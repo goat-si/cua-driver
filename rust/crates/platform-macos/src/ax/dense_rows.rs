@@ -151,7 +151,8 @@ pub(crate) fn plan_collection_children<S: AxTreeSource>(
     children: &[S::Element],
     budget: &WalkBudget,
 ) -> Vec<ChildPlan> {
-    plan_collection_children_observed(source, element, surface, role, children, budget).legacy
+    plan_collection_children_observed(source, element, surface, role, children, budget)
+        .into_walk_legacy()
 }
 
 pub(crate) fn plan_collection_children_observed<S: AxTreeSource>(

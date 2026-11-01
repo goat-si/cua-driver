@@ -86,7 +86,7 @@ pub(crate) fn bar_position_with<S: super::tree_source::AxTreeSource>(
     area: &S::Element,
     direction: &str,
 ) -> Option<f64> {
-    bar_position_observed_with(source, area, direction).legacy
+    bar_position_observed_with(source, area, direction).into_walk_legacy()
 }
 
 pub(crate) fn bar_position_observed_with<S: super::tree_source::AxTreeSource>(

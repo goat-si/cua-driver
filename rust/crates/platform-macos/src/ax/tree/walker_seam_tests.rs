@@ -320,6 +320,30 @@ fn run_fake(
     root: &Handle,
     query: Option<&str>,
     max_depth: usize,
+    budget: WalkBudget,
+    include_web_content: bool,
+) -> TreeWalkResult {
+    run_fake_observed(source, root, query, max_depth, budget, include_web_content).legacy
+}
+
+pub(super) fn run_fake_observed(
+    source: &Fake,
+    root: &Handle,
+    query: Option<&str>,
+    max_depth: usize,
+    budget: WalkBudget,
+    include_web_content: bool,
+) -> super::super::evidence::Observed<TreeWalkResult> {
+    let scope = super::super::evidence::EvidenceScope::start();
+    let result = run_fake_inner(source, root, query, max_depth, budget, include_web_content);
+    scope.finish(result)
+}
+
+fn run_fake_inner(
+    source: &Fake,
+    root: &Handle,
+    query: Option<&str>,
+    max_depth: usize,
     mut budget: WalkBudget,
     include_web_content: bool,
 ) -> TreeWalkResult {

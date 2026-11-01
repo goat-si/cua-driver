@@ -7,6 +7,39 @@
 use super::content_attrs::AttrStatus;
 use super::content_attrs::AttributeListing;
 use super::tree_source::{Read, ReadFailure};
+use std::cell::RefCell;
+
+thread_local! {
+    static WALK_EVIDENCE: RefCell<Option<Vec<ReadEvidence>>> = const { RefCell::new(None) };
+}
+
+/// A walk owns its evidence until it returns. Nested walks temporarily replace
+/// the collector and restore it even if they unwind.
+pub(crate) struct EvidenceScope {
+    previous: Option<Vec<ReadEvidence>>,
+}
+
+impl EvidenceScope {
+    pub(crate) fn start() -> Self {
+        let previous = WALK_EVIDENCE.with(|cell| cell.replace(Some(Vec::new())));
+        Self { previous }
+    }
+
+    pub(crate) fn finish<T>(self, legacy: T) -> Observed<T> {
+        let evidence = WALK_EVIDENCE.with(|cell| {
+            cell.borrow_mut()
+                .take()
+                .expect("walk evidence scope must remain active")
+        });
+        Observed { legacy, evidence }
+    }
+}
+
+impl Drop for EvidenceScope {
+    fn drop(&mut self) {
+        WALK_EVIDENCE.with(|cell| *cell.borrow_mut() = self.previous.take());
+    }
+}
 
 pub(crate) struct Observed<T> {
     pub(crate) legacy: T,
@@ -20,6 +53,17 @@ impl<T> Observed<T> {
             legacy,
             evidence: Vec::new(),
         }
+    }
+
+    /// Keep this observation in the active walk before returning its unchanged
+    /// legacy projection. Outside a walk there is no enclosing collector.
+    pub(crate) fn into_walk_legacy(self) -> T {
+        WALK_EVIDENCE.with(|cell| {
+            if let Some(active) = cell.borrow_mut().as_mut() {
+                active.extend(self.evidence);
+            }
+        });
+        self.legacy
     }
 }
 
@@ -111,5 +155,28 @@ mod tests {
         assert!(
             matches!(observed.evidence[0].status, EvidenceStatus::Unknown(ReadFailure::Ax(error)) if error == kAXErrorCannotComplete)
         );
+
+        let outer = EvidenceScope::start();
+        Observed {
+            legacy: (),
+            evidence: vec![first],
+        }
+        .into_walk_legacy();
+        let unwound = std::panic::catch_unwind(|| {
+            let _inner = EvidenceScope::start();
+            Observed {
+                legacy: (),
+                evidence: vec![replay],
+            }
+            .into_walk_legacy();
+            panic!("nested walk unwinds");
+        });
+        assert!(unwound.is_err());
+        Observed {
+            legacy: (),
+            evidence: vec![first],
+        }
+        .into_walk_legacy();
+        assert_eq!(outer.finish(()).evidence, [first, first]);
     }
 }

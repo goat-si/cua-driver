@@ -138,7 +138,7 @@ impl AxTreeSource for NativeSource {
         }
     }
     fn children(&self, element: &NativeElement) -> Read<Vec<NativeElement>> {
-        self.observed_children(element).legacy
+        self.observed_children(element).into_walk_legacy()
     }
     fn observed_children(
         &self,

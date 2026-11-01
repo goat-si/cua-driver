@@ -682,6 +682,45 @@ fn walk_tree_with_web_content(
     window_id: Option<u32>,
     query: Option<&str>,
     max_depth: usize,
+    budget: WalkBudget,
+    include_web_content: bool,
+) -> TreeWalkResult {
+    walk_tree_with_web_content_observed(
+        pid,
+        window_id,
+        query,
+        max_depth,
+        budget,
+        include_web_content,
+    )
+    .legacy
+}
+
+pub(crate) fn walk_tree_with_web_content_observed(
+    pid: i32,
+    window_id: Option<u32>,
+    query: Option<&str>,
+    max_depth: usize,
+    budget: WalkBudget,
+    include_web_content: bool,
+) -> super::evidence::Observed<TreeWalkResult> {
+    let scope = super::evidence::EvidenceScope::start();
+    let result = walk_tree_with_web_content_inner(
+        pid,
+        window_id,
+        query,
+        max_depth,
+        budget,
+        include_web_content,
+    );
+    scope.finish(result)
+}
+
+fn walk_tree_with_web_content_inner(
+    pid: i32,
+    window_id: Option<u32>,
+    query: Option<&str>,
+    max_depth: usize,
     mut budget: WalkBudget,
     include_web_content: bool,
 ) -> TreeWalkResult {
@@ -1901,7 +1940,7 @@ fn walk_children<S: AxTreeSource>(
 ) {
     if depth > max_depth {
         // A tree that ends exactly at the cap is still complete.
-        match source.observed_children(element).legacy {
+        match source.observed_children(element).into_walk_legacy() {
             Read::Absent => {}
             Read::Known(below) if below.is_empty() => {}
             Read::Known(_below) => note_skipped(),
@@ -1909,7 +1948,7 @@ fn walk_children<S: AxTreeSource>(
         }
         return;
     }
-    let children = match source.observed_children(element).legacy {
+    let children = match source.observed_children(element).into_walk_legacy() {
         Read::Known(children) => children,
         Read::Absent => Vec::new(),
         Read::Unknown(_) => {
@@ -1919,7 +1958,7 @@ fn walk_children<S: AxTreeSource>(
     };
     let tab_plan = if !in_web_content && children.len() >= TAB_STRIP_COMPACTION_THRESHOLD {
         plan_macos_tab_strip_observed(source, element, role, &children, budget, batching_disabled)
-            .legacy
+            .into_walk_legacy()
     } else {
         None
     };

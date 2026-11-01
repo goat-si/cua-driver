@@ -186,7 +186,8 @@ pub(crate) fn read_control_attrs_with<S: AxTreeSource>(
     budget: &mut WalkBudget,
     batching_disabled: &mut bool,
 ) -> Option<ControlAttrs> {
-    read_control_attrs_observed_with(source, element, budget, batching_disabled, None).legacy
+    read_control_attrs_observed_with(source, element, budget, batching_disabled, None)
+        .into_walk_legacy()
 }
 
 pub(crate) fn read_control_attrs_observed_with<S: AxTreeSource>(

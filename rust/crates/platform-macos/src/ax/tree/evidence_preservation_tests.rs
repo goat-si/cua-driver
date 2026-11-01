@@ -1,4 +1,4 @@
-use super::walker_seam_tests::{step, Fake, Reply};
+use super::walker_seam_tests::{run_fake_observed, step, Fake, Reply};
 use super::walker_test_support::{Batch, Slot, SlotFailure};
 use super::*;
 use crate::ax::batch_attrs::BatchFailure;
@@ -347,4 +347,93 @@ fn malformed_children_preserve_valid_items_and_decode_evidence() {
         ReadSite::Children,
         EvidenceStatus::Unknown(ReadFailure::WrongType),
     );
+}
+
+#[test]
+fn nested_walk_evidence_is_isolated() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    const CONTENT: &str =
+        "AXTitle,AXPlaceholderValue,AXDescription,AXIdentifier,AXHelp,AXSubrole,AXRoleDescription";
+    const FRAME: &str = "AXPosition,AXSize";
+    let inner_evidence = Rc::new(RefCell::new(None));
+    let saved = inner_evidence.clone();
+    let nested = move || {
+        let mut attrs = vec![Slot::Text(AttrStatus::Absent); 7];
+        attrs[0] = Slot::Text(AttrStatus::Known("inner".into()));
+        attrs[3] = Slot::Text(AttrStatus::WrongType);
+        let inner = Fake::new(
+            &[(2, 2, 2, &[])],
+            vec![
+                step("timeout 2", Reply::Unit),
+                step("text 2 AXRole", Reply::Text(Read::Known("AXWindow".into()))),
+                step(
+                    &format!("batch 2 {CONTENT}"),
+                    Reply::Batch(Ok(Batch(attrs))),
+                ),
+                step("actions 2", Reply::Actions(Read::Known(vec![]))),
+                step(
+                    &format!("batch 2 {FRAME}"),
+                    Reply::Batch(Ok(Batch(vec![Slot::Point(None), Slot::Size(None)]))),
+                ),
+                step("children 2", Reply::Children(Read::Absent)),
+            ],
+        );
+        let root = inner.handle(2);
+        let observed = run_fake_observed(&inner, &root, None, 10, WalkBudget::nodes_only(10), true);
+        assert!(observed.legacy.tree_markdown.contains("inner"));
+        drop(root);
+        inner.assert_consumed();
+        inner.assert_lifetimes(&[]);
+        *saved.borrow_mut() = Some(observed.evidence);
+    };
+    let mut attrs = vec![Slot::Text(AttrStatus::Absent); 7];
+    attrs[0] = Slot::Text(AttrStatus::Known("outer".into()));
+    attrs[2] = Slot::Text(AttrStatus::WrongType);
+    let outer = Fake::new(
+        &[(1, 1, 1, &[])],
+        vec![
+            step("timeout 1", Reply::Unit),
+            step("text 1 AXRole", Reply::Text(Read::Known("AXWindow".into()))),
+            step(
+                &format!("batch 1 {CONTENT}"),
+                Reply::Batch(Ok(Batch(attrs))),
+            ),
+            step("actions 1", Reply::Nested(Box::new(nested))),
+            step("actions 1", Reply::Actions(Read::Known(vec![]))),
+            step(
+                &format!("batch 1 {FRAME}"),
+                Reply::Batch(Ok(Batch(vec![Slot::Point(None), Slot::Size(None)]))),
+            ),
+            step("children 1", Reply::Children(Read::Absent)),
+        ],
+    );
+    let root = outer.handle(1);
+    let observed = run_fake_observed(&outer, &root, None, 10, WalkBudget::nodes_only(10), true);
+    assert!(observed.legacy.tree_markdown.contains("outer"));
+    drop(root);
+    outer.assert_consumed();
+    outer.assert_lifetimes(&[]);
+    let inner = inner_evidence.borrow();
+    let inner = inner.as_ref().expect("nested walk executed");
+    assert_evidence(
+        inner,
+        ReadSite::Content("AXIdentifier"),
+        EvidenceStatus::Unknown(ReadFailure::WrongType),
+    );
+    assert!(!inner
+        .iter()
+        .any(|entry| entry.site == ReadSite::Content("AXDescription")
+            && entry.status == EvidenceStatus::Unknown(ReadFailure::WrongType)));
+    assert_evidence(
+        &observed.evidence,
+        ReadSite::Content("AXDescription"),
+        EvidenceStatus::Unknown(ReadFailure::WrongType),
+    );
+    assert!(!observed
+        .evidence
+        .iter()
+        .any(|entry| entry.site == ReadSite::Content("AXIdentifier")
+            && entry.status == EvidenceStatus::Unknown(ReadFailure::WrongType)));
 }

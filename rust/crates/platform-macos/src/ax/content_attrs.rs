@@ -619,7 +619,7 @@ pub(crate) fn read_content_attrs_with<S: AxTreeSource>(
         },
         batching_disabled,
     )
-    .legacy;
+    .into_walk_legacy();
     if result.is_none() {
         budget.stop_for_timeout();
     }
