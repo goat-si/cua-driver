@@ -78,6 +78,7 @@ tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
 futures-util = "0.3"
 
 [dev-dependencies]
+cua-driver-core = { path = "../cua-driver-core", features = ["test-support"] }
 tempfile = "3"
 cua-cursor-motion = { path = "../cua-cursor-motion" }
 tokio = { workspace = true, features = ["test-util"] }

@@ -284,6 +284,7 @@ where
     F: FnOnce() -> R + Send + 'static,
     R: Send + 'static,
 {
+    let f = crate::input::worker_context::wrap_blocking(f);
     let Some(trace) = current() else {
         return tokio::task::spawn_blocking(f);
     };
@@ -353,6 +354,11 @@ async fn invoke_traced(
         "ok"
     };
     result
+}
+
+#[cfg(test)]
+pub(crate) async fn with_test_trace<F: Future>(future: F) -> F::Output {
+    CURRENT.scope(Trace::new("lease_test"), future).await
 }
 
 struct TracedTool {
