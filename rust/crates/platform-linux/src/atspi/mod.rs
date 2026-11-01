@@ -67,6 +67,7 @@ pub struct AtspiNode {
 
 pub struct AtspiTreeResult {
     pub tree_markdown: String,
+    pub(crate) boundary_markdown: String,
     pub nodes: Vec<AtspiNode>,
     pub bounds: Vec<(usize, i32, i32, u32, u32)>,
     /// True only for a native AT-SPI walk. The X11 property fallback is a
@@ -113,6 +114,10 @@ impl AtspiTreeResult {
             Some(q) => filter_tree(&walked.markdown, q),
             None => walked.markdown,
         };
+        let boundary_markdown = match query {
+            Some(q) => filter_tree(&walked.boundary_markdown, q),
+            None => walked.boundary_markdown,
+        };
         let (truncated, truncation_reason, nodes_visited, nodes_pending) = match &walked.truncation
         {
             Some(t) => (true, Some(t.reason.to_owned()), t.visited, t.pending),
@@ -120,6 +125,7 @@ impl AtspiTreeResult {
         };
         AtspiTreeResult {
             tree_markdown: md,
+            boundary_markdown,
             nodes: walked.nodes,
             bounds: walked.bounds,
             trusted: true,
@@ -709,6 +715,7 @@ fn walk_via_x11_properties(xid: u64, query: Option<&str>) -> AtspiTreeResult {
         Err(_) => {
             return AtspiTreeResult {
                 tree_markdown: String::new(),
+                boundary_markdown: String::new(),
                 nodes: vec![],
                 bounds: vec![],
                 trusted: false,
@@ -778,6 +785,7 @@ fn walk_via_x11_properties(xid: u64, query: Option<&str>) -> AtspiTreeResult {
     };
 
     AtspiTreeResult {
+        boundary_markdown: tree_markdown.clone(),
         tree_markdown,
         nodes,
         bounds: vec![],
@@ -920,6 +928,7 @@ mod budget_tests {
             };
         native::WalkedTree {
             markdown: "- [0] frame \"Untitled\"\n  - [1] push button \"OK\"\n".into(),
+            boundary_markdown: "- [0] frame \"Untitled\"\n  - [1] push button \"OK\"\n".into(),
             nodes: vec![
                 node(0, "frame", "Untitled", 0, vec![]),
                 node(1, "push button", "OK", 1, vec!["click".into()]),

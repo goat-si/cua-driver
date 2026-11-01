@@ -2427,10 +2427,12 @@ fn render(
     completeness: &crate::walk_completeness::Completeness,
 ) -> (
     String,
+    String,
     Vec<AtspiNode>,
     std::collections::HashMap<usize, cua_driver_contract::NodeBoundary>,
 ) {
     let mut md = String::new();
+    let mut passive_markers = Vec::new();
     let mut nodes = Vec::new();
     let mut boundaries = std::collections::HashMap::new();
     let mut idx = 0usize;
@@ -2593,16 +2595,52 @@ fn render(
                 })
                 .unwrap_or_default();
             md.push_str(&format!(
-                "{indent}- {role} = \"{name}\"{marker}{boundary_marker}
+                "{indent}- {role} = \"{name}\"{marker}
 ",
                 role = v.role,
                 name = v.name,
                 marker = passive_marker(&v.role, !v.actions.is_empty(), v.has_component, v.enabled),
             ));
+            if !boundary_marker.is_empty() {
+                passive_markers.push((md.len() - 1, boundary_marker));
+            }
         }
     }
 
-    (md, nodes, boundaries)
+    let boundary_md = insert_passive_markers(&md, &passive_markers);
+    (md, boundary_md, nodes, boundaries)
+}
+
+fn insert_passive_markers(markdown: &str, markers: &[(usize, String)]) -> String {
+    let mut marked = markdown.to_owned();
+    for (position, marker) in markers.iter().rev() {
+        marked.insert_str(*position, marker);
+    }
+    marked
+}
+
+#[cfg(test)]
+mod boundary_markdown_tests {
+    use super::insert_passive_markers;
+
+    #[test]
+    fn named_passive_lines_receive_markers_without_creating_unnamed_rows() {
+        let original = "- frame = \"Main\"\n  - label = \"Details\"\n";
+        let first_end = original.find('\n').unwrap();
+        let second_end = original.rfind('\n').unwrap();
+        let marked = insert_passive_markers(
+            original,
+            &[
+                (first_end, " [more: unknown]".into()),
+                (second_end, " [+3 more]".into()),
+            ],
+        );
+        assert_eq!(
+            marked,
+            "- frame = \"Main\" [more: unknown]\n  - label = \"Details\" [+3 more]\n"
+        );
+        assert_eq!(insert_passive_markers(original, &[]), original);
+    }
 }
 
 /// Why a visible, named control is listed without an index. A disabled
@@ -2767,6 +2805,7 @@ pub fn walk_tree(pid: u32) -> Result<Option<(String, Vec<AtspiNode>)>> {
 /// caller's window.
 pub struct WalkedTree {
     pub markdown: String,
+    pub(crate) boundary_markdown: String,
     pub nodes: Vec<AtspiNode>,
     pub bounds: Vec<(usize, i32, i32, u32, u32)>,
     /// True when a non-zero `xid` was resolved to exactly one application
@@ -2825,6 +2864,7 @@ pub(super) fn walk_tree_bounded_with_timeout(
                 dlog!("walk_tree: application lookup timed out for pid {pid}");
                 return Ok(Some(WalkedTree {
                     markdown: String::new(),
+                    boundary_markdown: String::new(),
                     nodes: Vec::new(),
                     bounds: Vec::new(),
                     window_scoped: false,
@@ -2848,6 +2888,7 @@ pub(super) fn walk_tree_bounded_with_timeout(
                 dlog!("walk_tree timed out for pid {pid}");
                 return Ok(Some(WalkedTree {
                     markdown: String::new(),
+                    boundary_markdown: String::new(),
                     nodes: Vec::new(),
                     bounds: Vec::new(),
                     window_scoped: false,
@@ -2877,7 +2918,8 @@ pub(super) fn walk_tree_bounded_with_timeout(
             return Ok(None);
         };
         let walk_elapsed = walk_started.elapsed();
-        let (markdown, nodes, boundaries) = render(&visited, scoped_frame, &completeness);
+        let (markdown, boundary_markdown, nodes, boundaries) =
+            render(&visited, scoped_frame, &completeness);
         let bounds_started = std::time::Instant::now();
         // Bounds resolution shares the deadline, but a walk that consumed the
         // whole budget must still yield *some* frames (element-index clicks
@@ -2923,6 +2965,7 @@ pub(super) fn walk_tree_bounded_with_timeout(
         };
         Ok(Some(WalkedTree {
             markdown,
+            boundary_markdown,
             nodes,
             bounds,
             window_scoped: scoped_frame.is_some(),

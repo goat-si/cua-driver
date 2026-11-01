@@ -1618,7 +1618,7 @@ impl Tool for GetWindowStateTool {
                     }
                     header.push('\n');
                     content.push(cua_driver_core::protocol::Content::text(
-                        header + &tr.tree_markdown,
+                        header + &tr.boundary_markdown,
                     ));
                     structured["element_count"] = json!(count);
                     // `elements_complete` is a real claim now: a native walk that
@@ -1627,7 +1627,7 @@ impl Tool for GetWindowStateTool {
                     // fallback trees keep negative existence unknown.
                     apply_linux_walk_completeness(&mut structured, &tr, timeout_ms);
                     structured["bounds_complete"] = json!(tr.bounds_complete);
-                    structured["tree_markdown"] = json!(tr.tree_markdown);
+                    structured["tree_markdown"] = json!(tr.boundary_markdown);
 
                     // Elements bind to this window only when the walk proved
                     // the window's scope (`snapshot_binds_window`).
@@ -1723,7 +1723,7 @@ impl Tool for GetWindowStateTool {
                     let elements = cua_driver_core::element_query::project_elements_for_query(
                         elements,
                         query.as_deref(),
-                        &tr.tree_markdown,
+                        &tr.boundary_markdown,
                     );
                     let elements = framed_elements_first(elements);
                     // Screenshot pixels: the capture is the window's own X11

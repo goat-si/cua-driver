@@ -67,6 +67,7 @@ fn element_entry_reports_toggle_state_and_expanded() {
 fn tree_for_completeness() -> crate::atspi::AtspiTreeResult {
     crate::atspi::AtspiTreeResult {
         tree_markdown: String::new(),
+        boundary_markdown: String::new(),
         nodes: Vec::new(),
         bounds: Vec::new(),
         trusted: true,
