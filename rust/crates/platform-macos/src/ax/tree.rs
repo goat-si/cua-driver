@@ -1431,9 +1431,23 @@ fn walk_element<S: AxTreeSource>(
                 (
                     (
                         None,
-                        trimmed_label(known(source.text(element, "AXDescription"))),
+                        trimmed_label(known(
+                            super::evidence::observe_read(
+                                Some(element_key),
+                                super::evidence::ReadSite::Scrollbar("AXDescription"),
+                                source.text(element, "AXDescription"),
+                            )
+                            .into_walk_legacy(),
+                        )),
                         None,
-                        known(source.text(element, "AXIdentifier")),
+                        known(
+                            super::evidence::observe_read(
+                                Some(element_key),
+                                super::evidence::ReadSite::Scrollbar("AXIdentifier"),
+                                source.text(element, "AXIdentifier"),
+                            )
+                            .into_walk_legacy(),
+                        ),
                     ),
                     false,
                 )
@@ -1471,7 +1485,14 @@ fn walk_element<S: AxTreeSource>(
                 element_ptr: snapshot_key,
                 depth,
                 parent_element_index: parent_index,
-                frame: known(source.frame(element)),
+                frame: known(
+                    super::evidence::observe_read(
+                        Some(element_key),
+                        super::evidence::ReadSite::Frame("scroll"),
+                        source.frame(element),
+                    )
+                    .into_walk_legacy(),
+                ),
                 value_state: if secure {
                     Some("[redacted]".into())
                 } else if value_unknown {

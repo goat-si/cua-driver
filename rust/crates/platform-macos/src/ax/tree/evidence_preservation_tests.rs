@@ -937,6 +937,80 @@ fn scrollbar_value_preserves_unknown_and_absent() {
 }
 
 #[test]
+fn scroll_extra_labels_preserve_unknown_and_absent() {
+    const CONTENT: &str =
+        "AXTitle,AXPlaceholderValue,AXDescription,AXIdentifier,AXHelp,AXSubrole,AXRoleDescription";
+    for name in ["AXDescription", "AXIdentifier"] {
+        for case in [Case::AxFailure, Case::Known, Case::Absent, Case::WrongType] {
+            let mut attrs = vec![Slot::Text(AttrStatus::Absent); 7];
+            attrs[0] = Slot::Text(AttrStatus::Known("Scroll".into()));
+            let desc = if name == "AXDescription" {
+                case
+            } else {
+                Case::Known
+            };
+            let id = if name == "AXIdentifier" {
+                case
+            } else {
+                Case::Known
+            };
+            let fake = Fake::new(
+                &[(1, 1, 1, &[]), (2, 2, 2, &[])],
+                vec![
+                    step("timeout 1", Reply::Unit),
+                    step(
+                        "text 1 AXRole",
+                        Reply::Text(Read::Known("AXScrollArea".into())),
+                    ),
+                    step(
+                        &format!("batch 1 {CONTENT}"),
+                        Reply::Batch(Ok(Batch(attrs))),
+                    ),
+                    step("value 1", Reply::Value(Ok(None))),
+                    step(
+                        "element 1 AXVerticalScrollBar",
+                        Reply::Element(Read::Known(2)),
+                    ),
+                    step(
+                        "text 2 AXRole",
+                        Reply::Text(Read::Known("AXScrollBar".into())),
+                    ),
+                    step("number 2 AXValue", Reply::Number(Read::Known(0.25))),
+                    step(
+                        "element 1 AXHorizontalScrollBar",
+                        Reply::Element(Read::Absent),
+                    ),
+                    step("snapshot 1", Reply::Unit),
+                    step(
+                        "text 1 AXDescription",
+                        Reply::Text(desc.read("Pane".into())),
+                    ),
+                    step("text 1 AXIdentifier", Reply::Text(id.read("main".into()))),
+                    step("actions 1", Reply::Actions(Read::Known(vec![]))),
+                    step("position 1", Reply::Point(Read::Absent)),
+                    step("children 1", Reply::Children(Read::Absent)),
+                ],
+            );
+            let root = fake.handle(1);
+            let observed = with_exhaustive_nodes(false, || {
+                run_fake_observed(&fake, &root, None, 10, WalkBudget::nodes_only(10), true)
+            });
+            assert!(!observed.legacy.nodes_skipped);
+            assert!(observed.legacy.tree_markdown.contains("scrolled 25% down"));
+            fake.assert_consumed();
+            drop(root);
+            fake.assert_lifetimes(&[(1, 1)]);
+            assert_evidence(&observed.evidence, ReadSite::Scrollbar(name), case.status());
+            assert_evidence(
+                &observed.evidence,
+                ReadSite::Frame("scroll"),
+                EvidenceStatus::Absent,
+            );
+        }
+    }
+}
+
+#[test]
 fn tab_parent_metadata_preserves_unknown_and_absent() {
     let fake = Fake::new(
         &[(1, 1, 1, &[])],
