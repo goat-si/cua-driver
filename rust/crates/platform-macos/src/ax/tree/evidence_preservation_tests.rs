@@ -1232,6 +1232,50 @@ fn dense_child_role_preserves_unknown_and_absent() {
 }
 
 #[test]
+fn dense_geometry_preserves_unknown_and_absent() {
+    const FRAME: &str = "AXPosition,AXSize";
+    for case in CASES {
+        let ids: Vec<usize> = (2..52).collect();
+        let mut nodes: Vec<(usize, usize, usize, &[usize])> = vec![(1, 1, 1, ids.as_slice())];
+        nodes.extend(ids.iter().map(|&id| (id, id, id, &[][..])));
+        let mut steps = Vec::new();
+        for &id in &ids {
+            steps.push(step(&format!("timeout {id}"), Reply::Unit));
+            let position = if id == 2 { case } else { Case::Known };
+            steps.push(step(
+                &format!("batch {id} {FRAME}"),
+                Reply::Batch(Ok(Batch(vec![position.slot(1), Case::Known.slot(2)]))),
+            ));
+        }
+        let fake = Fake::new(&nodes, steps);
+        let root = fake.handle(1);
+        let children: Vec<_> = ids.iter().map(|&id| fake.handle(id)).collect();
+        let observed = dense_rows::plan_collection_children_observed(
+            &fake,
+            &root,
+            &root,
+            "AXGroup",
+            &children,
+            &WalkBudget::nodes_only(100),
+        );
+        assert!(observed
+            .legacy
+            .iter()
+            .all(|plan| matches!(plan, ChildPlan::Defer { visible: true })));
+        assert_eq!(observed.legacy.len(), 50);
+        fake.assert_consumed();
+        drop(children);
+        drop(root);
+        fake.assert_lifetimes(&[]);
+        assert_evidence(
+            &observed.evidence,
+            ReadSite::Dense("AXPosition"),
+            case.status(),
+        );
+    }
+}
+
+#[test]
 fn malformed_children_preserve_valid_items_and_decode_evidence() {
     let observed =
         crate::ax::tree_source::native::decode_child_members([Some(11), None, Some(33)], |item| {
