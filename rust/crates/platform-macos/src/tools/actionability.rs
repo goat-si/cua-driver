@@ -487,6 +487,31 @@ mod u31_facts_tests {
             result.verdict,
             Verdict::Transient { unknown: true, .. }
         ));
+        reader.actions_result = Evidence::Known(
+            ["AXPress", "AXOpen", "AXShowMenu", "AXCancel"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+        );
+        for intent in [
+            semantic::SemanticIntent::Click,
+            semantic::SemanticIntent::Open,
+            semantic::SemanticIntent::RightClick,
+            semantic::SemanticIntent::Select,
+            semantic::SemanticIntent::Focus,
+            semantic::SemanticIntent::PerformAction("AXCancel".into()),
+        ] {
+            let report = semantic::sample_with(
+                7,
+                13,
+                &mut reader,
+                &mut scope,
+                &FakeClock::default(),
+                &mut StabilitySampler::default(),
+                &intent,
+            );
+            assert_eq!(report.verdict, Verdict::Pass);
+        }
         assert!(scope.calls.iter().all(|(_, _, _, kind)| *kind != "hit"));
     }
 
