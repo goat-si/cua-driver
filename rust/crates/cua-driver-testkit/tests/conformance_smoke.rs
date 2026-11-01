@@ -13,6 +13,9 @@ struct State {
     failing_reads: bool,
     read_errors: u64,
     generation: u64,
+    incomplete_reads: bool,
+    incomplete_count: u64,
+    incomplete_violation: bool,
 }
 struct Fixture(Rc<RefCell<State>>);
 impl ConformanceFixture for Fixture {
@@ -49,6 +52,20 @@ impl ConformanceFixture for Fixture {
         s.failing_reads = false;
         Ok(s.read_errors)
     }
+    fn start_incomplete_observation(&mut self) -> Result<(), String> {
+        let mut s = self.0.borrow_mut();
+        s.incomplete_reads = true;
+        s.incomplete_count = 0;
+        Ok(())
+    }
+    fn finish_incomplete_observation(&mut self) -> Result<u64, String> {
+        let mut s = self.0.borrow_mut();
+        s.incomplete_reads = false;
+        Ok(s.incomplete_count)
+    }
+    fn absent_element_name(&self) -> Result<&str, String> {
+        Ok("Missing sentinel")
+    }
 }
 struct Fake {
     state: Rc<RefCell<State>>,
@@ -71,7 +88,7 @@ impl Driver for Fake {
                 s.generation += 1;
                 let token = format!("{}:{}", self.session, s.generation);
                 response(
-                    json!({"snapshot_id":s.generation.to_string(),"elements":if s.destroyed { vec![] } else { vec![json!({"element_index":3,"element_token":token})] }}),
+                    json!({"snapshot_id":s.generation.to_string(),"elements":if s.destroyed { vec![] } else { vec![json!({"element_index":3,"element_token":token,"label":"Text"})] }}),
                     "",
                     false,
                 )
@@ -102,6 +119,15 @@ impl Driver for Fake {
                 )
             }
             "run_steps" if args["steps"][0].get("wait_for").is_some() => {
+                if s.incomplete_reads {
+                    s.incomplete_count += 1;
+                    let code = if s.incomplete_violation {
+                        "not_found"
+                    } else {
+                        "incomplete_observation"
+                    };
+                    return response(json!({"steps":[{"code":code}]}), "incomplete", true);
+                }
                 assert!(s.failing_reads);
                 s.read_errors += 1;
                 if self.violation == Some(Contract::GoneReadError) {
@@ -114,6 +140,22 @@ impl Driver for Fake {
                 )
             }
             "run_steps" => {
+                if s.incomplete_reads {
+                    s.incomplete_count += 1;
+                    if s.incomplete_violation {
+                        s.dispatched.push("click".into());
+                    }
+                    let text = if s.incomplete_violation {
+                        "no candidates"
+                    } else {
+                        "candidate: Text"
+                    };
+                    return response(
+                        json!({"steps":[{"code":"incomplete_observation"}]}),
+                        text,
+                        true,
+                    );
+                }
                 if self.violation == Some(Contract::Ambiguity) {
                     s.dispatched.push("click".into());
                     return response(json!({"steps":[{"ok":true}]}), "clicked", false);
@@ -125,6 +167,32 @@ impl Driver for Fake {
                 )
             }
             _ => panic!("unexpected tool {tool}"),
+        }
+    }
+}
+
+#[test]
+fn incomplete_tree_probes_require_injection_candidates_and_zero_dispatch() {
+    for violate in [false, true] {
+        let state = Rc::new(RefCell::new(State {
+            incomplete_violation: violate,
+            ..Default::default()
+        }));
+        let mut fixture = Fixture(state.clone());
+        let mut driver = Fake {
+            state,
+            session: "a",
+            violation: None,
+        };
+        for outcome in [
+            conformance::incomplete_absence(&mut driver, &mut fixture),
+            conformance::incomplete_uniqueness(&mut driver, &mut fixture),
+        ] {
+            assert_eq!(
+                matches!(outcome, ContractOutcome::Pass),
+                !violate,
+                "{outcome:?}"
+            );
         }
     }
 }
