@@ -422,15 +422,19 @@ pub fn apply(
         } else if let Some(fields) = structured.as_object_mut() {
             fields.remove("observation_complete");
         }
-        if had_refusal {
+        let message = if had_refusal {
             let code = refusal_code
                 .as_deref()
                 .unwrap_or("invalid_drilldown_refusal");
+            let message = format!("Drill-down refused ({code}); no subtree was published.");
             structured["status"] = json!("refused");
-            structured["refusal"] = json!({"code":code, "message":format!("Drill-down {status}; no subtree was published.")});
-        }
+            structured["refusal"] = json!({"code":code, "message":&message});
+            message
+        } else {
+            format!("Drill-down {status}; no subtree was published.")
+        };
         for part in content.iter_mut() {
-            *part = Content::text(format!("Drill-down {status}; no subtree was published."));
+            *part = Content::text(message.clone());
         }
         return;
     }
@@ -1802,6 +1806,10 @@ mod tests {
         result["refusal"] = json!({"code":"permission_denied","message":"denied"});
         apply(&opts(json!({})), &ctx, &mut content, &mut result);
         assert_eq!(result["refusal"]["code"], "permission_denied");
+        assert!(result["refusal"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("permission_denied"));
         assert!(result.get("snapshot_id").is_none());
     }
 
