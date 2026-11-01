@@ -1793,7 +1793,7 @@ mod secure_value_tests {
     use std::cell::RefCell;
 
     struct Fake {
-        attrs: [AttrStatus; 6],
+        attrs: [AttrStatus; 7],
         trace: Vec<&'static str>,
     }
     impl Fake {
@@ -1812,7 +1812,7 @@ mod secure_value_tests {
         }
     }
     impl ContentReader for Fake {
-        fn batch(&mut self) -> Result<[AttrStatus; 6], BatchFailure> {
+        fn batch(&mut self) -> Result<[AttrStatus; 7], BatchFailure> {
             self.trace.push("batch");
             Ok(self.attrs.clone())
         }
@@ -1843,7 +1843,7 @@ mod secure_value_tests {
         assert_eq!(tab_child_value(attrs).0, None);
         assert!(!secure.trace.contains(&"AXValue"));
         let mut unknown = Fake::new(None);
-        let attrs = unknown.read(AttrStatus::Failed);
+        let attrs = unknown.read(crate::ax::content_attrs::FAILED_TEST);
         let (value, incomplete) = tab_child_value(attrs);
         assert_eq!(value, None);
         assert!(incomplete);
@@ -1922,7 +1922,7 @@ mod secure_value_tests {
             crate::tools::test_element_entry(&secure, None, None)["value"],
             "[redacted]"
         );
-        let (unknown, trace) = fake_node(AttrStatus::Failed, None);
+        let (unknown, trace) = fake_node(crate::ax::content_attrs::FAILED_TEST, None);
         assert!(!trace.contains(&"AXValue"));
         assert!(!format_node_line(&unknown).contains("ordinary"));
         assert!(crate::tools::test_element_entry(&unknown, None, None)

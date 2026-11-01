@@ -27,6 +27,8 @@ pub(crate) mod press_key;
 mod right_click;
 mod scroll;
 mod select_text;
+#[cfg(test)]
+pub(crate) use select_text::selection_exposure_allowed as selection_exposure_for_test;
 mod set_value;
 mod set_value_autosubmit;
 mod set_window_frame;
