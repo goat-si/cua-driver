@@ -1,6 +1,9 @@
 //! State machine for an AppKit popup selection. All observations and effects
 //! are supplied by the caller, so tests do not need a running desktop.
 
+use crate::ax::write_outcome::{native_write_outcome, NativeWriteKind, Settable};
+use cua_driver_contract::ErrorDisposition;
+use cua_driver_core::mutation::{ChainResult, Postcondition, PriorInput, WriteOutcome};
 use std::time::Duration;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -46,6 +49,7 @@ pub(super) enum PopupOutcome {
     StoppedAfterOpen {
         reason: String,
         close: CloseStatus,
+        disposition: ErrorDisposition,
     },
     Selected {
         title: String,
@@ -56,6 +60,7 @@ pub(super) enum PopupOutcome {
         reason: String,
         preexisting: bool,
         close: Option<CloseStatus>,
+        disposition: ErrorDisposition,
     },
 }
 
@@ -99,13 +104,17 @@ pub(super) fn tool_result(
             }
             result
         }
-        PopupOutcome::StoppedAfterOpen { reason, close } => {
+        PopupOutcome::StoppedAfterOpen {
+            reason,
+            close,
+            disposition,
+        } => {
             let note = close_note(*close);
-            ToolResult::error(format!("{reason}. {note}{suffix}")).with_structured(
-                serde_json::json!({
+            ToolResult::error(format!("{reason}. {note}{suffix}"))
+                .with_structured(serde_json::json!({
                     "dispatched": true, "effect": "unverifiable", "note": note,
-                }),
-            )
+                }))
+                .with_disposition(*disposition)
         }
         PopupOutcome::Selected {
             title,
@@ -133,6 +142,7 @@ pub(super) fn tool_result(
             reason,
             preexisting,
             close,
+            disposition,
         } => {
             let note = if *preexisting {
                 "Used a previously open menu."
@@ -147,6 +157,7 @@ pub(super) fn tool_result(
             .with_structured(serde_json::json!({
                 "dispatched":true, "effect":"unverifiable", "note":note,
             }))
+            .with_disposition(*disposition)
         }
     }
 }
@@ -198,19 +209,48 @@ fn same_list<E: PopupEnv>(env: &E, a: &[OptionEntry<E::Id>], b: &[OptionEntry<E:
             .all(|(a, b)| env.same(&a.id, &b.id) && a.title == b.title && a.value == b.value)
 }
 
-fn cleanup<E: PopupEnv>(env: &mut E, owned: &E::Id) -> CloseStatus {
+fn perform_record(code: i32, prior: PriorInput) -> ChainResult {
+    let outcome = native_write_outcome(NativeWriteKind::Perform, true, &Settable::Yes, code);
+    ChainResult::from_recorded(vec![outcome], prior).expect("one perform is a valid record")
+}
+
+fn opener_record(result: PressReturn) -> ChainResult {
+    let code = match result {
+        PressReturn::Success => crate::ax::bindings::kAXErrorSuccess,
+        PressReturn::Timeout => crate::ax::bindings::kAXErrorCannotComplete,
+        PressReturn::Error(code) => code,
+    };
+    // Starting the modal opener itself is prior input even while its return is pending.
+    perform_record(code, PriorInput::MayHaveDelivered)
+}
+
+fn disposition(chain: &ChainResult) -> ErrorDisposition {
+    chain
+        .error_disposition(Postcondition::Indeterminate, false)
+        .expect("an indeterminate postcondition cannot confirm the write")
+}
+
+fn cleanup<E: PopupEnv>(env: &mut E, owned: &E::Id) -> (CloseStatus, ChainResult) {
     let eligible = match env.menu() {
-        MenuState::Open(current) if env.same(owned, &current) => env.cancel(owned) == 0,
+        MenuState::Open(current) if env.same(owned, &current) => {
+            let code = env.cancel(owned);
+            let cancel = perform_record(code, PriorInput::MayHaveDelivered);
+            cancel.outcomes() == [WriteOutcome::Delivered]
+        }
         MenuState::ClosedOrEmpty => true,
         _ => false,
     };
     let result = env.join();
-    if eligible && result == PressReturn::Success && matches!(env.menu(), MenuState::ClosedOrEmpty)
+    let opener = opener_record(result);
+    let close = if eligible
+        && result == PressReturn::Success
+        && matches!(env.menu(), MenuState::ClosedOrEmpty)
     {
         CloseStatus::Confirmed
     } else {
         CloseStatus::Unconfirmed
-    }
+    };
+    (close, opener)
 }
 
 struct OwnedMenu<'a, E: PopupEnv> {
@@ -220,7 +260,7 @@ struct OwnedMenu<'a, E: PopupEnv> {
 }
 
 impl<E: PopupEnv> OwnedMenu<'_, E> {
-    fn finish(&mut self) -> CloseStatus {
+    fn finish(&mut self) -> (CloseStatus, ChainResult) {
         self.finished = true;
         cleanup(self.env, &self.id)
     }
@@ -234,7 +274,16 @@ impl<E: PopupEnv> Drop for OwnedMenu<'_, E> {
     }
 }
 
+#[cfg(test)]
 pub(super) fn select<E: PopupEnv>(env: &mut E, requested: &str) -> PopupOutcome {
+    select_with_prior(env, requested, PriorInput::None)
+}
+
+pub(super) fn select_with_prior<E: PopupEnv>(
+    env: &mut E,
+    requested: &str,
+    prior: PriorInput,
+) -> PopupOutcome {
     let (menu, owned) = match env.menu() {
         MenuState::Unknown => {
             return PopupOutcome::Refused {
@@ -261,49 +310,62 @@ pub(super) fn select<E: PopupEnv>(env: &mut E, requested: &str) -> PopupOutcome 
                     {
                         break (menu, true);
                     }
-                    let _ = env.join();
+                    let opener = opener_record(env.join());
                     return PopupOutcome::StoppedAfterOpen {
                         reason: "Menu ownership was not established; it may still be open".into(),
                         close: CloseStatus::Unconfirmed,
+                        disposition: disposition(&opener),
                     };
                 }
                 if !pending || env.now() >= deadline {
-                    let _ = env.join();
+                    let opener = opener_record(env.join());
                     return PopupOutcome::StoppedAfterOpen {
                         reason: "Menu ownership was not established; it may still be open".into(),
                         close: CloseStatus::Unconfirmed,
+                        disposition: disposition(&opener),
                     };
                 }
                 env.pause();
             }
         }
     };
-    let (selection, close) = if owned {
+    let (selection, close, opener) = if owned {
         let mut guard = OwnedMenu {
             env,
             id: menu.clone(),
             finished: false,
         };
-        let selection = select_in_menu(guard.env, &menu, requested);
-        let close = guard.finish();
-        (selection, Some(close))
+        let selection = select_in_menu(guard.env, &menu, requested, PriorInput::MayHaveDelivered);
+        let (close, opener) = guard.finish();
+        (selection, Some(close), Some(opener))
     } else {
-        (select_in_menu(env, &menu, requested), None)
+        (select_in_menu(env, &menu, requested, prior), None, None)
     };
     match selection {
-        Ok((title, 0)) => PopupOutcome::Selected {
+        Ok((title, 0, _)) => PopupOutcome::Selected {
             title,
             preexisting: !owned,
             close,
         },
-        Ok((_, code)) => PopupOutcome::SentUnverified {
-            reason: format!("Option press returned {code}"),
-            preexisting: !owned,
-            close,
-        },
+        Ok((_, code, option)) => {
+            if option.no_input() {
+                PopupOutcome::Refused {
+                    reason: format!("Option press returned {code}"),
+                    preexisting: !owned,
+                }
+            } else {
+                PopupOutcome::SentUnverified {
+                    reason: format!("Option press returned {code}"),
+                    preexisting: !owned,
+                    close,
+                    disposition: disposition(&option),
+                }
+            }
+        }
         Err(reason) if owned => PopupOutcome::StoppedAfterOpen {
             reason,
             close: close.unwrap_or(CloseStatus::Unconfirmed),
+            disposition: disposition(opener.as_ref().expect("owned opener was joined")),
         },
         Err(reason) => PopupOutcome::Refused {
             reason,
@@ -316,7 +378,8 @@ fn select_in_menu<E: PopupEnv>(
     env: &mut E,
     menu: &E::Id,
     requested: &str,
-) -> Result<(String, i32), String> {
+    prior: PriorInput,
+) -> Result<(String, i32, ChainResult), String> {
     let deadline = env.now() + Duration::from_millis(2500);
     let mut previous: Option<Vec<OptionEntry<E::Id>>> = None;
     let entries = loop {
@@ -366,7 +429,8 @@ fn select_in_menu<E: PopupEnv>(
                     let still_open = matches!(env.menu(), MenuState::Open(ref current) if env.same(menu, current));
                     if unchanged_menu && unchanged_list && still_open {
                         let code = env.press(&entries[i].id);
-                        Ok((entries[i].title.clone(), code))
+                        let option = perform_record(code, prior);
+                        Ok((entries[i].title.clone(), code, option))
                     } else {
                         Err("Menu changed before selection".to_owned())
                     }

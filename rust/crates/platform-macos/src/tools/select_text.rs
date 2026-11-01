@@ -5,6 +5,7 @@ use core_foundation::{
     string::CFString,
 };
 use cua_driver_core::{
+    mutation::{ChainResult, Postcondition, PriorInput, WriteOutcome},
     protocol::ToolResult,
     tool::{Tool, ToolDef},
 };
@@ -101,6 +102,7 @@ struct CfRange {
 struct SelectError {
     message: String,
     post_dispatch: bool,
+    disposition: Option<cua_driver_contract::ErrorDisposition>,
 }
 
 impl SelectError {
@@ -108,6 +110,7 @@ impl SelectError {
         Self {
             message: message.into(),
             post_dispatch: false,
+            disposition: Some(cua_driver_contract::ErrorDisposition::NOT_DELIVERED),
         }
     }
 
@@ -115,6 +118,7 @@ impl SelectError {
         Self {
             message: message.into(),
             post_dispatch: true,
+            disposition: Some(cua_driver_contract::ErrorDisposition::DELIVERED),
         }
     }
 }
@@ -134,7 +138,7 @@ impl From<&str> for SelectError {
 unsafe fn write_selected_text_range(
     element: AXUIElementRef,
     range: SelectedTextRange,
-) -> Result<(), SelectError> {
+) -> Result<i32, SelectError> {
     let range = CfRange {
         location: range.location,
         length: range.length,
@@ -147,32 +151,60 @@ unsafe fn write_selected_text_range(
     let error =
         AXUIElementSetAttributeValue(element, attr.as_concrete_TypeRef(), value as CFTypeRef);
     CFRelease(value as CFTypeRef);
-    (error == kAXErrorSuccess).then_some(()).ok_or_else(|| {
-        SelectError::post(format!(
-            "AXSelectedTextRange write failed with AXError {error}"
-        ))
-    })
+    Ok(error)
 }
 
-unsafe fn select_text_blocking(
-    element: AXUIElementRef,
+trait SelectTextOps {
+    fn exposure_allowed(&mut self) -> bool;
+    fn settable(&mut self) -> bool;
+    fn value(&mut self) -> Option<String>;
+    fn write_range(&mut self, range: SelectedTextRange) -> Result<i32, SelectError>;
+    fn selected_range(&mut self) -> Option<SelectedTextRange>;
+    fn selected_text(&mut self) -> Option<String>;
+}
+
+struct NativeSelectTextOps(AXUIElementRef);
+
+impl SelectTextOps for NativeSelectTextOps {
+    fn exposure_allowed(&mut self) -> bool {
+        selection_exposure_allowed(&mut crate::ax::label_reader::NativeLabelReader, self.0)
+    }
+    fn settable(&mut self) -> bool {
+        unsafe { is_attribute_settable(self.0, "AXSelectedTextRange") }
+    }
+    fn value(&mut self) -> Option<String> {
+        unsafe { copy_string_attr(self.0, "AXValue") }
+    }
+    fn write_range(&mut self, range: SelectedTextRange) -> Result<i32, SelectError> {
+        unsafe { write_selected_text_range(self.0, range) }
+    }
+    fn selected_range(&mut self) -> Option<SelectedTextRange> {
+        unsafe { read_selected_text_range(self.0) }
+    }
+    fn selected_text(&mut self) -> Option<String> {
+        unsafe { copy_string_attr(self.0, "AXSelectedText") }
+    }
+}
+
+fn select_text_with(
+    ops: &mut impl SelectTextOps,
     needle: &str,
     occurrence: Option<usize>,
     prefix: Option<&str>,
     suffix: Option<&str>,
     selection: &str,
 ) -> Result<(String, SelectedTextRange, usize, usize), SelectError> {
-    let mut reader = crate::ax::label_reader::NativeLabelReader;
-    if !selection_exposure_allowed(&mut reader, element) {
+    if !ops.exposure_allowed() {
         return Err(
             "select_text refuses secure fields, and fields whose security attributes could not be read"
                 .into(),
         );
     }
-    if !is_attribute_settable(element, "AXSelectedTextRange") {
+    if !ops.settable() {
         return Err("AXSelectedTextRange is not settable on this element".into());
     }
-    let before = copy_string_attr(element, "AXValue")
+    let before = ops
+        .value()
         .ok_or_else(|| "AXValue is unreadable; selection was not attempted".to_owned())?;
     let matches: Vec<(usize, usize)> = find_occurrences(&before, needle)
         .into_iter()
@@ -212,8 +244,28 @@ unsafe fn select_text_blocking(
         }
         _ => return Err("selection must be text, cursor_before or cursor_after".into()),
     }
-    write_selected_text_range(element, range)?;
-    let after = copy_string_attr(element, "AXValue").ok_or_else(|| {
+    let code = ops.write_range(range)?;
+    let outcome = crate::ax::write_outcome::native_write_outcome(
+        crate::ax::write_outcome::NativeWriteKind::SetAttribute,
+        true,
+        &crate::ax::write_outcome::Settable::Yes,
+        code,
+    );
+    let chain = ChainResult::from_recorded(vec![outcome], PriorInput::None)
+        .expect("a single native write is a valid chain");
+    if outcome != WriteOutcome::Delivered {
+        return Err(SelectError {
+            message: format!("AXSelectedTextRange write failed with AXError {code}"),
+            post_dispatch: !chain.no_input(),
+            disposition: chain.error_disposition(Postcondition::Indeterminate, false),
+        });
+    }
+    if !ops.exposure_allowed() {
+        return Err(SelectError::post(
+            "selection readback withheld because the field became secure or its security could not be determined",
+        ));
+    }
+    let after = ops.value().ok_or_else(|| {
         SelectError::post("AXValue is unreadable after selection; outcome is unverifiable")
     })?;
     if after != before {
@@ -221,14 +273,16 @@ unsafe fn select_text_blocking(
             "AXValue changed during selection; refusing to report success",
         ));
     }
-    let actual_range = read_selected_text_range(element)
+    let actual_range = ops
+        .selected_range()
         .ok_or_else(|| SelectError::post("AXSelectedTextRange readback is unavailable"))?;
     if actual_range != range {
         return Err(SelectError::post(format!(
             "selection range readback mismatch: expected {range:?}, got {actual_range:?}"
         )));
     }
-    let selected_text = copy_string_attr(element, "AXSelectedText")
+    let selected_text = ops
+        .selected_text()
         .ok_or_else(|| SelectError::post("AXSelectedText readback is unavailable"))?;
     let expected_text = if selection == "text" { needle } else { "" };
     if selected_text != expected_text {
@@ -237,6 +291,29 @@ unsafe fn select_text_blocking(
         ));
     }
     Ok((selected_text, range, occurrence, match_count))
+}
+
+fn select_error_result(error: SelectError) -> ToolResult {
+    let code = if error.message.contains("secure") || error.message.contains("not settable") {
+        "cannot_select_text_for_element"
+    } else if error.message.contains("occurrence") {
+        "text_occurrence_out_of_range"
+    } else if error.message.contains("matches") {
+        "text_to_select_ambiguous"
+    } else if error.message.contains("readback") || error.message.contains("AXValue changed") {
+        "selection_readback_mismatch"
+    } else {
+        "text_to_select_not_found"
+    };
+    let mut result = ToolResult::error(format!("select_text failed: {}", error.message))
+        .with_structured(serde_json::json!({
+            "code": code,
+            "effect": if error.post_dispatch { "unverifiable" } else { "refused" }
+        }));
+    if let Some(disposition) = error.disposition {
+        result = result.with_disposition(disposition);
+    }
+    result
 }
 
 #[async_trait]
@@ -299,9 +376,9 @@ impl Tool for SelectTextTool {
             Err(error) => return error,
         };
         let element = resolved.clone();
-        let result = latency::spawn_action_blocking(move || unsafe {
-            select_text_blocking(
-                element.as_ptr() as AXUIElementRef,
+        let result = latency::spawn_action_blocking(move || {
+            select_text_with(
+                &mut NativeSelectTextOps(element.as_ptr() as AXUIElementRef),
                 &needle,
                 occurrence,
                 prefix.as_deref(),
@@ -328,28 +405,7 @@ impl Tool for SelectTextTool {
                 "match_count": match_count,
                 "value_changed": false
             })),
-            Ok(Err(error)) => {
-                let code =
-                    if error.message.contains("secure") || error.message.contains("not settable") {
-                        "cannot_select_text_for_element"
-                    } else if error.message.contains("occurrence") {
-                        "text_occurrence_out_of_range"
-                    } else if error.message.contains("matches") {
-                        "text_to_select_ambiguous"
-                    } else if error.message.contains("readback")
-                        || error.message.contains("AXValue changed")
-                    {
-                        "selection_readback_mismatch"
-                    } else {
-                        "text_to_select_not_found"
-                    };
-                ToolResult::error(format!("select_text failed: {}", error.message)).with_structured(
-                    serde_json::json!({
-                        "code": code,
-                        "effect": if error.post_dispatch { "unverifiable" } else { "refused" }
-                    }),
-                )
-            }
+            Ok(Err(error)) => select_error_result(error),
             Err(error) => ToolResult::error(format!("select_text task failed: {error}")),
         }
     }
@@ -580,5 +636,87 @@ mod tests {
         }
         assert!(selection_exposure_allowed(&mut reader, 0));
         assert!(!reader.trace.iter().any(|(_, name)| name == "AXValue"));
+    }
+}
+
+#[cfg(test)]
+mod u32_outcome_tests {
+    use super::*;
+
+    struct Fake {
+        error: bool,
+        secure_after: bool,
+        writes: usize,
+        values: usize,
+        selected: usize,
+    }
+    impl SelectTextOps for Fake {
+        fn exposure_allowed(&mut self) -> bool {
+            !(self.secure_after && self.writes > 0)
+        }
+        fn settable(&mut self) -> bool {
+            true
+        }
+        fn value(&mut self) -> Option<String> {
+            self.values += 1;
+            Some("hello".into())
+        }
+        fn write_range(&mut self, _: SelectedTextRange) -> Result<i32, SelectError> {
+            self.writes += 1;
+            Ok(if self.error {
+                kAXErrorCannotComplete
+            } else {
+                kAXErrorSuccess
+            })
+        }
+        fn selected_range(&mut self) -> Option<SelectedTextRange> {
+            Some(SelectedTextRange {
+                location: 0,
+                length: 5,
+            })
+        }
+        fn selected_text(&mut self) -> Option<String> {
+            self.selected += 1;
+            Some("hello".into())
+        }
+    }
+    fn fake(error: bool, secure_after: bool) -> Fake {
+        Fake {
+            error,
+            secure_after,
+            writes: 0,
+            values: 0,
+            selected: 0,
+        }
+    }
+    #[test]
+    fn range_write_error_keeps_unverifiable_unsafe_disposition() {
+        let error = select_text_with(&mut fake(true, false), "hello", None, None, None, "text")
+            .unwrap_err();
+        assert!(error.post_dispatch);
+        assert_eq!(
+            error.disposition,
+            Some(cua_driver_contract::ErrorDisposition::SUSPECTED_NOOP)
+        );
+        let serialized = serde_json::to_value(select_error_result(error)).unwrap();
+        let normalized =
+            cua_driver_core::mcp_result::finalize_error_disposition("select_text", serialized);
+        assert_eq!(normalized["structuredContent"]["effect"], "unverifiable");
+        assert_eq!(
+            normalized["structuredContent"]["disposition"]["delivery"],
+            "delivery_uncertain"
+        );
+        assert_eq!(
+            normalized["structuredContent"]["disposition"]["retry"],
+            "unsafe"
+        );
+        assert!(normalized["structuredContent"].get("dispatched").is_none());
+    }
+    #[test]
+    fn withheld_after_selection_reads_no_value_or_selected_text() {
+        let mut ops = fake(false, true);
+        assert!(select_text_with(&mut ops, "hello", None, None, None, "text").is_err());
+        assert_eq!(ops.values, 1);
+        assert_eq!(ops.selected, 0);
     }
 }
