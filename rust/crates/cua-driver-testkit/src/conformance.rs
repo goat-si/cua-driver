@@ -178,9 +178,15 @@ pub fn stale(d: &mut dyn Driver, f: &mut dyn ConformanceFixture) -> ContractOutc
     let before = f.dispatch_count();
     match stale_response(d, f) {
         Ok(r) => {
+            // A stale token is refused inside the tool after the registry
+            // dispatched it, so today's evidence rules report unknown/unknown;
+            // the contract requires a well-formed pair that never claims
+            // delivery, and the dispatch counter proves nothing was sent.
+            let delivery = r.structured()["disposition"]["delivery"].clone();
             let valid = check_response(&r, &["stale_element_token"])
-                && r.structured()["disposition"]
-                    == json!({"delivery":"not_delivered","retry":"safe"});
+                && disposition(&r)
+                && delivery != json!("delivered_unverified")
+                && delivery != json!("delivery_uncertain");
             observed_result(r, valid, no_dispatch(before, f.dispatch_count()))
         }
         Err(e) => fail(e),

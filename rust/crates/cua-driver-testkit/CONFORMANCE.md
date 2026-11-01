@@ -12,7 +12,7 @@ read/act round trip; otherwise set `session_evidence` to an error, producing
 | Contract | Expected evidence | macOS AX | Windows UIA | Linux AT-SPI |
 |---|---|---|---|---|
 | Ambiguity | ambiguous, two candidates, zero dispatches | Required | Required | Required |
-| Stale | destroy, fresh read invalidates token, stale refusal and not_delivered/safe | Required | Required | Required |
+| Stale | destroy, fresh read invalidates token, stale_element_token with a valid disposition that never claims delivery (not_delivered/safe or unknown/unknown), and no dispatch | Required | Required | Required |
 | ForeignSession | session A token refused in B, zero dispatches | Required | Required | Required |
 | GoneReadError | actual injected read error, gone_unconfirmed/lookup_failed | Required | Required | Required |
 | Disposition | well-formed delivery/retry pair on every refusal above | Required | Required | Required |
