@@ -699,7 +699,11 @@ impl Tool for TypeTextTool {
                 &changes.result_suffix(),
             ),
             Ok(Err(e)) => text_delivery_failure("type_text failed", &e),
-            Err(e) => ToolResult::error(format!("Task error: {e}")),
+            Err(e) => ToolResult::error(format!(
+                "Text worker failed: {e}; delivery is unknown. Read fresh state before retrying."
+            ))
+            .with_structured(serde_json::json!({"effect": "unverifiable", "verified": false}))
+            .with_disposition(cua_driver_contract::ErrorDisposition::SUSPECTED_NOOP),
         };
         // Any refusal after a delivered focus action carries its receipt.
         let result = super::not_editable::account_focus_receipt(result, token_receipt);
@@ -872,6 +876,23 @@ pub(crate) fn text_delivery_failure(prefix: &str, error: &anyhow::Error) -> Tool
         }
         return result;
     }
+    if let Some(scope) = error.downcast_ref::<TextScopeError>() {
+        let effect = if scope.chain.no_input() {
+            "refused"
+        } else {
+            "unverifiable"
+        };
+        let mut result = ToolResult::error(message).with_structured(serde_json::json!({
+            "code": super::WINDOW_NOT_KEY, "effect": effect, "keys_sent": false,
+        }));
+        if let Some(disposition) = scope.chain.error_disposition(
+            cua_driver_core::mutation::Postcondition::Indeterminate,
+            false,
+        ) {
+            result = result.with_disposition(disposition);
+        }
+        return result;
+    }
     match error.downcast_ref::<crate::input::keyboard::PasteMayHaveLanded>() {
         Some(paste) => ToolResult::error(format!(
             "{message}. Read the field before typing the text again."
@@ -889,6 +910,13 @@ pub(crate) fn text_delivery_failure(prefix: &str, error: &anyhow::Error) -> Tool
 #[derive(Debug, thiserror::Error)]
 #[error("{message}")]
 struct TextWriteError {
+    message: String,
+    chain: cua_driver_core::mutation::ChainResult,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+struct TextScopeError {
     message: String,
     chain: cua_driver_core::mutation::ChainResult,
 }
@@ -1732,14 +1760,33 @@ unsafe fn set_raw_attr(
     element: AXUIElementRef,
     name: &str,
     value: core_foundation::base::CFTypeRef,
-) {
+) -> i32 {
     use core_foundation::{base::TCFType, string::CFString};
     let attr = CFString::new(name);
-    let _ = crate::ax::bindings::AXUIElementSetAttributeValue(
-        element,
-        attr.as_concrete_TypeRef(),
-        value,
-    );
+    crate::ax::bindings::AXUIElementSetAttributeValue(element, attr.as_concrete_TypeRef(), value)
+}
+
+fn restore_range_with(
+    settable: crate::ax::write_outcome::Settable,
+    prior: cua_driver_core::mutation::PriorInput,
+    send: impl FnOnce() -> i32,
+) -> Result<(), TextWriteError> {
+    use crate::ax::write_outcome::{native_write_outcome, NativeWriteKind};
+    use cua_driver_core::mutation::{ChainResult, WriteOutcome};
+    let error = send();
+    let outcome = native_write_outcome(NativeWriteKind::SetAttribute, true, &settable, error);
+    let chain =
+        ChainResult::from_recorded(vec![outcome], prior).expect("one restored range setter");
+    if outcome == WriteOutcome::Delivered {
+        Ok(())
+    } else {
+        Err(TextWriteError {
+            message: format!(
+                "restoring AXSelectedTextRange returned error {error}; no text was sent"
+            ),
+            chain,
+        })
+    }
 }
 
 /// After an activation, wait until WindowServer has kept `window_id`'s
@@ -1797,6 +1844,7 @@ struct KeyFocusChecks {
     /// the first-key settle, because activation can end an editing session.
     recheck_editability_after_settle: bool,
     prior: cua_driver_core::mutation::PriorInput,
+    focus_already_written: bool,
 }
 
 fn focus_write_with(
@@ -1850,6 +1898,7 @@ fn cgevent_type_verified(
         exact_focus: focused_key_route,
         recheck_editability_after_settle,
         mut prior,
+        focus_already_written,
     } = checks;
     if replace {
         let (ptr, _) = element_ptr_and_idx.ok_or_else(|| {
@@ -1866,7 +1915,7 @@ fn cgevent_type_verified(
     }
     // A sent focus write is a separate mutation; never repeat it after an
     // uncertain return or merely because a subsequent focus read is stale.
-    if let Some((ptr, _)) = element_ptr_and_idx {
+    if let Some((ptr, _)) = element_ptr_and_idx.filter(|_| !focus_already_written) {
         let settable =
             unsafe { crate::ax::write_outcome::query_settable(ptr as AXUIElementRef, "AXFocused") };
         focus_write_with(settable, prior, || {
@@ -2548,6 +2597,58 @@ fn prior_for_key_entry(
     }
 }
 
+fn scope_entry_failure(
+    error: crate::input::skylight::ScopeEntryError,
+    previous: cua_driver_core::mutation::PriorInput,
+) -> TextScopeError {
+    use crate::input::skylight::{scope_disclosure, HandBack};
+    use cua_driver_core::mutation::{ChainResult, PriorInput, Reason, WriteOutcome};
+    let mut prior = prior_for_key_entry(previous, error.entry);
+    if error
+        .hand_back
+        .is_some_and(|hand_back| hand_back != HandBack::NotMoved)
+    {
+        prior = PriorInput::MayHaveDelivered;
+    }
+    let chain = ChainResult::from_recorded(
+        vec![WriteOutcome::StopNotDelivered(Reason::UnconfirmedAlive)],
+        prior,
+    )
+    .expect("one scope entry stop");
+    let disclosure = scope_disclosure(error.entry, error.hand_back);
+    TextScopeError {
+        message: format!("{}; no text was sent. {disclosure}", error.reason),
+        chain,
+    }
+}
+
+fn text_key_scope(
+    pid: i32,
+    window_id: Option<u32>,
+    prior: cua_driver_core::mutation::PriorInput,
+) -> Result<Option<crate::input::skylight::WindowKeyScope>, TextScopeError> {
+    use crate::input::skylight;
+    let Some(wid) = window_id else {
+        return Ok(None);
+    };
+    if !skylight::is_available() {
+        return Err(scope_entry_failure(
+            skylight::ScopeEntryError {
+                reason: skylight::KEY_POST_SPI_UNAVAILABLE.into(),
+                entry: Default::default(),
+                hand_back: None,
+            },
+            prior,
+        ));
+    }
+    if !skylight::is_focus_without_raise_available() {
+        return Ok(None);
+    }
+    skylight::enter_exact_window_key_inline_detailed(pid, wid)
+        .map(Some)
+        .map_err(|error| scope_entry_failure(error, prior))
+}
+
 /// Best-effort-background ladder for `type_text`.
 ///
 /// - `delivery_mode == Background` (default): AX insert → read-back; on a
@@ -2573,16 +2674,7 @@ fn type_text_blocking(
     let _scope = if !route.delivery_mode.is_foreground()
         && matches!(route.keyboard_policy, BackgroundKeyboardPolicy::Allowed)
     {
-        match super::key_scope(pid, route.window_id) {
-            Ok(scope) => scope,
-            Err(reason) => {
-                return Ok(TypeTextDelivery::Refused(BackgroundRefusal {
-                    code: super::WINDOW_NOT_KEY,
-                    reason,
-                    advice: Some("foreground"),
-                }))
-            }
-        }
+        text_key_scope(pid, route.window_id, route.prior)?
     } else {
         None
     };
@@ -2757,7 +2849,7 @@ fn type_text_in_key_window(
         // dropped. 200ms covers that re-grab without penalizing an already
         // armed interactive stream on every text chunk.
         let foreground_settle_ms = foreground_settle_ms(pid, apps::frontmost_pid());
-        let do_type = |element: Option<(usize, Option<usize>)>| {
+        let do_type = |element: Option<(usize, Option<usize>)>, focus_already_written: bool| {
             cgevent_type_verified(
                 KeyReceiver {
                     pid,
@@ -2775,6 +2867,7 @@ fn type_text_in_key_window(
                 KeyFocusChecks {
                     exact_focus: focused_key_route,
                     recheck_editability_after_settle: !late_fg_targeted,
+                    focus_already_written,
                     prior: if window_id.is_some() {
                         cua_driver_core::mutation::PriorInput::MayHaveDelivered
                     } else {
@@ -2797,7 +2890,17 @@ fn type_text_in_key_window(
                     || {
                         late_fg_cell_check(pid, Some(wid), late_fg_targeted)?;
                         if let Some((ptr, _)) = element_ptr_and_idx {
-                            crate::input::ax_actions::focus_element(ptr)?;
+                            let settable = unsafe {
+                                crate::ax::write_outcome::query_settable(
+                                    ptr as AXUIElementRef,
+                                    "AXFocused",
+                                )
+                            };
+                            focus_write_with(
+                                settable,
+                                cua_driver_core::mutation::PriorInput::MayHaveDelivered,
+                                || crate::input::ax_actions::focus_element_raw(ptr),
+                            )?;
                         }
                         if foreground_settle_ms > 0 {
                             std::thread::sleep(std::time::Duration::from_millis(
@@ -2869,15 +2972,32 @@ fn type_text_in_key_window(
                 let fronted =
                     crate::input::skylight::with_foreground_assist(pid as libc::pid_t, wid, || {
                         if let Some(element) = remembered {
-                            let _ = crate::input::ax_actions::focus_element(element as usize);
+                            let settable = unsafe {
+                                crate::ax::write_outcome::query_settable(element, "AXFocused")
+                            };
+                            focus_write_with(
+                                settable,
+                                cua_driver_core::mutation::PriorInput::MayHaveDelivered,
+                                || crate::input::ax_actions::focus_element_raw(element as usize),
+                            )?;
                             if let Some(selection) = selection {
-                                unsafe { set_raw_attr(element, SELECTED_RANGE, selection) };
+                                let settable = unsafe {
+                                    crate::ax::write_outcome::query_settable(
+                                        element,
+                                        SELECTED_RANGE,
+                                    )
+                                };
+                                restore_range_with(
+                                    settable,
+                                    cua_driver_core::mutation::PriorInput::MayHaveDelivered,
+                                    || unsafe { set_raw_attr(element, SELECTED_RANGE, selection) },
+                                )?;
                             }
                         }
                         late_fg_cell_check(pid, Some(wid), late_fg_targeted)?;
                         // The remembered field is focused again; the read-back
                         // follows the focused element.
-                        typed_delivery = do_type(element_ptr_and_idx)?;
+                        typed_delivery = do_type(element_ptr_and_idx, remembered.is_some())?;
                         Ok(())
                     });
                 unsafe {
@@ -2911,14 +3031,14 @@ fn type_text_in_key_window(
                     wid,
                     || {
                         late_fg_cell_check(pid, Some(wid), late_fg_targeted)?;
-                        typed_delivery = do_type(element_ptr_and_idx)?;
+                        typed_delivery = do_type(element_ptr_and_idx, false)?;
                         Ok(())
                     },
                 )?;
                 (typed_delivery, fronted)
             }
             // No window to front — best-effort background keystrokes instead.
-            None => (do_type(element_ptr_and_idx)?, false),
+            None => (do_type(element_ptr_and_idx, false)?, false),
         };
         // Only claim the `_fg` path when a front actually happened; when no
         // foregrounding occurred (no window, or SPIs unavailable) these were
@@ -2972,6 +3092,7 @@ fn type_text_in_key_window(
                 exact_focus: focused_key_route,
                 recheck_editability_after_settle: false,
                 prior,
+                focus_already_written: false,
             },
         )?;
         return Ok(TypeTextDelivery::Typed(TypeTextOutcome {
@@ -3192,6 +3313,7 @@ fn type_text_in_key_window(
             exact_focus: focused_key_route,
             recheck_editability_after_settle: false,
             prior,
+            focus_already_written: false,
         },
     )?;
     Ok(TypeTextDelivery::Typed(TypeTextOutcome {
@@ -3386,6 +3508,16 @@ mod selection_outcome_tests {
             Some(cua_driver_contract::ErrorDisposition::SUSPECTED_NOOP)
         );
         assert!(focus_write_with(Settable::Yes, PriorInput::None, || kAXErrorSuccess).is_ok());
+        let range_error = restore_range_with(Settable::Yes, PriorInput::MayHaveDelivered, || {
+            kAXErrorCannotComplete
+        })
+        .unwrap_err();
+        assert_eq!(
+            range_error
+                .chain
+                .error_disposition(Postcondition::Indeterminate, false),
+            Some(cua_driver_contract::ErrorDisposition::SUSPECTED_NOOP)
+        );
         assert_eq!(
             prior_for_receipt(Some(super::super::not_editable::FocusDispatch::SentAx)),
             PriorInput::MayHaveDelivered
@@ -3399,6 +3531,37 @@ mod selection_outcome_tests {
                 }
             ),
             PriorInput::MayHaveDelivered
+        );
+        let scope = scope_entry_failure(
+            crate::input::skylight::ScopeEntryError {
+                reason: "unconfirmed".into(),
+                entry: crate::input::skylight::KeyEntry {
+                    records_uncertain: true,
+                    ..Default::default()
+                },
+                hand_back: Some(crate::input::skylight::HandBack::Deferred),
+            },
+            PriorInput::None,
+        );
+        let result = text_delivery_failure("type_text", &scope.into());
+        assert_eq!(result.structured_content.unwrap()["effect"], "unverifiable");
+        assert_eq!(
+            result.disposition,
+            Some(cua_driver_contract::ErrorDisposition::SUSPECTED_NOOP)
+        );
+        let scope = scope_entry_failure(
+            crate::input::skylight::ScopeEntryError {
+                reason: "unconfirmed".into(),
+                entry: Default::default(),
+                hand_back: None,
+            },
+            PriorInput::None,
+        );
+        let result = text_delivery_failure("type_text", &scope.into());
+        assert_eq!(result.structured_content.unwrap()["effect"], "refused");
+        assert_eq!(
+            result.disposition,
+            Some(cua_driver_contract::ErrorDisposition::NOT_DELIVERED)
         );
     }
 
