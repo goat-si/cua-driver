@@ -1,6 +1,7 @@
 use super::{ElementFacts, Occluder};
+use crate::protocol::ToolResult;
 use serde::Serialize;
-use serde_json::{json, Value};
+use serde_json::json;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
@@ -61,12 +62,22 @@ impl ActionabilityReport {
             disposition: None,
         }
     }
-    /// Returns an additive refusal detail; success has no actionability payload.
-    pub fn refusal_json(&self) -> Option<Value> {
+    /// Converts a terminal report into the public refusal result.
+    pub fn refusal_result(&self) -> Option<ToolResult> {
         match &self.verdict {
-            Verdict::Terminal { code, reason } => Some(
-                json!({"actionability": {"verdict":"terminal", "code":code, "reason":reason, "waited_ms":self.waited_ms}}),
-            ),
+            Verdict::Terminal { code, reason } => {
+                let message = format!("{code}: {reason} (waited {} ms)", self.waited_ms);
+                let mut result = ToolResult::error(&message).with_structured(json!({
+                    "code": "element_not_actionable",
+                    "effect": "refused",
+                    "refusal": {"code": "element_not_actionable", "message": message}
+                }));
+                if self.disposition == Some(DispositionIntent::NotDeliveredSafe) {
+                    result = result
+                        .with_disposition(cua_driver_contract::ErrorDisposition::NOT_DELIVERED);
+                }
+                Some(result)
+            }
             _ => None,
         }
     }

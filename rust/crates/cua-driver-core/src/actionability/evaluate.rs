@@ -7,24 +7,36 @@ use super::{
 pub struct Policy {
     allow_cursor_move: bool,
     allow_focus_steal: bool,
+    background_window: bool,
 }
 impl Policy {
     pub const fn headless() -> Self {
         Self {
             allow_cursor_move: false,
             allow_focus_steal: false,
+            background_window: false,
         }
     }
     pub const fn focus_fallback() -> Self {
         Self {
             allow_cursor_move: false,
             allow_focus_steal: true,
+            background_window: false,
         }
     }
     pub const fn headed() -> Self {
         Self {
             allow_cursor_move: true,
             allow_focus_steal: true,
+            background_window: false,
+        }
+    }
+    /// Deliver physical pointer events to the target window without focus.
+    pub const fn background_window() -> Self {
+        Self {
+            allow_cursor_move: false,
+            allow_focus_steal: false,
+            background_window: true,
         }
     }
     fn is_headed(self) -> bool {
@@ -72,10 +84,21 @@ fn gate(checks: &mut Vec<Check>, name: &'static str, evidence: &Evidence<bool>, 
 }
 
 /// Evaluates only live evidence supplied by the caller; no platform calls occur.
-pub fn evaluate(intent: Intent, facts: &ElementFacts, policy: Policy) -> ActionabilityReport {
+pub fn evaluate(intent: Intent<'_>, facts: &ElementFacts, policy: Policy) -> ActionabilityReport {
     use Intent::*;
     let requirements = intent.requirements();
     let mut checks = Vec::new();
+    if policy.background_window && !requirements.receives_events {
+        push(
+            &mut checks,
+            "policy",
+            CheckStatus::Terminal {
+                code: "policy_denied",
+            },
+            "background window delivery requires a pointer intent",
+        );
+        return ActionabilityReport::from_checks(checks, facts.clone());
+    }
     let actions = match &facts.affordances {
         Evidence::Known(v) => Some(v.as_slice()),
         Evidence::Absent => Some(&[][..]),
@@ -87,13 +110,23 @@ pub fn evaluate(intent: Intent, facts: &ElementFacts, policy: Policy) -> Actiona
         RightClick => has(&[Affordance::ShowMenu]),
         _ => false,
     };
-    let semantic_pointer = requirements.receives_events && !policy.is_headed() && direct;
+    let semantic_pointer =
+        requirements.receives_events && !policy.is_headed() && !policy.background_window && direct;
+    let semantic_nonpointer = match intent {
+        Open => has(&[Affordance::Open]),
+        SelectText => matches!(facts.selectable_text, Evidence::Known(true)),
+        PerformAction { name } => {
+            matches!(&facts.advertised_actions, Evidence::Known(actions) if actions.iter().any(|action| action == name))
+        }
+        _ => false,
+    };
     let without_pointer = policy == Policy::headless()
         && (semantic_pointer
+            || semantic_nonpointer
             || (!requirements.receives_events && has(supported_affordances(intent))));
     let keyboard = matches!(intent, TypeText | PressKey | KeyDown | KeyUp);
-    let geometry_needed =
-        !keyboard && !(without_pointer && (semantic_pointer || requirements.editable));
+    let geometry_needed = !keyboard
+        && !(without_pointer && (semantic_pointer || requirements.editable || semantic_nonpointer));
     if requirements.visible {
         gate(&mut checks, "visible", &facts.visible, false);
         match &facts.offscreen {
@@ -154,7 +187,7 @@ pub fn evaluate(intent: Intent, facts: &ElementFacts, policy: Policy) -> Actiona
             gate(&mut checks, "stable", &facts.stable, false);
         }
     }
-    if requirements.enabled {
+    if requirements.enabled || policy.background_window {
         gate(&mut checks, "enabled", &facts.enabled, false);
     }
     if requirements.editable {
@@ -177,8 +210,21 @@ pub fn evaluate(intent: Intent, facts: &ElementFacts, policy: Policy) -> Actiona
             Evidence::Absent => gate(&mut checks, "editable", &facts.editable, true),
         }
     }
-    let physical_allowed = policy.allow_cursor_move && policy.allow_focus_steal;
-    let support = if matches!(intent, Hover | Drag | ScrollTo) {
+    let physical_allowed =
+        (policy.allow_cursor_move && policy.allow_focus_steal) || policy.background_window;
+    let support = if matches!(intent, SelectText) {
+        match &facts.selectable_text {
+            Evidence::Known(v) => Some(*v),
+            Evidence::Absent => Some(false),
+            Evidence::Unknown(_) => None,
+        }
+    } else if let PerformAction { name } = intent {
+        match &facts.advertised_actions {
+            Evidence::Known(v) => Some(v.iter().any(|action| action == name)),
+            Evidence::Absent => Some(false),
+            Evidence::Unknown(_) => None,
+        }
+    } else if matches!(intent, Hover | Drag | ScrollTo) {
         Some(true)
     } else if matches!(intent, Click | RightClick) {
         if (!policy.is_headed() && direct) || physical_allowed {
@@ -230,7 +276,7 @@ pub fn evaluate(intent: Intent, facts: &ElementFacts, policy: Policy) -> Actiona
             "affordances unavailable",
         ),
     }
-    if matches!(intent, Hover | Drag) && !policy.allow_cursor_move {
+    if matches!(intent, Hover | Drag) && !policy.allow_cursor_move && !policy.background_window {
         push(
             &mut checks,
             "policy",
@@ -242,6 +288,12 @@ pub fn evaluate(intent: Intent, facts: &ElementFacts, policy: Policy) -> Actiona
     }
     if requirements.receives_events && !semantic_pointer {
         match &facts.receives_events {
+            Evidence::Known(e) if policy.background_window != e.target_window => push(
+                &mut checks,
+                "receives_events",
+                CheckStatus::Transient { unknown: true },
+                "hit test evidence is for a different delivery scope",
+            ),
             Evidence::Known(e) if e.verified_point.is_some() => {
                 push(&mut checks, "receives_events", CheckStatus::Pass, "")
             }
