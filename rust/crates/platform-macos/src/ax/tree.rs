@@ -1693,9 +1693,16 @@ fn walk_element<S: AxTreeSource>(
         let read = match value {
             super::write_outcome::Settable::Yes => Read::Known(true),
             super::write_outcome::Settable::No => Read::Known(false),
-            super::write_outcome::Settable::Unknown(error) => Read::Unknown(super::tree_source::ReadFailure::Ax(error)),
+            super::write_outcome::Settable::Unknown(error) => {
+                Read::Unknown(super::tree_source::ReadFailure::Ax(error))
+            }
         };
-        super::evidence::observe_read(Some(element_key), super::evidence::ReadSite::ValueSettable, read).into_walk_legacy();
+        super::evidence::observe_read(
+            Some(element_key),
+            super::evidence::ReadSite::ValueSettable,
+            read,
+        )
+        .into_walk_legacy();
     }
     let value_settable = matches!(
         value_settable_read,

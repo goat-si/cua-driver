@@ -188,6 +188,9 @@ impl<S: AxTreeSource> AxTreeSource for EvidenceSource<'_, S> {
     fn set_messaging_timeout(&self, e: &Self::Element) {
         self.source.set_messaging_timeout(e)
     }
+    fn set_optional_timeout(&self, e: &Self::Element, seconds: f32) {
+        self.source.set_optional_timeout(e, seconds)
+    }
     fn text(&self, e: &Self::Element, name: &str) -> Read<String> {
         let v = self.source.text(e, name);
         self.record(e, name, &v);
