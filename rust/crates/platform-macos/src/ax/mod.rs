@@ -33,6 +33,7 @@ pub mod reveal_scroll;
 pub mod scroll_area;
 pub mod snapshot;
 pub mod tree;
+mod tree_source;
 pub mod window_scope;
 pub(crate) mod write_outcome;
 

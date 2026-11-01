@@ -5,10 +5,9 @@
 //! them together; any failure replays the single reads, which convert with the
 //! same functions so both paths return the same values.
 
-use super::batch_attrs::{
-    batch_failure_action, copy_attrs_batch, BatchFailureAction, BatchRead, BatchSlots,
-};
+use super::batch_attrs::{batch_failure_action, BatchFailure, BatchFailureAction};
 use super::bindings::*;
+use super::tree_source::{AxTreeSource, Read, TreeBatch};
 use cua_driver_core::walk_budget::WalkBudget;
 
 const CONTROL_ATTRIBUTES: [&str; 7] = [
@@ -33,44 +32,51 @@ pub(crate) struct ControlAttrs {
     pub selected: Option<bool>,
 }
 
+fn known<T>(read: Read<T>) -> Option<T> {
+    match read {
+        Read::Known(value) => Some(value),
+        Read::Absent | Read::Unknown(_) => None,
+    }
+}
+
+fn batch_text(batch: &impl TreeBatch, index: usize) -> Option<String> {
+    match batch.text(index) {
+        super::content_attrs::AttrStatus::Known(value) => Some(value),
+        _ => None,
+    }
+}
+
 impl ControlAttrs {
-    fn from_slots(slots: &BatchSlots) -> Self {
-        unsafe {
-            Self {
-                enabled: slots.raw(0).and_then(|v| bool_from_cf(v)),
-                frame: rect_from_parts(
-                    slots.raw(1).and_then(|v| point_from_cf(v)),
-                    slots.raw(2).and_then(|v| size_from_cf(v)),
-                ),
-                value_description: slots.string(3),
-                min_value: slots.raw(4).and_then(|v| number_from_cf(v)),
-                max_value: slots.raw(5).and_then(|v| number_from_cf(v)),
-                selected: slots.raw(6).and_then(|v| bool_from_cf(v)),
-            }
+    fn from_slots(slots: &impl TreeBatch) -> Self {
+        Self {
+            enabled: known(slots.boolean(0)),
+            frame: rect_from_parts(known(slots.position(1)), known(slots.size(2))),
+            value_description: batch_text(slots, 3),
+            min_value: known(slots.number(4)),
+            max_value: known(slots.number(5)),
+            selected: known(slots.boolean(6)),
         }
     }
 
-    /// The single reads, each started only before the deadline. `None` when
-    /// one would start past it.
-    unsafe fn from_singles(element: AXUIElementRef, step: &Stepper) -> Option<Self> {
+    /// The single reads, each started only before the deadline.
+    fn from_singles<S: AxTreeSource>(
+        source: &S,
+        element: &S::Element,
+        step: &Stepper,
+    ) -> Option<Self> {
         Some(Self {
-            enabled: step.read(|| copy_bool_attr(element, "AXEnabled"))?,
-            frame: frame_from_singles(element, step)?,
-            value_description: step.read(|| copy_string_attr(element, "AXValueDescription"))?,
-            min_value: step.read(|| copy_number_attr(element, "AXMinValue"))?,
-            max_value: step.read(|| copy_number_attr(element, "AXMaxValue"))?,
-            selected: step.read(|| copy_bool_attr(element, "AXSelected"))?,
+            enabled: step.read(|| known(source.boolean(element, "AXEnabled")))?,
+            frame: frame_from_singles(source, element, step)?,
+            value_description: step.read(|| known(source.text(element, "AXValueDescription")))?,
+            min_value: step.read(|| known(source.number(element, "AXMinValue")))?,
+            max_value: step.read(|| known(source.number(element, "AXMaxValue")))?,
+            selected: step.read(|| known(source.boolean(element, "AXSelected")))?,
         })
     }
 }
 
-fn frame_from_slots(slots: &BatchSlots) -> Option<[f64; 4]> {
-    unsafe {
-        rect_from_parts(
-            slots.raw(0).and_then(|v| point_from_cf(v)),
-            slots.raw(1).and_then(|v| size_from_cf(v)),
-        )
-    }
+fn frame_from_slots(slots: &impl TreeBatch) -> Option<[f64; 4]> {
+    rect_from_parts(known(slots.position(0)), known(slots.size(1)))
 }
 
 /// Starts one AX read after another, none past the walk's deadline.
@@ -87,11 +93,15 @@ impl Stepper<'_> {
 
 /// [`element_screen_rect`]'s two reads, each started only before the
 /// deadline: `Some(frame)` as it reads, `None` when a read would start past it.
-unsafe fn frame_from_singles(element: AXUIElementRef, step: &Stepper) -> Option<Option<[f64; 4]>> {
-    let Some(position) = step.read(|| copy_position_attr(element))? else {
+fn frame_from_singles<S: AxTreeSource>(
+    source: &S,
+    element: &S::Element,
+    step: &Stepper,
+) -> Option<Option<[f64; 4]>> {
+    let Some(position) = step.read(|| known(source.position(element)))? else {
         return Some(None);
     };
-    let size = step.read(|| copy_size_attr(element))?;
+    let size = step.read(|| known(source.size(element)))?;
     Some(rect_from_parts(Some(position), size))
 }
 
@@ -117,11 +127,11 @@ fn replay_after_batch_failure(
 /// One batched read, or its single reads, within the walk's deadline. No read
 /// starts past it, and a read that ends past it is discarded: the walk stops
 /// and the caller keeps the row's role only.
-fn read_within_deadline<T>(
+fn read_within_deadline<T, B>(
     budget: &mut WalkBudget,
     batching_disabled: &mut bool,
-    batch: impl FnOnce() -> BatchRead,
-    from_slots: impl FnOnce(&BatchSlots) -> T,
+    batch: impl FnOnce() -> Result<B, BatchFailure>,
+    from_slots: impl FnOnce(&B) -> T,
     singles: impl FnOnce(&Stepper) -> Option<T>,
 ) -> Option<T> {
     let read = 'read: {
@@ -133,8 +143,8 @@ fn read_within_deadline<T>(
             };
             match batched {
                 None => break 'read None,
-                Some(BatchRead::Slots(slots)) => break 'read Some(from_slots(&slots)),
-                Some(BatchRead::Fallback(kind)) => {
+                Some(Ok(slots)) => break 'read Some(from_slots(&slots)),
+                Some(Err(kind)) => {
                     if !replay_after_batch_failure(kind, budget, batching_disabled) {
                         return None;
                     }
@@ -162,18 +172,26 @@ pub(crate) unsafe fn frame_batched(
     element: AXUIElementRef,
     budget: &WalkBudget,
 ) -> Option<Option<[f64; 4]>> {
+    super::tree_source::native::with_borrowed(element, |source, element| {
+        frame_batched_with(source, element, budget)
+    })
+}
+
+fn frame_batched_with<S: AxTreeSource>(
+    source: &S,
+    element: &S::Element,
+    budget: &WalkBudget,
+) -> Option<Option<[f64; 4]>> {
     let expired = || budget.expired();
     let step = Stepper { expired: &expired };
-    let frame = match step.read(|| copy_attrs_batch(element, &FRAME_ATTRIBUTES))? {
-        BatchRead::Slots(slots) => Some(frame_from_slots(&slots)),
-        BatchRead::Fallback(_) => frame_from_singles(element, &step),
+    let frame = match step.read(|| source.batch(element, &FRAME_ATTRIBUTES))? {
+        Ok(slots) => Some(frame_from_slots(&slots)),
+        Err(_) => frame_from_singles(source, element, &step),
     }?;
     step.read(|| frame)
 }
 
-/// The control state and frame of an element that may be indexed, or `None`
-/// when a read would start, or ended, past the walk's deadline (the walk is
-/// stopped).
+/// The control state and frame of an element that may be indexed.
 ///
 /// # Safety
 /// `element` must be a live AX element.
@@ -182,17 +200,27 @@ pub(crate) unsafe fn read_control_attrs(
     budget: &mut WalkBudget,
     batching_disabled: &mut bool,
 ) -> Option<ControlAttrs> {
+    super::tree_source::native::with_borrowed(element, |source, element| {
+        read_control_attrs_with(source, element, budget, batching_disabled)
+    })
+}
+
+fn read_control_attrs_with<S: AxTreeSource>(
+    source: &S,
+    element: &S::Element,
+    budget: &mut WalkBudget,
+    batching_disabled: &mut bool,
+) -> Option<ControlAttrs> {
     read_within_deadline(
         budget,
         batching_disabled,
-        || copy_attrs_batch(element, &CONTROL_ATTRIBUTES),
+        || source.batch(element, &CONTROL_ATTRIBUTES),
         ControlAttrs::from_slots,
-        |step| ControlAttrs::from_singles(element, step),
+        |step| ControlAttrs::from_singles(source, element, step),
     )
 }
 
-/// The frame of an element, as [`element_screen_rect`] reads it, or `None` when
-/// a read would start, or ended, past the walk's deadline (the walk is stopped).
+/// The frame of an element as `element_screen_rect` reads it.
 ///
 /// # Safety
 /// `element` must be a live AX element.
@@ -201,17 +229,30 @@ pub(crate) unsafe fn read_frame(
     budget: &mut WalkBudget,
     batching_disabled: &mut bool,
 ) -> Option<Option<[f64; 4]>> {
+    super::tree_source::native::with_borrowed(element, |source, element| {
+        read_frame_with(source, element, budget, batching_disabled)
+    })
+}
+
+fn read_frame_with<S: AxTreeSource>(
+    source: &S,
+    element: &S::Element,
+    budget: &mut WalkBudget,
+    batching_disabled: &mut bool,
+) -> Option<Option<[f64; 4]>> {
     read_within_deadline(
         budget,
         batching_disabled,
-        || copy_attrs_batch(element, &FRAME_ATTRIBUTES),
+        || source.batch(element, &FRAME_ATTRIBUTES),
         frame_from_slots,
-        |step| frame_from_singles(element, step),
+        |step| frame_from_singles(source, element, step),
     )
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::batch_attrs::BatchRead;
+    use super::super::tree_source::NativeBatch;
     use super::*;
     use core_foundation::{
         array::CFArray,
@@ -237,7 +278,7 @@ mod tests {
         }
     }
 
-    fn slots(values: &[CFType]) -> BatchSlots {
+    fn slots(values: &[CFType]) -> NativeBatch {
         let array = CFArray::from_CFTypes(values);
         let raw = array.as_CFTypeRef();
         let read = unsafe {
@@ -247,13 +288,14 @@ mod tests {
         let BatchRead::Slots(slots) = read else {
             panic!("valid control state must decode");
         };
-        slots
+        NativeBatch(slots)
     }
 
     #[test]
     fn no_read_starts_past_the_deadline_and_a_late_read_is_discarded() {
         use super::super::batch_attrs::BatchFailure;
-        let never = || -> BatchRead { panic!("no batch past the deadline") };
+        let never =
+            || -> Result<NativeBatch, BatchFailure> { panic!("no batch past the deadline") };
         let mut expired = WalkBudget::new(0, 10);
         let _ = expired.admit();
         let mut disabled = false;
@@ -296,7 +338,7 @@ mod tests {
         let read = read_within_deadline(
             &mut live,
             &mut disabled,
-            || BatchRead::Fallback(BatchFailure::Decode),
+            || Err::<NativeBatch, _>(BatchFailure::Decode),
             |_| 1,
             |step| step.read(|| 9),
         );
@@ -386,6 +428,144 @@ mod tests {
                 Some((5.0, 5.0)),
             ),
             None
+        );
+    }
+}
+
+#[cfg(test)]
+mod source_adapter_tests {
+    use super::*;
+    use crate::ax::batch_attrs::BatchFailure;
+    use crate::ax::content_attrs::AttrStatus;
+    use crate::ax::tree_source::NativeBatch;
+    use crate::ax::write_outcome::Settable;
+    use std::cell::RefCell;
+
+    struct Source {
+        trace: RefCell<Vec<String>>,
+        position_present: bool,
+    }
+    impl AxTreeSource for Source {
+        type Element = ();
+        type Batch = NativeBatch;
+        type ElementSet = ();
+        fn key(&self, _: &()) -> usize {
+            panic!("unexpected key")
+        }
+        fn set_messaging_timeout(&self, _: &()) {
+            panic!("unexpected timeout")
+        }
+        fn text(&self, _: &(), name: &str) -> Read<String> {
+            self.trace.borrow_mut().push(name.into());
+            Read::Absent
+        }
+        fn text_status(&self, _: &(), _: &str) -> AttrStatus {
+            panic!("unexpected status")
+        }
+        fn boolean(&self, _: &(), name: &str) -> Read<bool> {
+            self.trace.borrow_mut().push(name.into());
+            Read::Known(true)
+        }
+        fn number(&self, _: &(), name: &str) -> Read<f64> {
+            self.trace.borrow_mut().push(name.into());
+            Read::Absent
+        }
+        fn position(&self, _: &()) -> Read<(f64, f64)> {
+            self.trace.borrow_mut().push("AXPosition".into());
+            if self.position_present {
+                Read::Known((10.0, 20.0))
+            } else {
+                Read::Absent
+            }
+        }
+        fn size(&self, _: &()) -> Read<(f64, f64)> {
+            self.trace.borrow_mut().push("AXSize".into());
+            Read::Known((30.0, 40.0))
+        }
+        fn value(&self, _: &()) -> Result<Option<StringishAttrValue>, AXError> {
+            panic!("unexpected value")
+        }
+        fn batch(&self, _: &(), names: &[&str]) -> Result<NativeBatch, BatchFailure> {
+            self.trace
+                .borrow_mut()
+                .push(format!("batch:{}", names.join(",")));
+            Err(BatchFailure::Decode)
+        }
+        fn children(&self, _: &()) -> Read<Vec<()>> {
+            panic!("unexpected children")
+        }
+        fn element_attribute(&self, _: &(), _: &str) -> Read<()> {
+            panic!("unexpected element")
+        }
+        fn element_set(&self, _: &(), _: &str) -> Read<()> {
+            panic!("unexpected set")
+        }
+        fn set_contains(&self, _: &(), _: &()) -> bool {
+            panic!("unexpected membership")
+        }
+        fn action_names(&self, _: &()) -> Read<Vec<String>> {
+            panic!("unexpected actions")
+        }
+        fn value_settable(&self, _: &()) -> bool {
+            panic!("unexpected writable")
+        }
+        fn selected_settable(&self, _: &()) -> Settable {
+            panic!("unexpected selected")
+        }
+        fn frame(&self, _: &()) -> Read<[f64; 4]> {
+            panic!("unexpected frame")
+        }
+        fn retain_for_snapshot(&self, _: &()) -> usize {
+            panic!("unexpected retain")
+        }
+    }
+
+    #[test]
+    fn failed_control_batch_replays_singles_in_order() {
+        let source = Source {
+            trace: RefCell::new(Vec::new()),
+            position_present: true,
+        };
+        let mut budget = WalkBudget::nodes_only(10);
+        let _ = budget.admit();
+        let mut disabled = false;
+        let result = read_control_attrs_with(&source, &(), &mut budget, &mut disabled).unwrap();
+        assert_eq!(result.frame, Some([10.0, 20.0, 30.0, 40.0]));
+        assert_eq!(
+            source.trace.into_inner(),
+            [
+                format!("batch:{}", CONTROL_ATTRIBUTES.join(",")),
+                "AXEnabled".into(),
+                "AXPosition".into(),
+                "AXSize".into(),
+                "AXValueDescription".into(),
+                "AXMinValue".into(),
+                "AXMaxValue".into(),
+                "AXSelected".into()
+            ]
+        );
+        assert!(!disabled);
+    }
+
+    #[test]
+    fn absent_position_skips_size_in_frame_replay() {
+        let source = Source {
+            trace: RefCell::new(Vec::new()),
+            position_present: false,
+        };
+        let mut budget = WalkBudget::nodes_only(10);
+        let _ = budget.admit();
+        let mut disabled = false;
+        assert_eq!(
+            read_frame_with(&source, &(), &mut budget, &mut disabled),
+            Some(None)
+        );
+        assert_eq!(
+            source.trace.into_inner(),
+            [
+                format!("batch:{}", FRAME_ATTRIBUTES.join(",")),
+                "AXPosition".into()
+            ]
         );
     }
 }
