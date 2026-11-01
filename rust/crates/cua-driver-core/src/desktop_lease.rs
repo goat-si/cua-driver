@@ -826,6 +826,21 @@ pub mod test_support {
         pub fn hold(&self) {
             self.held.store(true, Ordering::SeqCst);
         }
+
+        /// Release a lease taken with [`Self::hold`], as if the other holder exited.
+        pub fn release(&self) {
+            self.held.store(false, Ordering::SeqCst);
+        }
+
+        /// Make every later acquisition fail as unavailable (`desktop_lease_unavailable`).
+        pub fn set_unavailable(&self, unavailable: bool) {
+            self.unavailable.store(unavailable, Ordering::SeqCst);
+        }
+
+        /// How many acquisitions were attempted, including refused ones.
+        pub fn attempts(&self) -> usize {
+            self.attempts.load(Ordering::SeqCst)
+        }
     }
     impl LeaseBackend for TestBackend {
         fn try_acquire(&self) -> io::Result<Option<LeaseGuard>> {
