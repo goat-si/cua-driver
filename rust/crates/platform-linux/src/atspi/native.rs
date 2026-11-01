@@ -3042,18 +3042,25 @@ async fn write_through_editable_proxies(
     proxies: &atspi::proxy::proxy_ext::Proxies<'_>,
     text: &str,
 ) -> Result<bool> {
-    let et = proxies
+    proxies
         .editable_text()
         .await
         .map_err(|e| anyhow!("EditableText unavailable: {e}"))?;
-
-    let off = match proxies.text().await {
-        Ok(tp) => tp.caret_offset().await.ok(),
-        Err(_) => None,
-    };
-    let toolkit = editable_toolkit(acc).await;
-    let dispatch = TEXT_DISPATCH.with(Arc::clone);
-    write_at_caret(&et, &dispatch, off, text, toolkit).await
+    use crate::text_write_policy::{Reason, TextWriteOutcome};
+    match run_native_editable_route(acc, text, EditableRoute::Insert).await? {
+        TextWriteOutcome::Acknowledged => Ok(true),
+        TextWriteOutcome::NothingWritten {
+            reason: Reason::Refused | Reason::Unsupported,
+        } => Ok(false),
+        TextWriteOutcome::NothingWritten {
+            reason: Reason::GateClosed,
+        } => Err(WriteDispatchClosed.into()),
+        TextWriteOutcome::NothingWritten { reason } => {
+            Err(anyhow!("editable insert unavailable: {reason:?}"))
+        }
+        TextWriteOutcome::Uncertain { step } => Err(WriteUncertain { step }.into()),
+        TextWriteOutcome::Partial { step } => Err(WritePartial { step }.into()),
+    }
 }
 
 async fn editable_toolkit(acc: &AccessibleProxy<'_>) -> crate::text_write_policy::Toolkit {
@@ -3086,29 +3093,6 @@ async fn editable_toolkit(acc: &AccessibleProxy<'_>) -> crate::text_write_policy
         Toolkit::Qt
     } else {
         Toolkit::Unknown
-    }
-}
-
-async fn write_at_caret(
-    calls: &impl InsertCalls,
-    dispatch: &TextWriteDispatch,
-    caret: Option<i32>,
-    text: &str,
-    toolkit: crate::text_write_policy::Toolkit,
-) -> Result<bool> {
-    let caret = caret.ok_or_else(|| anyhow!("editable caret unavailable"))?;
-    let len = crate::text_write_policy::text_units(text, toolkit)
-        .map_err(|reason| anyhow!("editable insert unavailable: {reason:?}"))?;
-    write_through_insert_calls(calls, dispatch, caret, text, len).await
-}
-
-trait InsertCalls {
-    async fn insert(&self, offset: i32, text: &str, len: i32) -> zbus::Result<bool>;
-}
-
-impl InsertCalls for atspi::proxy::editable_text::EditableTextProxy<'_> {
-    async fn insert(&self, offset: i32, text: &str, len: i32) -> zbus::Result<bool> {
-        self.insert_text(offset, text, len).await
     }
 }
 
@@ -3167,190 +3151,142 @@ fn classify_mutator_error(error: &zbus::Error) -> crate::text_write_policy::Call
     }
 }
 
-async fn write_through_insert_calls(
-    calls: &impl InsertCalls,
-    dispatch: &TextWriteDispatch,
-    off: i32,
-    text: &str,
-    len: i32,
-) -> Result<bool> {
-    use crate::text_write_policy::{CallClass, MutationResult};
-    if dispatch.gate.enter_mutator().is_err() {
-        return Err(WriteDispatchClosed.into());
-    }
-    dispatch.ledger.record_sent();
-    let result = call(calls.insert(off, text, len)).await;
-    let classified = match &result {
-        Some(Ok(true)) => Ok(MutationResult::Acknowledged),
-        Some(Ok(false)) => Ok(MutationResult::Refused),
-        Some(Err(error)) => Err(classify_mutator_error(error)),
-        None => Err(CallClass::PossiblyExecuted),
-    };
-    dispatch.ledger.record_result(classified);
-    dispatch.gate.finish_mutator();
-    match result {
-        Some(Ok(written)) => Ok(written),
-        Some(Err(error))
-            if classify_mutator_error(&error)
-                == crate::text_write_policy::CallClass::KnownUnsupported =>
-        {
-            Ok(false)
-        }
-        Some(Err(_)) | None => Err(WriteUncertain {
-            step: crate::text_write_policy::WriteStep {
-                step: crate::text_write_policy::Step::InsertText,
-                bytes: text.len(),
-                units: Some(len),
-            },
-        }
-        .into()),
-    }
-}
-
 #[cfg(test)]
 mod insert_regression_tests {
     use super::*;
-    use std::cell::RefCell;
+    use crate::text_write_policy::{
+        CallClass, EditableOps, MutationReply, MutationResult, TextWriteOutcome, Toolkit,
+    };
 
     struct Fake {
-        failure: bool,
-        contents: RefCell<String>,
-        calls: RefCell<Vec<&'static str>>,
-        args: RefCell<Vec<(i32, i32)>>,
+        reply: MutationReply,
+        caret: Result<i32, CallClass>,
+        contents: String,
+        calls: Vec<&'static str>,
+        args: Vec<(i32, i32)>,
     }
-
-    impl InsertCalls for Fake {
-        async fn insert(&self, offset: i32, _: &str, len: i32) -> zbus::Result<bool> {
-            self.calls.borrow_mut().push("insert");
-            self.args.borrow_mut().push((offset, len));
-            if self.failure {
-                Err(zbus::Error::InvalidReply)
-            } else {
-                Ok(false)
+    impl Fake {
+        fn new(reply: MutationReply) -> Self {
+            Self {
+                reply,
+                caret: Ok(5),
+                contents: "hello".into(),
+                calls: vec![],
+                args: vec![],
             }
         }
     }
-
+    impl EditableOps for Fake {
+        fn caret(&mut self) -> Result<i32, CallClass> {
+            self.caret
+        }
+        fn character_count(&mut self) -> Result<i32, CallClass> {
+            Ok(5)
+        }
+        fn validate_insert(&mut self) -> Result<(), CallClass> {
+            Ok(())
+        }
+        fn set_text(&mut self, text: &str) -> MutationReply {
+            self.calls.push("set");
+            self.contents = text.to_owned();
+            Ok(MutationResult::Acknowledged)
+        }
+        fn delete_text(&mut self, _: i32, _: i32) -> MutationReply {
+            self.calls.push("delete");
+            Ok(MutationResult::Acknowledged)
+        }
+        fn insert_text(&mut self, offset: i32, _: &str, length: i32) -> MutationReply {
+            self.calls.push("insert");
+            self.args.push((offset, length));
+            self.reply
+        }
+        fn commit(&mut self) -> MutationReply {
+            self.calls.push("commit");
+            Ok(MutationResult::Acknowledged)
+        }
+    }
+    fn run(
+        fake: &mut Fake,
+        dispatch: &TextWriteDispatch,
+        text: &str,
+        toolkit: Toolkit,
+    ) -> TextWriteOutcome {
+        run_editable_route(fake, text, toolkit, dispatch, EditableRoute::Insert)
+    }
     #[test]
     fn insert_error_must_not_trigger_second_write() {
-        let fake = Fake {
-            failure: true,
-            contents: RefCell::new("hello".into()),
-            calls: RefCell::new(vec![]),
-            args: RefCell::new(vec![]),
-        };
-        let error = runtime()
-            .block_on(write_through_insert_calls(
-                &fake,
+        let mut fake = Fake::new(Err(CallClass::PossiblyExecuted));
+        assert!(matches!(
+            run(
+                &mut fake,
                 &TextWriteDispatch::default(),
-                5,
                 "abc",
-                3,
-            ))
-            .unwrap_err();
-        assert!(error.downcast_ref::<WriteUncertain>().is_some());
-        assert_eq!(*fake.calls.borrow(), ["insert"]);
+                Toolkit::Gtk
+            ),
+            TextWriteOutcome::Uncertain { .. }
+        ));
+        assert_eq!(fake.calls, ["insert"]);
     }
-
     #[test]
     fn refused_insert_must_not_replace_existing_content() {
-        let fake = Fake {
-            failure: false,
-            contents: RefCell::new("hello".into()),
-            calls: RefCell::new(vec![]),
-            args: RefCell::new(vec![]),
-        };
-        let _ = runtime().block_on(write_through_insert_calls(
-            &fake,
-            &TextWriteDispatch::default(),
-            5,
-            "abc",
-            3,
+        let mut fake = Fake::new(Ok(MutationResult::Refused));
+        assert!(matches!(
+            run(
+                &mut fake,
+                &TextWriteDispatch::default(),
+                "abc",
+                Toolkit::Gtk
+            ),
+            TextWriteOutcome::NothingWritten { .. }
         ));
-        assert_eq!(*fake.contents.borrow(), "hello");
-        assert_eq!(*fake.calls.borrow(), ["insert"]);
+        assert_eq!(fake.contents, "hello");
+        assert_eq!(fake.calls, ["insert"]);
     }
-
     #[test]
     fn caret_failure_must_not_dispatch() {
-        let fake = Fake {
-            failure: false,
-            contents: RefCell::new("hello".into()),
-            calls: RefCell::new(vec![]),
-            args: RefCell::new(vec![]),
-        };
-        let _ = runtime().block_on(write_at_caret(
-            &fake,
+        let mut fake = Fake::new(Ok(MutationResult::Acknowledged));
+        fake.caret = Err(CallClass::PreDispatchUnavailable);
+        let _ = run(
+            &mut fake,
             &TextWriteDispatch::default(),
-            None,
             "abc",
-            crate::text_write_policy::Toolkit::Gtk,
-        ));
-        assert!(fake.calls.borrow().is_empty());
+            Toolkit::Gtk,
+        );
+        assert!(fake.calls.is_empty());
     }
-
     #[test]
     fn closed_gate_prevents_late_insert() {
-        let fake = Fake {
-            failure: false,
-            contents: RefCell::new("hello".into()),
-            calls: RefCell::new(vec![]),
-            args: RefCell::new(vec![]),
-        };
+        let mut fake = Fake::new(Ok(MutationResult::Acknowledged));
         let dispatch = TextWriteDispatch::default();
         assert!(!dispatch.gate.close_on_timeout());
-        assert!(runtime()
-            .block_on(write_at_caret(
-                &fake,
-                &dispatch,
-                Some(5),
-                "abc",
-                crate::text_write_policy::Toolkit::Gtk,
-            ))
-            .is_err());
-        assert!(fake.calls.borrow().is_empty());
+        assert!(matches!(
+            run(&mut fake, &dispatch, "abc", Toolkit::Gtk),
+            TextWriteOutcome::NothingWritten {
+                reason: crate::text_write_policy::Reason::GateClosed
+            }
+        ));
+        assert!(fake.calls.is_empty());
         assert!(!dispatch.ledger.sent());
     }
-
     #[test]
     fn toolkit_units_are_used_for_insert() {
-        for (toolkit, length) in [
-            (crate::text_write_policy::Toolkit::Gtk, 6),
-            (crate::text_write_policy::Toolkit::Qt, 3),
-        ] {
-            let fake = Fake {
-                failure: false,
-                contents: RefCell::new("hello".into()),
-                calls: RefCell::new(vec![]),
-                args: RefCell::new(vec![]),
-            };
-            let _ = runtime().block_on(write_at_caret(
-                &fake,
-                &TextWriteDispatch::default(),
-                Some(5),
-                "é😀",
-                toolkit,
-            ));
-            assert_eq!(*fake.args.borrow(), [(5, length)]);
+        for (toolkit, length) in [(Toolkit::Gtk, 6), (Toolkit::Qt, 3)] {
+            let mut fake = Fake::new(Ok(MutationResult::Acknowledged));
+            let _ = run(&mut fake, &TextWriteDispatch::default(), "é😀", toolkit);
+            assert_eq!(fake.args, [(5, length)]);
         }
-        let fake = Fake {
-            failure: false,
-            contents: RefCell::new("hello".into()),
-            calls: RefCell::new(vec![]),
-            args: RefCell::new(vec![]),
-        };
-        assert!(runtime()
-            .block_on(write_at_caret(
-                &fake,
+        let mut fake = Fake::new(Ok(MutationResult::Acknowledged));
+        assert!(matches!(
+            run(
+                &mut fake,
                 &TextWriteDispatch::default(),
-                Some(5),
                 "é😀",
-                crate::text_write_policy::Toolkit::Unknown,
-            ))
-            .is_err());
-        assert!(fake.calls.borrow().is_empty());
+                Toolkit::Unknown
+            ),
+            TextWriteOutcome::NothingWritten { .. }
+        ));
+        assert!(fake.calls.is_empty());
     }
-
     #[test]
     fn classify_real_zbus_mutator_errors() {
         use crate::text_write_policy::CallClass::{KnownUnsupported, PossiblyExecuted};
@@ -6004,9 +5940,41 @@ impl crate::text_write_policy::EditableOps for NativeEditableOps<'_> {
     }
 }
 
-async fn replace_with_policy(
+#[derive(Clone, Copy)]
+enum EditableRoute {
+    Insert,
+    Replace,
+}
+
+fn run_editable_route(
+    ops: &mut impl crate::text_write_policy::EditableOps,
+    value: &str,
+    toolkit: crate::text_write_policy::Toolkit,
+    dispatch: &TextWriteDispatch,
+    route: EditableRoute,
+) -> crate::text_write_policy::TextWriteOutcome {
+    match route {
+        EditableRoute::Insert => crate::text_write_policy::insert_route(
+            ops,
+            value,
+            toolkit,
+            &dispatch.gate,
+            &dispatch.ledger,
+        ),
+        EditableRoute::Replace => crate::text_write_policy::replace_route(
+            ops,
+            value,
+            toolkit,
+            &dispatch.gate,
+            &dispatch.ledger,
+        ),
+    }
+}
+
+async fn run_native_editable_route(
     acc: &AccessibleProxy<'_>,
     value: &str,
+    route: EditableRoute,
 ) -> Result<crate::text_write_policy::TextWriteOutcome> {
     let toolkit = editable_toolkit(acc).await;
     let connection = acc.inner().connection().clone();
@@ -6039,16 +6007,19 @@ async fn replace_with_policy(
             editable,
             dispatch: worker_dispatch.clone(),
         };
-        Ok::<_, anyhow::Error>(crate::text_write_policy::replace_route(
+        Ok::<_, anyhow::Error>(run_editable_route(
             &mut ops,
             &value,
             toolkit,
-            &worker_dispatch.gate,
-            &worker_dispatch.ledger,
+            &worker_dispatch,
+            route,
         ))
     });
     match worker.await {
-        Ok(result) => result,
+        Ok(Ok(result)) => Ok(result),
+        Ok(Err(_)) => Ok(crate::text_write_policy::TextWriteOutcome::NothingWritten {
+            reason: crate::text_write_policy::Reason::InsertUnavailable,
+        }),
         Err(_) => write_timeout_result(&dispatch, bytes, || {
             Err(anyhow!("editable worker failed before dispatch"))
         }),
@@ -6057,6 +6028,7 @@ async fn replace_with_policy(
 
 #[cfg(test)]
 mod replace_regression_tests {
+    use super::{run_editable_route, EditableRoute, TextWriteDispatch};
     use crate::text_write_policy::{
         self as policy, CallClass, EditableOps, MutationReply, MutationResult, TextWriteOutcome,
     };
@@ -6097,12 +6069,12 @@ mod replace_regression_tests {
         }
     }
     fn run(fake: &mut Fake) -> TextWriteOutcome {
-        policy::replace_route(
+        run_editable_route(
             fake,
             "abc",
             policy::Toolkit::Gtk,
-            &policy::DispatchGate::default(),
-            &policy::DispatchLedger::default(),
+            &TextWriteDispatch::default(),
+            EditableRoute::Replace,
         )
     }
     #[test]
@@ -6141,7 +6113,7 @@ async fn set_value_on(
         .map_err(|e| anyhow!("interface proxies unavailable: {e}"))?;
     if proxies.editable_text().await.is_ok() {
         use crate::text_write_policy::{Reason, TextWriteOutcome};
-        match replace_with_policy(acc, value).await? {
+        match run_native_editable_route(acc, value, EditableRoute::Replace).await? {
             TextWriteOutcome::Acknowledged => return Ok(()),
             TextWriteOutcome::Uncertain { step } => return Err(WriteUncertain { step }.into()),
             TextWriteOutcome::Partial { step } => return Err(WritePartial { step }.into()),
