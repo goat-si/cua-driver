@@ -277,6 +277,33 @@ fn ordinary_read_is_not_asserted() {
     );
 }
 
+fn unasserted_verify_options(display_only: bool, full_output: bool, query: Option<&str>) {
+    use super::environment_evidence_tests::Scenario;
+    let assertion = verify_assertion_requested(true, display_only, full_output, query);
+    let (walk, _, _) = with_exhaustive_assertion(assertion, || {
+        with_exhaustive_nodes(true, || {
+            super::orchestration_preservation_tests::run_scenario(
+                Scenario::Launching,
+                Some((2, "AXWindow")),
+            )
+        })
+    });
+    assert_eq!(
+        reasons(&walk.legacy),
+        json!([{"kind":"unknown", "detail":"not_asserted"}])
+    );
+}
+
+#[test]
+fn full_output_read_is_not_asserted() {
+    unasserted_verify_options(false, true, None);
+}
+
+#[test]
+fn display_only_read_is_not_asserted() {
+    unasserted_verify_options(true, false, None);
+}
+
 #[test]
 fn closed_menubar_menu_is_scope_exclusion_not_incomplete() {
     let tree = super::walker_seam_tests::closed_menu_fixture();
@@ -298,6 +325,36 @@ fn closed_menubar_menu_is_scope_exclusion_not_incomplete() {
     ));
     assert!(!has_reason(&tree, "policy_omission", "collapsed_menu"));
     assert!(!tree.nodes_skipped);
+}
+
+#[test]
+fn unreadable_menu_selection_stays_incomplete() {
+    for failure in [
+        super::super::tree_source::ReadFailure::WrongType,
+        super::super::tree_source::ReadFailure::Ax(kAXErrorCannotComplete),
+    ] {
+        let tree = super::walker_seam_tests::collapsed_menu_fixture(Read::Unknown(failure));
+        assert!(tree.nodes_skipped);
+        assert!(has_reason(
+            &tree,
+            "provider_failure",
+            "attribute_read_failed"
+        ));
+        assert!(has_reason(&tree, "policy_omission", "collapsed_menu"));
+        let mut output = json!({});
+        tree.walk.apply(&mut output);
+        assert!(output.get("observation_scope_exclusions").is_none());
+    }
+}
+
+#[test]
+fn absent_menu_selection_stays_incomplete() {
+    let tree = super::walker_seam_tests::collapsed_menu_fixture(Read::Absent);
+    assert!(tree.nodes_skipped);
+    assert!(has_reason(&tree, "policy_omission", "collapsed_menu"));
+    let mut output = json!({});
+    tree.walk.apply(&mut output);
+    assert!(output.get("observation_scope_exclusions").is_none());
 }
 
 #[test]

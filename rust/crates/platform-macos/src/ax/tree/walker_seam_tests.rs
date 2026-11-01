@@ -579,6 +579,10 @@ fn representative_window_markdown_and_nodes_are_pinned() {
 }
 
 pub(super) fn closed_menu_fixture() -> TreeWalkResult {
+    collapsed_menu_fixture(Read::Known(false))
+}
+
+pub(super) fn collapsed_menu_fixture(selection: Read<bool>) -> TreeWalkResult {
     let source = Fake::new(
         &[(1, 1, 1, &[2]), (2, 2, 2, &[])],
         vec![
@@ -601,7 +605,7 @@ pub(super) fn closed_menu_fixture() -> TreeWalkResult {
                 Reply::Batch(Ok(control_batch())),
             ),
             step("snapshot 1", Reply::Unit),
-            step("bool 1 AXSelected", Reply::Bool(Read::Known(false))),
+            step("bool 1 AXSelected", Reply::Bool(selection)),
         ],
     );
     let root = source.handle(1);

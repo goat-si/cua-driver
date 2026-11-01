@@ -585,8 +585,12 @@ impl Tool for GetWindowStateTool {
         let collapse_menus = query.as_deref().is_none_or(|q| q.trim().is_empty())
             && !view.full_output
             && !observation_only;
-        let assert_exhaustive =
-            verify_read && !display_only && !view.full_output && query.is_none();
+        let assert_exhaustive = crate::ax::tree::verify_assertion_requested(
+            verify_read,
+            display_only,
+            view.full_output,
+            query.as_deref(),
+        );
         let window_dense_rows = !view.full_output && !observation_only;
         // Start the screenshot grab before the tree walk so the two overlap:
         // ScreenCaptureKit and the accessibility walk use independent system
@@ -3172,7 +3176,19 @@ mod evidence_refactor_output_tests;
 #[cfg(test)]
 mod completeness_output_tests {
     use super::*;
+    use crate::ax::tree::verify_assertion_requested;
     use serde_json::json;
+
+    #[test]
+    fn verified_query_projection_never_asserts_complete() {
+        for query in [Some("Beta"), Some("")] {
+            assert!(!verify_assertion_requested(true, false, false, query));
+        }
+        assert!(verify_assertion_requested(true, false, false, None));
+        assert!(!verify_assertion_requested(false, false, false, None));
+        assert!(!verify_assertion_requested(true, true, false, None));
+        assert!(!verify_assertion_requested(true, false, true, None));
+    }
 
     #[test]
     fn scope_exclusion_owner_maps_after_deferred_renumbering() {

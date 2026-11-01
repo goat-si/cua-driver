@@ -3808,6 +3808,15 @@ thread_local! {
     static EXHAUSTIVE_ASSERTION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+pub(crate) fn verify_assertion_requested(
+    verify_read: bool,
+    display_only: bool,
+    full_output: bool,
+    query: Option<&str>,
+) -> bool {
+    verify_read && !display_only && !full_output && query.is_none()
+}
+
 /// Enable completeness assertion only for a trusted internal verify read.
 pub fn with_exhaustive_assertion<T>(enabled: bool, walk: impl FnOnce() -> T) -> T {
     struct Restore(bool);
