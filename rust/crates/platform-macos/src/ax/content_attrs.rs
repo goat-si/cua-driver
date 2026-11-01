@@ -169,6 +169,9 @@ pub(super) trait ContentReader {
     fn value(&mut self) -> Result<Option<StringishAttrValue>, AXError>;
     fn expired(&self) -> bool;
     fn classified(&mut self) {}
+    fn owner(&self) -> Option<usize> {
+        None
+    }
 }
 
 pub(super) fn read_with_observed<R: ContentReader>(
@@ -176,7 +179,113 @@ pub(super) fn read_with_observed<R: ContentReader>(
     reader: &mut R,
     batching_disabled: &mut bool,
 ) -> super::evidence::Observed<Option<ContentAttrs>> {
-    super::evidence::Observed::legacy_only(read_with(role, reader, batching_disabled))
+    let mut recording = EvidenceContentReader {
+        reader,
+        evidence: std::cell::RefCell::new(Vec::new()),
+        attempt: 0,
+    };
+    let legacy = read_with(role, &mut recording, batching_disabled);
+    super::evidence::Observed {
+        legacy,
+        evidence: recording.evidence.into_inner(),
+    }
+}
+
+struct EvidenceContentReader<'a, R> {
+    reader: &'a mut R,
+    evidence: std::cell::RefCell<Vec<super::evidence::ReadEvidence>>,
+    attempt: u32,
+}
+
+impl<R: ContentReader> EvidenceContentReader<'_, R> {
+    fn record(
+        &self,
+        site: super::evidence::ReadSite,
+        status: super::evidence::EvidenceStatus,
+        listing: Option<AttributeListing>,
+    ) {
+        self.evidence
+            .borrow_mut()
+            .push(super::evidence::ReadEvidence {
+                owner: self.reader.owner(),
+                site,
+                status,
+                attempt: self.attempt,
+                listing,
+            });
+    }
+}
+
+impl<R: ContentReader> ContentReader for EvidenceContentReader<'_, R> {
+    fn batch(&mut self) -> Result<[AttrStatus; 7], super::batch_attrs::BatchFailure> {
+        let result = self.reader.batch();
+        match &result {
+            Ok(attrs) => {
+                for (name, attr) in CONTENT_ATTRIBUTES.iter().zip(attrs) {
+                    let (status, listing) = super::evidence::attr_status(attr);
+                    self.record(super::evidence::ReadSite::Content(name), status, listing);
+                }
+            }
+            Err(error) => {
+                let status = match error {
+                    super::batch_attrs::BatchFailure::WholeCall(code) => {
+                        super::evidence::EvidenceStatus::Unknown(
+                            super::tree_source::ReadFailure::Ax(*code),
+                        )
+                    }
+                    super::batch_attrs::BatchFailure::Decode => {
+                        super::evidence::EvidenceStatus::Unknown(
+                            super::tree_source::ReadFailure::WrongType,
+                        )
+                    }
+                };
+                self.record(super::evidence::ReadSite::Batch("content"), status, None);
+                self.attempt = self.attempt.saturating_add(1);
+            }
+        }
+        result
+    }
+    fn string(&mut self, name: &str) -> AttrStatus {
+        let result = self.reader.string(name);
+        if let Some(name) = CONTENT_ATTRIBUTES
+            .iter()
+            .copied()
+            .find(|known| *known == name)
+        {
+            let (status, listing) = super::evidence::attr_status(&result);
+            self.record(super::evidence::ReadSite::Content(name), status, listing);
+        }
+        result
+    }
+    fn value(&mut self) -> Result<Option<StringishAttrValue>, AXError> {
+        let result = self.reader.value();
+        let status = match &result {
+            Ok(Some(_)) => super::evidence::EvidenceStatus::Known,
+            Ok(None) => super::evidence::EvidenceStatus::Absent,
+            Err(code) => {
+                super::evidence::EvidenceStatus::Unknown(super::tree_source::ReadFailure::Ax(*code))
+            }
+        };
+        self.record(super::evidence::ReadSite::Content("AXValue"), status, None);
+        result
+    }
+    fn expired(&self) -> bool {
+        let expired = self.reader.expired();
+        if expired {
+            self.record(
+                super::evidence::ReadSite::Content("deadline"),
+                super::evidence::EvidenceStatus::DeadlineExpired,
+                None,
+            );
+        }
+        expired
+    }
+    fn classified(&mut self) {
+        self.reader.classified();
+    }
+    fn owner(&self) -> Option<usize> {
+        self.reader.owner()
+    }
 }
 
 pub(super) fn read_with<R: ContentReader>(

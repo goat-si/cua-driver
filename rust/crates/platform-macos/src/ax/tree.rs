@@ -2073,14 +2073,20 @@ fn plan_macos_tab_strip_observed<S: AxTreeSource>(
     budget: &mut WalkBudget,
     batching_disabled: &mut bool,
 ) -> super::evidence::Observed<Option<TabStripCompaction>> {
-    super::evidence::Observed::legacy_only(plan_macos_tab_strip(
+    let source = super::evidence_source::EvidenceSource::new(
         source,
+        super::evidence_source::Domain::Tab,
+        None,
+    );
+    let result = plan_macos_tab_strip(
+        &source,
         parent,
         parent_role,
         children,
         budget,
         batching_disabled,
-    ))
+    );
+    source.finish(result)
 }
 
 fn tab_child_value(attrs: ContentAttrs) -> (Option<String>, bool) {

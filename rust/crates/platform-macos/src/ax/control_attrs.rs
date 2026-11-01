@@ -186,7 +186,7 @@ pub(crate) fn read_control_attrs_with<S: AxTreeSource>(
     budget: &mut WalkBudget,
     batching_disabled: &mut bool,
 ) -> Option<ControlAttrs> {
-    read_control_attrs_observed_with(source, element, budget, batching_disabled).legacy
+    read_control_attrs_observed_with(source, element, budget, batching_disabled, None).legacy
 }
 
 pub(crate) fn read_control_attrs_observed_with<S: AxTreeSource>(
@@ -194,14 +194,21 @@ pub(crate) fn read_control_attrs_observed_with<S: AxTreeSource>(
     element: &S::Element,
     budget: &mut WalkBudget,
     batching_disabled: &mut bool,
+    owner: Option<usize>,
 ) -> super::evidence::Observed<Option<ControlAttrs>> {
-    super::evidence::Observed::legacy_only(read_within_deadline(
+    let source = super::evidence_source::EvidenceSource::new(
+        source,
+        super::evidence_source::Domain::Control,
+        owner,
+    );
+    let result = read_within_deadline(
         budget,
         batching_disabled,
         || source.batch(element, &CONTROL_ATTRIBUTES),
         ControlAttrs::from_slots,
-        |step| ControlAttrs::from_singles(source, element, step),
-    ))
+        |step| ControlAttrs::from_singles(&source, element, step),
+    );
+    source.finish(result)
 }
 
 /// The frame of an element as `element_screen_rect` reads it.

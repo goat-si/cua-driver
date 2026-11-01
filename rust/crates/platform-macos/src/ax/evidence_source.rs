@@ -1,0 +1,272 @@
+//! Decorates an existing source without changing its requests or results.
+use super::batch_attrs::BatchFailure;
+use super::bindings::{AXError, StringishAttrValue};
+use super::content_attrs::AttrStatus;
+use super::evidence::{attr_status, read_status, EvidenceStatus, Observed, ReadEvidence, ReadSite};
+use super::tree_source::{AxTreeSource, Read, ReadFailure, TreeBatch};
+use super::write_outcome::Settable;
+use std::cell::RefCell;
+use std::rc::Rc;
+
+#[derive(Clone, Copy)]
+pub(crate) enum Domain {
+    Control,
+    Scrollbar,
+    Tab,
+    Dense,
+}
+
+impl Domain {
+    fn site(self, name: &str) -> Option<ReadSite> {
+        // Only known attribute names become metadata; target-provided strings
+        // can never enter the evidence stream.
+        let name = match name {
+            "AXEnabled" => "AXEnabled",
+            "AXPosition" => "AXPosition",
+            "AXSize" => "AXSize",
+            "AXValueDescription" => "AXValueDescription",
+            "AXMinValue" => "AXMinValue",
+            "AXMaxValue" => "AXMaxValue",
+            "AXSelected" => "AXSelected",
+            "AXVerticalScrollBar" => "AXVerticalScrollBar",
+            "AXHorizontalScrollBar" => "AXHorizontalScrollBar",
+            "AXRole" => "AXRole",
+            "AXValue" => "AXValue",
+            "AXTitle" => "AXTitle",
+            "AXDescription" => "AXDescription",
+            "AXRoleDescription" => "AXRoleDescription",
+            "AXRows" => "AXRows",
+            "AXVisibleRows" => "AXVisibleRows",
+            "AXVisibleChildren" => "AXVisibleChildren",
+            _ => return None,
+        };
+        Some(match self {
+            Self::Control => ReadSite::Control(name),
+            Self::Scrollbar => ReadSite::Scrollbar(name),
+            Self::Tab => ReadSite::Tab(name),
+            Self::Dense => ReadSite::Dense(name),
+        })
+    }
+    fn batch_site(self) -> ReadSite {
+        ReadSite::Batch(match self {
+            Self::Control => "control",
+            Self::Scrollbar => "scrollbar",
+            Self::Tab => "tab",
+            Self::Dense => "dense",
+        })
+    }
+}
+
+#[derive(Default)]
+struct State {
+    evidence: Vec<ReadEvidence>,
+    attempt: u32,
+}
+
+pub(crate) struct EvidenceSource<'a, S> {
+    source: &'a S,
+    domain: Domain,
+    owner: Option<usize>,
+    state: Rc<RefCell<State>>,
+}
+
+impl<'a, S: AxTreeSource> EvidenceSource<'a, S> {
+    pub(crate) fn new(source: &'a S, domain: Domain, owner: Option<usize>) -> Self {
+        Self {
+            source,
+            domain,
+            owner,
+            state: Rc::new(RefCell::new(State::default())),
+        }
+    }
+    pub(crate) fn finish<T>(&self, legacy: T) -> Observed<T> {
+        Observed {
+            legacy,
+            evidence: std::mem::take(&mut self.state.borrow_mut().evidence),
+        }
+    }
+    fn record<T>(&self, _element: &S::Element, name: &str, result: &Read<T>) {
+        if let Some(site) = self.domain.site(name) {
+            let mut state = self.state.borrow_mut();
+            let attempt = state.attempt;
+            state.evidence.push(ReadEvidence {
+                owner: self.owner,
+                site,
+                status: read_status(result),
+                attempt,
+                listing: None,
+            });
+        }
+    }
+}
+
+pub(crate) struct EvidenceBatch<B> {
+    inner: B,
+    sites: Vec<Option<ReadSite>>,
+    owner: Option<usize>,
+    attempt: u32,
+    state: Rc<RefCell<State>>,
+}
+
+impl<B: TreeBatch> EvidenceBatch<B> {
+    fn record(
+        &self,
+        slot: usize,
+        status: EvidenceStatus,
+        listing: Option<super::content_attrs::AttributeListing>,
+    ) {
+        if let Some(site) = self.sites[slot] {
+            self.state.borrow_mut().evidence.push(ReadEvidence {
+                owner: self.owner,
+                site,
+                status,
+                attempt: self.attempt,
+                listing,
+            });
+        }
+    }
+}
+
+impl<B: TreeBatch> TreeBatch for EvidenceBatch<B> {
+    fn text(&self, slot: usize) -> AttrStatus {
+        let value = self.inner.text(slot);
+        let (status, listing) = attr_status(&value);
+        self.record(slot, status, listing);
+        value
+    }
+    fn boolean(&self, slot: usize) -> Read<bool> {
+        let value = self.inner.boolean(slot);
+        self.record(slot, read_status(&value), None);
+        value
+    }
+    fn number(&self, slot: usize) -> Read<f64> {
+        let value = self.inner.number(slot);
+        self.record(slot, read_status(&value), None);
+        value
+    }
+    fn position(&self, slot: usize) -> Read<(f64, f64)> {
+        let value = self.inner.position(slot);
+        self.record(slot, read_status(&value), None);
+        value
+    }
+    fn size(&self, slot: usize) -> Read<(f64, f64)> {
+        let value = self.inner.size(slot);
+        self.record(slot, read_status(&value), None);
+        value
+    }
+}
+
+impl<S: AxTreeSource> AxTreeSource for EvidenceSource<'_, S> {
+    type Element = S::Element;
+    type Batch = EvidenceBatch<S::Batch>;
+    type ElementSet = S::ElementSet;
+    fn key(&self, e: &Self::Element) -> usize {
+        self.source.key(e)
+    }
+    fn set_messaging_timeout(&self, e: &Self::Element) {
+        self.source.set_messaging_timeout(e)
+    }
+    fn text(&self, e: &Self::Element, name: &str) -> Read<String> {
+        let v = self.source.text(e, name);
+        self.record(e, name, &v);
+        v
+    }
+    fn text_status(&self, e: &Self::Element, name: &str) -> AttrStatus {
+        let v = self.source.text_status(e, name);
+        if let Some(site) = self.domain.site(name) {
+            let (status, listing) = attr_status(&v);
+            let mut state = self.state.borrow_mut();
+            let attempt = state.attempt;
+            state.evidence.push(ReadEvidence {
+                owner: self.owner,
+                site,
+                status,
+                attempt,
+                listing,
+            });
+        }
+        v
+    }
+    fn boolean(&self, e: &Self::Element, name: &str) -> Read<bool> {
+        let v = self.source.boolean(e, name);
+        self.record(e, name, &v);
+        v
+    }
+    fn number(&self, e: &Self::Element, name: &str) -> Read<f64> {
+        let v = self.source.number(e, name);
+        self.record(e, name, &v);
+        v
+    }
+    fn position(&self, e: &Self::Element) -> Read<(f64, f64)> {
+        let v = self.source.position(e);
+        self.record(e, "AXPosition", &v);
+        v
+    }
+    fn size(&self, e: &Self::Element) -> Read<(f64, f64)> {
+        let v = self.source.size(e);
+        self.record(e, "AXSize", &v);
+        v
+    }
+    fn value(&self, e: &Self::Element) -> Result<Option<StringishAttrValue>, AXError> {
+        self.source.value(e)
+    }
+    fn batch(&self, e: &Self::Element, names: &[&str]) -> Result<Self::Batch, BatchFailure> {
+        let attempt = self.state.borrow().attempt;
+        match self.source.batch(e, names) {
+            Ok(inner) => Ok(EvidenceBatch {
+                inner,
+                sites: names.iter().map(|name| self.domain.site(name)).collect(),
+                owner: self.owner,
+                attempt,
+                state: self.state.clone(),
+            }),
+            Err(error) => {
+                let status = match error {
+                    BatchFailure::WholeCall(code) => EvidenceStatus::Unknown(ReadFailure::Ax(code)),
+                    BatchFailure::Decode => EvidenceStatus::Unknown(ReadFailure::WrongType),
+                };
+                let mut state = self.state.borrow_mut();
+                state.evidence.push(ReadEvidence {
+                    owner: self.owner,
+                    site: self.domain.batch_site(),
+                    status,
+                    attempt,
+                    listing: None,
+                });
+                state.attempt = state.attempt.saturating_add(1);
+                Err(error)
+            }
+        }
+    }
+    fn children(&self, e: &Self::Element) -> Read<Vec<Self::Element>> {
+        self.source.children(e)
+    }
+    fn element_attribute(&self, e: &Self::Element, name: &str) -> Read<Self::Element> {
+        let v = self.source.element_attribute(e, name);
+        self.record(e, name, &v);
+        v
+    }
+    fn element_set(&self, e: &Self::Element, name: &str) -> Read<Self::ElementSet> {
+        let v = self.source.element_set(e, name);
+        self.record(e, name, &v);
+        v
+    }
+    fn set_contains(&self, set: &Self::ElementSet, e: &Self::Element) -> bool {
+        self.source.set_contains(set, e)
+    }
+    fn action_names(&self, e: &Self::Element) -> Read<Vec<String>> {
+        self.source.action_names(e)
+    }
+    fn value_settable(&self, e: &Self::Element) -> bool {
+        self.source.value_settable(e)
+    }
+    fn selected_settable(&self, e: &Self::Element) -> Settable {
+        self.source.selected_settable(e)
+    }
+    fn frame(&self, e: &Self::Element) -> Read<[f64; 4]> {
+        self.source.frame(e)
+    }
+    fn retain_for_snapshot(&self, e: &Self::Element) -> usize {
+        self.source.retain_for_snapshot(e)
+    }
+}

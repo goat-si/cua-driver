@@ -72,6 +72,21 @@ fn content_observation_preserves_shadowed_failures() {
         ReadSite::Content("AXDescription"),
         EvidenceStatus::Unknown(ReadFailure::Ax(kAXErrorFailure)),
     );
+    assert!(observed
+        .evidence
+        .iter()
+        .any(|entry| entry.site == ReadSite::Content("AXDescription")
+            && entry.listing == Some(AttributeListing::Listed)));
+    assert_evidence(
+        &observed.evidence,
+        ReadSite::Content("AXTitle"),
+        EvidenceStatus::Known,
+    );
+    assert_evidence(
+        &observed.evidence,
+        ReadSite::Content("AXPlaceholderValue"),
+        EvidenceStatus::Absent,
+    );
 }
 
 const CONTROL: &str =
@@ -98,6 +113,7 @@ fn control_batch_preserves_unknown_and_absent_per_slot() {
         &element,
         &mut WalkBudget::nodes_only(10),
         &mut false,
+        Some(1),
     );
     let legacy = observed.legacy.expect("control returned");
     assert_eq!(legacy.enabled, None);
@@ -110,6 +126,27 @@ fn control_batch_preserves_unknown_and_absent_per_slot() {
         ReadSite::Control("AXEnabled"),
         EvidenceStatus::Unknown(failure()),
     );
+    for name in ["AXPosition", "AXSize", "AXValueDescription", "AXMaxValue"] {
+        assert_evidence(
+            &observed.evidence,
+            ReadSite::Control(name),
+            EvidenceStatus::Absent,
+        );
+    }
+    assert_evidence(
+        &observed.evidence,
+        ReadSite::Control("AXMinValue"),
+        EvidenceStatus::Unknown(ReadFailure::WrongType),
+    );
+    assert_evidence(
+        &observed.evidence,
+        ReadSite::Control("AXSelected"),
+        EvidenceStatus::Known,
+    );
+    assert!(observed
+        .evidence
+        .iter()
+        .all(|entry| entry.owner == Some(1) && entry.attempt == 0));
 }
 
 #[test]
@@ -138,6 +175,7 @@ fn control_singles_preserve_unknown_and_absent_per_field() {
         &element,
         &mut WalkBudget::nodes_only(10),
         &mut false,
+        Some(1),
     );
     let legacy = observed.legacy.expect("control returned");
     assert_eq!(legacy.enabled, None);
@@ -150,6 +188,31 @@ fn control_singles_preserve_unknown_and_absent_per_field() {
         ReadSite::Control("AXEnabled"),
         EvidenceStatus::Unknown(failure()),
     );
+    assert_evidence(
+        &observed.evidence,
+        ReadSite::Batch("control"),
+        EvidenceStatus::Unknown(ReadFailure::WrongType),
+    );
+    for name in ["AXPosition", "AXValueDescription", "AXMaxValue"] {
+        assert_evidence(
+            &observed.evidence,
+            ReadSite::Control(name),
+            EvidenceStatus::Absent,
+        );
+    }
+    assert_evidence(
+        &observed.evidence,
+        ReadSite::Control("AXMinValue"),
+        EvidenceStatus::Unknown(ReadFailure::WrongType),
+    );
+    assert!(observed
+        .evidence
+        .iter()
+        .any(|entry| entry.site == ReadSite::Batch("control") && entry.attempt == 0));
+    assert!(observed
+        .evidence
+        .iter()
+        .any(|entry| entry.site == ReadSite::Control("AXEnabled") && entry.attempt == 1));
 }
 
 #[test]
@@ -171,6 +234,24 @@ fn scrollbar_owner_preserves_unknown_and_absent() {
         &observed.evidence,
         ReadSite::Scrollbar("AXVerticalScrollBar"),
         EvidenceStatus::Unknown(failure()),
+    );
+    let fake = Fake::new(
+        &[(1, 1, 1, &[])],
+        vec![step(
+            "element 1 AXVerticalScrollBar",
+            Reply::Element(Read::Absent),
+        )],
+    );
+    let element = fake.handle(1);
+    let absent = crate::ax::scroll_area::bar_position_observed_with(&fake, &element, "down");
+    assert_eq!(absent.legacy, None);
+    fake.assert_consumed();
+    drop(element);
+    fake.assert_lifetimes(&[]);
+    assert_evidence(
+        &absent.evidence,
+        ReadSite::Scrollbar("AXVerticalScrollBar"),
+        EvidenceStatus::Absent,
     );
 }
 
@@ -202,6 +283,16 @@ fn tab_parent_metadata_preserves_unknown_and_absent() {
         ReadSite::Tab("AXTitle"),
         EvidenceStatus::Unknown(failure()),
     );
+    assert_evidence(
+        &observed.evidence,
+        ReadSite::Tab("AXDescription"),
+        EvidenceStatus::Absent,
+    );
+    assert_evidence(
+        &observed.evidence,
+        ReadSite::Tab("AXRoleDescription"),
+        EvidenceStatus::Absent,
+    );
 }
 
 #[test]
@@ -231,6 +322,16 @@ fn dense_visibility_sets_preserve_unknown_and_absent() {
         &observed.evidence,
         ReadSite::Dense("AXVisibleRows"),
         EvidenceStatus::Unknown(failure()),
+    );
+    assert_evidence(
+        &observed.evidence,
+        ReadSite::Dense("AXRows"),
+        EvidenceStatus::Absent,
+    );
+    assert_evidence(
+        &observed.evidence,
+        ReadSite::Dense("AXVisibleChildren"),
+        EvidenceStatus::Absent,
     );
 }
 

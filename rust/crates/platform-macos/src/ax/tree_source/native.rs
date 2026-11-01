@@ -22,12 +22,42 @@ pub(crate) struct NativeElementSet {
 /// when another member has the wrong type.
 pub(crate) fn decode_child_members<I, T>(
     items: I,
-    decode: impl FnMut(I::Item) -> Option<T>,
+    mut decode: impl FnMut(I::Item) -> Option<T>,
 ) -> crate::ax::evidence::Observed<Vec<T>>
 where
     I: IntoIterator,
 {
-    crate::ax::evidence::Observed::legacy_only(items.into_iter().filter_map(decode).collect())
+    use crate::ax::evidence::{EvidenceStatus, Observed, ReadEvidence, ReadSite};
+    let mut legacy = Vec::new();
+    let mut evidence = Vec::new();
+    for item in items {
+        match decode(item) {
+            Some(item) => legacy.push(item),
+            None => evidence.push(ReadEvidence {
+                owner: None,
+                site: ReadSite::Children,
+                status: EvidenceStatus::Unknown(ReadFailure::WrongType),
+                attempt: 0,
+                listing: None,
+            }),
+        }
+    }
+    Observed { legacy, evidence }
+}
+
+fn observed_children_read<T>(
+    owner: usize,
+    legacy: Read<Vec<T>>,
+) -> crate::ax::evidence::Observed<Read<Vec<T>>> {
+    use crate::ax::evidence::{read_status, Observed, ReadEvidence, ReadSite};
+    let evidence = vec![ReadEvidence {
+        owner: Some(owner),
+        site: ReadSite::Children,
+        status: read_status(&legacy),
+        attempt: 0,
+        listing: None,
+    }];
+    Observed { legacy, evidence }
 }
 
 impl NativeElement {
@@ -108,6 +138,12 @@ impl AxTreeSource for NativeSource {
         }
     }
     fn children(&self, element: &NativeElement) -> Read<Vec<NativeElement>> {
+        self.observed_children(element).legacy
+    }
+    fn observed_children(
+        &self,
+        element: &NativeElement,
+    ) -> crate::ax::evidence::Observed<Read<Vec<NativeElement>>> {
         unsafe {
             let attr = CFString::new("AXChildren");
             let mut value = std::ptr::null();
@@ -117,27 +153,38 @@ impl AxTreeSource for NativeSource {
                 &mut value,
             );
             if !children_read_succeeded(error) {
-                return Read::Unknown(ReadFailure::Ax(error));
+                return observed_children_read(
+                    self.key(element),
+                    Read::Unknown(ReadFailure::Ax(error)),
+                );
             }
             if error != kAXErrorSuccess || value.is_null() {
-                return Read::Absent;
+                return observed_children_read(self.key(element), Read::Absent);
             }
             if CFGetTypeID(value) != CFArray::<CFTypeRef>::type_id() {
                 CFRelease(value);
-                return Read::Unknown(ReadFailure::WrongType);
+                return observed_children_read(
+                    self.key(element),
+                    Read::Unknown(ReadFailure::WrongType),
+                );
             }
             let array = CFArray::<CFTypeRef>::wrap_under_create_rule(value as _);
             let ax_type = AXUIElementGetTypeID();
-            let children = decode_child_members(0..array.len(), |i| {
+            let mut children = decode_child_members(0..array.len(), |i| {
                 let item = *array.get(i)?;
                 if CFGetTypeID(item) != ax_type {
                     return None;
                 }
                 CFRetain(item);
                 Some(NativeElement::from_owned(item as AXUIElementRef))
-            })
-            .legacy;
-            Read::Known(children)
+            });
+            for entry in &mut children.evidence {
+                entry.owner = Some(self.key(element));
+            }
+            let mut observed =
+                observed_children_read(self.key(element), Read::Known(children.legacy));
+            observed.evidence.extend(children.evidence);
+            observed
         }
     }
     fn element_attribute(&self, element: &NativeElement, name: &str) -> Read<NativeElement> {

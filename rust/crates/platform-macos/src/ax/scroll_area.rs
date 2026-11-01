@@ -94,7 +94,13 @@ pub(crate) fn bar_position_observed_with<S: super::tree_source::AxTreeSource>(
     area: &S::Element,
     direction: &str,
 ) -> super::evidence::Observed<Option<f64>> {
-    super::evidence::Observed::legacy_only(bar_position_legacy_with(source, area, direction))
+    let source = super::evidence_source::EvidenceSource::new(
+        source,
+        super::evidence_source::Domain::Scrollbar,
+        None,
+    );
+    let result = bar_position_legacy_with(&source, area, direction);
+    source.finish(result)
 }
 
 fn bar_position_legacy_with<S: super::tree_source::AxTreeSource>(

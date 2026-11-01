@@ -4,8 +4,9 @@
 //! Sites and statuses are populated by the subsequent evidence-capture step.
 #![allow(dead_code)]
 
+use super::content_attrs::AttrStatus;
 use super::content_attrs::AttributeListing;
-use super::tree_source::ReadFailure;
+use super::tree_source::{Read, ReadFailure};
 
 pub(crate) struct Observed<T> {
     pub(crate) legacy: T,
@@ -59,6 +60,26 @@ pub(crate) struct ReadEvidence {
     pub(crate) attempt: u32,
     /// Classification metadata from an existing text-status read, if any.
     pub(crate) listing: Option<AttributeListing>,
+}
+
+pub(crate) fn read_status<T>(read: &Read<T>) -> EvidenceStatus {
+    match read {
+        Read::Known(_) => EvidenceStatus::Known,
+        Read::Absent => EvidenceStatus::Absent,
+        Read::Unknown(failure) => EvidenceStatus::Unknown(*failure),
+    }
+}
+
+pub(crate) fn attr_status(status: &AttrStatus) -> (EvidenceStatus, Option<AttributeListing>) {
+    match status {
+        AttrStatus::Known(_) => (EvidenceStatus::Known, None),
+        AttrStatus::Absent => (EvidenceStatus::Absent, None),
+        AttrStatus::Failed { error, listed } => (
+            EvidenceStatus::Unknown(ReadFailure::Ax(*error)),
+            Some(*listed),
+        ),
+        AttrStatus::WrongType => (EvidenceStatus::Unknown(ReadFailure::WrongType), None),
+    }
 }
 
 #[cfg(test)]
