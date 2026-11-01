@@ -8,8 +8,8 @@ fn star(child_count: usize) -> Vec<Vec<usize>> {
 
 fn chain(len: usize) -> Vec<Vec<usize>> {
     let mut children = vec![Vec::new(); len];
-    for i in 0..len.saturating_sub(1) {
-        children[i] = vec![i + 1];
+    for (i, child) in children.iter_mut().enumerate().take(len.saturating_sub(1)) {
+        *child = vec![i + 1];
     }
     children
 }
