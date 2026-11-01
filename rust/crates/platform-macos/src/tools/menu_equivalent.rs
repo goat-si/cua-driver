@@ -99,6 +99,45 @@ pub(super) struct MenuMatch {
     pub enabled: bool,
 }
 
+trait MenuReader {
+    type Node: Copy;
+    fn element(&self, node: Self::Node, name: &str) -> Option<Self::Node>;
+    fn children(&self, node: Self::Node) -> Vec<Self::Node>;
+    fn string(&self, node: Self::Node, name: &str) -> Option<String>;
+    fn number(&self, node: Self::Node, name: &str) -> Option<f64>;
+    fn boolean(&self, node: Self::Node, name: &str) -> Option<bool>;
+    fn release(&self, node: Self::Node);
+}
+struct LiveMenuReader;
+impl MenuReader for LiveMenuReader {
+    type Node = AXUIElementRef;
+    fn element(&self, n: Self::Node, a: &str) -> Option<Self::Node> {
+        unsafe { copy_element_attr(n, a) }
+    }
+    fn children(&self, n: Self::Node) -> Vec<Self::Node> {
+        unsafe { copy_children(n) }
+    }
+    fn string(&self, n: Self::Node, a: &str) -> Option<String> {
+        unsafe { copy_string_attr(n, a) }
+    }
+    fn number(&self, n: Self::Node, a: &str) -> Option<f64> {
+        unsafe { copy_number_attr(n, a) }
+    }
+    fn boolean(&self, n: Self::Node, a: &str) -> Option<bool> {
+        unsafe { copy_bool_attr(n, a) }
+    }
+    fn release(&self, n: Self::Node) {
+        unsafe { CFRelease(n as CFTypeRef) }
+    }
+}
+pub(super) fn spawn_lookup<F, R>(f: F) -> tokio::task::JoinHandle<R>
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    crate::goat::action_latency::spawn_action_blocking(f)
+}
+
 /// Find the item in `pid`'s menu bar whose key equivalent is `combo`. An
 /// enabled match wins over a disabled one with the same equivalent. The
 /// Apple menu is skipped: its commands belong to the system.
@@ -109,17 +148,18 @@ pub(super) fn find(pid: i32, combo: &Combo) -> Option<MenuMatch> {
             return None;
         }
         let _ = AXUIElementSetMessagingTimeout(app, 1.0);
-        let bar = copy_element_attr(app, "AXMenuBar");
+        let reader = LiveMenuReader;
+        let bar = reader.element(app, "AXMenuBar");
         CFRelease(app as CFTypeRef);
         let bar = bar?;
         let mut found: Option<MenuMatch> = None;
         let mut budget = MAX_ITEMS;
         visit_releasing(
-            semantic_items(bar),
+            semantic_items(&reader, bar),
             |index, top| {
-                let title = copy_string_attr(top, "AXTitle").unwrap_or_default();
+                let title = reader.string(top, "AXTitle").unwrap_or_default();
                 if index > 0 || title != "Apple" {
-                    search(top, vec![title], combo, &mut found, &mut budget, 0);
+                    search(&reader, top, vec![title], combo, &mut found, &mut budget, 0);
                 }
                 found.as_ref().is_some_and(|m| m.enabled)
             },
@@ -148,12 +188,12 @@ fn visit_releasing<T: Copy>(
 
 /// The items under a menu bar item or submenu item (through the untitled
 /// `AXMenu` container AppKit puts between them).
-unsafe fn semantic_items(parent: AXUIElementRef) -> Vec<AXUIElementRef> {
+fn semantic_items<R: MenuReader>(reader: &R, parent: R::Node) -> Vec<R::Node> {
     let mut out = Vec::new();
-    for child in copy_children(parent) {
-        if copy_string_attr(child, "AXRole").as_deref() == Some("AXMenu") {
-            out.extend(copy_children(child));
-            CFRelease(child as CFTypeRef);
+    for child in reader.children(parent) {
+        if reader.string(child, "AXRole").as_deref() == Some("AXMenu") {
+            out.extend(reader.children(child));
+            reader.release(child);
         } else {
             out.push(child);
         }
@@ -161,26 +201,27 @@ unsafe fn semantic_items(parent: AXUIElementRef) -> Vec<AXUIElementRef> {
     out
 }
 
-unsafe fn search(
-    parent: AXUIElementRef,
+fn search<R: MenuReader>(
+    reader: &R,
+    parent: R::Node,
     path: Vec<String>,
     combo: &Combo,
     found: &mut Option<MenuMatch>,
     budget: &mut usize,
     depth: usize,
 ) {
-    for item in semantic_items(parent) {
+    for item in semantic_items(reader, parent) {
         if *budget == 0 || found.as_ref().is_some_and(|m| m.enabled) {
-            CFRelease(item as CFTypeRef);
+            reader.release(item);
             continue;
         }
         *budget -= 1;
-        let title = copy_string_attr(item, "AXTitle").unwrap_or_default();
-        let cmd_char = copy_string_attr(item, "AXMenuItemCmdChar").unwrap_or_default();
+        let title = reader.string(item, "AXTitle").unwrap_or_default();
+        let cmd_char = reader.string(item, "AXMenuItemCmdChar").unwrap_or_default();
         if !cmd_char.is_empty() {
-            let modifiers = copy_number_attr(item, "AXMenuItemCmdModifiers").unwrap_or(0.0) as i64;
+            let modifiers = reader.number(item, "AXMenuItemCmdModifiers").unwrap_or(0.0) as i64;
             if combo.matches(&cmd_char, modifiers) {
-                let enabled = copy_bool_attr(item, "AXEnabled") != Some(false);
+                let enabled = reader.boolean(item, "AXEnabled") != Some(false);
                 if found.is_none() || enabled {
                     let mut item_path = path.clone();
                     item_path.push(title.clone());
@@ -193,9 +234,9 @@ unsafe fn search(
         } else if depth < 2 && !title.is_empty() {
             let mut sub_path = path.clone();
             sub_path.push(title);
-            search(item, sub_path, combo, found, budget, depth + 1);
+            search(reader, item, sub_path, combo, found, budget, depth + 1);
         }
-        CFRelease(item as CFTypeRef);
+        reader.release(item);
     }
 }
 

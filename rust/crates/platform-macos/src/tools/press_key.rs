@@ -880,7 +880,7 @@ impl Tool for PressKeyTool {
                 super::menu_equivalent::Combo::parse(&modifiers, &key),
             ) {
                 let lookup = combo.clone();
-                let menu_item = latency::spawn_action_blocking(move || {
+                let menu_item = super::menu_equivalent::spawn_lookup(move || {
                     let native = !super::type_text::is_browser_pid(pid)
                         && !crate::browser::electron_js::ElectronJs::is_electron(pid);
                     if native {
