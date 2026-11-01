@@ -123,6 +123,12 @@ pub(crate) enum ReadSite {
     TopLevelWindowsMember,
     TopLevelRemoteWindow,
     ApplicationRoot,
+    MenuWindowList,
+    MenuDiscoveryDeadline,
+    MenuWindowCap,
+    MenuResolution,
+    MenuFrame,
+    MenuOwnership,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -132,6 +138,7 @@ pub(crate) enum EvidenceStatus {
     Unknown(ReadFailure),
     Unavailable,
     DeadlineExpired,
+    DiscoveryLimit,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

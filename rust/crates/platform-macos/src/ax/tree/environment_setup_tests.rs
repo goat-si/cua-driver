@@ -7,6 +7,10 @@ struct SingleRoot<'a> {
     root: RefCell<Option<super::walker_seam_tests::Handle>>,
     trace: RefCell<Vec<&'static str>>,
     create: bool,
+    scoped: bool,
+    menu_frames: Option<Option<Vec<[f64; 4]>>>,
+    menu_replies: RefCell<std::collections::VecDeque<Option<super::MenuObservation<usize>>>>,
+    menu_credits: RefCell<std::collections::HashMap<usize, super::walker_seam_tests::Handle>>,
 }
 
 impl super::AxWalkEnvironment for SingleRoot<'_> {
@@ -47,7 +51,7 @@ impl super::AxWalkEnvironment for SingleRoot<'_> {
         pid: i32,
         id: Option<u32>,
     ) -> crate::ax::evidence::Observed<Vec<usize>> {
-        assert_eq!((application, pid, id), (1, 42, None));
+        assert_eq!((application, pid, id), (1, 42, self.scoped.then_some(99)));
         self.trace.borrow_mut().push("windows");
         crate::ax::evidence::Observed::legacy_only(vec![])
     }
@@ -55,9 +59,18 @@ impl super::AxWalkEnvironment for SingleRoot<'_> {
         panic!("unexpected identity check")
     }
     fn release(&self, element: usize) {
-        assert_eq!(element, 2);
-        self.trace.borrow_mut().push("release-root");
-        drop(self.root.borrow_mut().take().expect("root credit"));
+        if element == 2 {
+            self.trace.borrow_mut().push("release-root");
+            drop(self.root.borrow_mut().take().expect("root credit"));
+        } else {
+            self.trace.borrow_mut().push("release-menu");
+            drop(
+                self.menu_credits
+                    .borrow_mut()
+                    .remove(&element)
+                    .expect("menu credit"),
+            );
+        }
     }
     fn retain(&self, _: usize) {
         panic!("unexpected retain")
@@ -65,11 +78,16 @@ impl super::AxWalkEnvironment for SingleRoot<'_> {
     fn element_key(&self, element: usize) -> usize {
         element
     }
-    fn set_element_timeout(&self, _: usize) {
-        panic!("unexpected recovery")
+    fn set_element_timeout(&self, element: usize) {
+        assert!(self.scoped);
+        assert_eq!(element, 2);
+        self.trace.borrow_mut().push("element-timeout");
     }
-    fn window_id(&self, _: usize) -> Option<u32> {
-        panic!("unexpected window id")
+    fn window_id(&self, element: usize) -> Option<u32> {
+        assert!(self.scoped);
+        assert_eq!(element, 2);
+        self.trace.borrow_mut().push("window-id");
+        Some(99)
     }
     fn window_bounds(&self, _: u32) -> Option<[f64; 4]> {
         panic!("unexpected bounds")
@@ -91,12 +109,20 @@ impl super::AxWalkEnvironment for SingleRoot<'_> {
     }
     fn scope_candidate(
         &self,
-        _: usize,
+        element: usize,
     ) -> crate::ax::evidence::Observed<crate::ax::window_scope::TopLevelCandidate> {
-        panic!("unexpected scope")
+        assert!(self.scoped);
+        assert_eq!(element, 2);
+        self.trace.borrow_mut().push("candidate");
+        crate::ax::evidence::Observed::legacy_only(crate::ax::window_scope::TopLevelCandidate::new(
+            "AXWindow",
+            Some(99),
+        ))
     }
-    fn window_owner(&self, _: i32, _: u32) -> crate::windows::WindowOwner {
-        panic!("unexpected owner")
+    fn window_owner(&self, pid: i32, id: u32) -> crate::windows::WindowOwner {
+        assert_eq!((pid, id), (42, 99));
+        self.trace.borrow_mut().push("owner");
+        crate::windows::WindowOwner::SamePid
     }
     fn sheet_role(&self, _: usize) -> crate::ax::tree_source::Read<String> {
         panic!("unexpected sheet")
@@ -124,7 +150,7 @@ impl super::WalkElementBorrow<super::walker_seam_tests::Fake> for SingleRoot<'_>
         f: impl FnOnce(&super::walker_seam_tests::Fake, &super::walker_seam_tests::Handle) -> R,
     ) -> R {
         assert!(std::ptr::eq(self.source, source));
-        assert!(self.root.borrow().is_some());
+        assert!(self.root.borrow().is_some() || self.menu_credits.borrow().contains_key(&raw));
         super::WalkElementBorrow::with_walk_element(source, source, raw, f)
     }
 }
@@ -133,21 +159,99 @@ impl super::WalkOrchestration<super::walker_seam_tests::Fake> for SingleRoot<'_>
         assert_eq!(application, 1);
         self.trace.borrow_mut().push("release-app");
     }
-    fn menu_frames(&self, _: i32) -> Option<Vec<[f64; 4]>> {
-        panic!("unexpected menu listing")
+    fn menu_frames(&self, pid: i32) -> crate::ax::evidence::Observed<Option<Vec<[f64; 4]>>> {
+        assert_eq!(pid, 42);
+        self.trace.borrow_mut().push("menu-list");
+        super::menu_list_observed(self.menu_frames.clone().expect("unexpected menu listing"))
     }
     fn menu_in_window(
         &self,
-        _: i32,
+        pid: i32,
         _: [f64; 4],
         _: std::time::Instant,
-    ) -> Option<(
-        usize,
-        Option<[f64; 4]>,
-        Option<super::super::context_menus::MenuOwner>,
-    )> {
-        panic!("unexpected menu lookup")
+    ) -> crate::ax::evidence::Observed<
+        Option<(
+            usize,
+            Option<[f64; 4]>,
+            Option<super::super::context_menus::MenuOwner>,
+        )>,
+    > {
+        assert_eq!(pid, 42);
+        self.trace.borrow_mut().push("menu-lookup");
+        let result = self
+            .menu_replies
+            .borrow_mut()
+            .pop_front()
+            .expect("unexpected menu lookup");
+        if let Some((element, _, _)) = &result {
+            assert!(self
+                .menu_credits
+                .borrow_mut()
+                .insert(*element, self.source.handle(*element))
+                .is_none());
+        }
+        super::menu_resolution_observed(result, |element| *element)
     }
+}
+
+pub(super) fn run_menu_case(
+    frames: Option<Vec<[f64; 4]>>,
+    replies: Vec<Option<super::MenuObservation<usize>>>,
+) -> (
+    crate::ax::evidence::Observed<super::TreeWalkResult>,
+    Vec<&'static str>,
+) {
+    use super::walker_seam_tests::{step, Fake, Reply};
+    use super::walker_test_support::{Batch, Slot};
+    use crate::ax::content_attrs::AttrStatus;
+    use crate::ax::tree_source::Read;
+    use cua_driver_core::walk_budget::WalkBudget;
+    let mut attrs = vec![Slot::Text(AttrStatus::Absent); 7];
+    attrs[0] = Slot::Text(AttrStatus::Known("Window".into()));
+    let source = Fake::new(&[(2, 2, 2, &[]), (3, 3, 3, &[])], vec![
+        step("timeout 2", Reply::Unit),
+        step("text 2 AXRole", Reply::Text(Read::Known("AXWindow".into()))),
+        step("batch 2 AXTitle,AXPlaceholderValue,AXDescription,AXIdentifier,AXHelp,AXSubrole,AXRoleDescription", Reply::Batch(Ok(Batch(attrs)))),
+        step("value 2", Reply::Value(Ok(None))),
+        step("actions 2", Reply::Actions(Read::Known(vec![]))),
+        step("batch 2 AXPosition,AXSize", Reply::Batch(Ok(Batch(vec![Slot::Point(None), Slot::Size(None)])))),
+        step("children 2", Reply::Children(Read::Absent)),
+    ]);
+    let environment = SingleRoot {
+        source: &source,
+        root: RefCell::new(None),
+        trace: RefCell::new(vec![]),
+        create: true,
+        scoped: true,
+        menu_frames: Some(frames),
+        menu_replies: RefCell::new(replies.into()),
+        menu_credits: RefCell::new(Default::default()),
+    };
+    let observed = super::walk_with_environment(
+        &source,
+        &environment,
+        super::WalkRequest {
+            pid: 42,
+            window_id: Some(99),
+            query: None,
+            max_depth: 10,
+            include_web_content: true,
+        },
+        WalkBudget::nodes_only(100),
+    );
+    let expected_markdown = if observed.legacy.truncated {
+        "- AXWindow \"Window\"\n\n⚠️ PARTIAL TREE: the 31536000000 ms timeout_ms budget ran out after 1 node(s) (0 discovered but not visited). Every element listed is real; elements after the cut are missing. If the element you need is absent, retry with a larger timeout_ms (e.g. 5000) or narrow with query / max_depth."
+    } else {
+        "- AXWindow \"Window\"\n"
+    };
+    assert_eq!(observed.legacy.tree_markdown, expected_markdown);
+    assert!(environment.menu_replies.borrow().is_empty());
+    assert!(environment.menu_credits.borrow().is_empty());
+    assert!(environment.root.borrow().is_none());
+    source.assert_consumed();
+    source.assert_lifetimes(&[]);
+    let trace = environment.trace.borrow().clone();
+    (observed, trace)
 }
 
 #[test]
@@ -173,6 +277,10 @@ fn shared_entry_walks_fake_root_and_releases_its_credit() {
         root: RefCell::new(None),
         trace: RefCell::new(vec![]),
         create: true,
+        scoped: false,
+        menu_frames: None,
+        menu_replies: RefCell::new(Default::default()),
+        menu_credits: RefCell::new(Default::default()),
     };
     let observed = super::walk_with_environment(
         &source,
@@ -229,6 +337,10 @@ fn shared_entry_preserves_application_creation_failure() {
         root: RefCell::new(None),
         trace: RefCell::new(vec![]),
         create: false,
+        scoped: false,
+        menu_frames: None,
+        menu_replies: RefCell::new(Default::default()),
+        menu_credits: RefCell::new(Default::default()),
     };
     let observed = super::walk_with_environment(
         &source,

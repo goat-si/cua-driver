@@ -4,6 +4,95 @@ use crate::ax::evidence::{EvidenceStatus, ReadSite};
 use std::cell::{Cell, RefCell};
 use std::time::{Duration, Instant};
 
+#[test]
+fn menu_discovery_preserves_failure_deadline_and_cap() {
+    use super::environment_setup_tests::run_menu_case;
+    use crate::ax::context_menus::MenuOwner;
+    use crate::ax::evidence::EvidenceScope;
+    use cua_driver_core::walk_budget::WalkStop;
+    let frame = [0.0, 0.0, 40.0, 40.0];
+
+    let (failed_list, trace) = run_menu_case(None, vec![]);
+    assert_eq!(failed_list.legacy.walk.stop, Some(WalkStop::Timeout));
+    assert!(failed_list
+        .evidence
+        .iter()
+        .any(|e| e.site == ReadSite::MenuWindowList && e.status == EvidenceStatus::Unavailable));
+    assert!(!trace.contains(&"menu-lookup"));
+
+    let scope = EvidenceScope::start();
+    assert!(
+        super::menu_discovery_deadline(Instant::now(), false, Some(Duration::from_millis(1)))
+            .is_none()
+    );
+    let deadline = scope.finish(());
+    assert!(deadline
+        .evidence
+        .iter()
+        .any(|e| e.site == ReadSite::MenuDiscoveryDeadline
+            && e.status == EvidenceStatus::DeadlineExpired));
+
+    let (capped, trace) = run_menu_case(Some(vec![frame; 5]), vec![None, None, None, None]);
+    assert_eq!(capped.legacy.walk.stop, Some(WalkStop::Timeout));
+    assert!(capped
+        .evidence
+        .iter()
+        .any(|e| e.site == ReadSite::MenuWindowCap && e.status == EvidenceStatus::DiscoveryLimit));
+    assert_eq!(
+        capped
+            .evidence
+            .iter()
+            .filter(
+                |e| e.site == ReadSite::MenuResolution && e.status == EvidenceStatus::Unavailable
+            )
+            .count(),
+        4
+    );
+    assert_eq!(
+        trace
+            .iter()
+            .filter(|entry| **entry == "menu-lookup")
+            .count(),
+        4
+    );
+
+    let (uncertain, trace) = run_menu_case(Some(vec![frame]), vec![Some((3, Some(frame), None))]);
+    assert_eq!(uncertain.legacy.walk.stop, Some(WalkStop::Timeout));
+    assert!(uncertain
+        .evidence
+        .iter()
+        .any(|e| e.site == ReadSite::MenuOwnership
+            && e.owner == Some(3)
+            && e.status == EvidenceStatus::Unavailable));
+    assert!(trace.contains(&"release-menu"));
+
+    let (missing_frame, trace) = run_menu_case(
+        Some(vec![frame]),
+        vec![Some((3, None, Some(MenuOwner::Window(99))))],
+    );
+    assert_eq!(missing_frame.legacy.walk.stop, Some(WalkStop::Timeout));
+    assert!(missing_frame
+        .evidence
+        .iter()
+        .any(|e| e.site == ReadSite::MenuFrame
+            && e.owner == Some(3)
+            && e.status == EvidenceStatus::Unavailable));
+    assert!(trace.contains(&"release-menu"));
+
+    let (foreign, trace) = run_menu_case(
+        Some(vec![frame]),
+        vec![Some((3, Some(frame), Some(MenuOwner::Window(123))))],
+    );
+    assert_eq!(foreign.legacy.walk.stop, None);
+    assert!(foreign
+        .evidence
+        .iter()
+        .any(|e| e.site == ReadSite::MenuOwnership
+            && e.owner == Some(3)
+            && e.status == EvidenceStatus::Known));
+    assert!(trace.contains(&"release-menu"));
+}
+
 #[derive(Clone, Copy)]
 pub(super) enum Scenario {
     Union,

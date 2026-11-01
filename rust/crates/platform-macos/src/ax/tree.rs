@@ -836,30 +836,115 @@ trait WalkOrchestration<S: AxTreeSource>:
     AxWalkEnvironment + WalkElementBorrow<S, Raw = <Self as AxWalkEnvironment>::Element>
 {
     fn release_application(&self, application: Self::Application);
-    fn menu_frames(&self, pid: i32) -> Option<Vec<[f64; 4]>>;
+    fn menu_frames(&self, pid: i32) -> super::evidence::Observed<Option<Vec<[f64; 4]>>>;
     fn menu_in_window(
         &self,
         pid: i32,
         frame: [f64; 4],
         deadline: Instant,
-    ) -> Option<MenuObservation<Self::Element>>;
+    ) -> super::evidence::Observed<Option<MenuObservation<Self::Element>>>;
 }
 
 impl WalkOrchestration<super::tree_source::native::NativeSource> for NativeWalkEnvironment {
     fn release_application(&self, application: Self::Application) {
         unsafe { CFRelease(application as CFTypeRef) }
     }
-    fn menu_frames(&self, pid: i32) -> Option<Vec<[f64; 4]>> {
-        super::context_menus::open_menu_window_frames(pid)
+    fn menu_frames(&self, pid: i32) -> super::evidence::Observed<Option<Vec<[f64; 4]>>> {
+        menu_list_observed(super::context_menus::open_menu_window_frames(pid))
     }
     fn menu_in_window(
         &self,
         pid: i32,
         frame: [f64; 4],
         deadline: Instant,
-    ) -> Option<MenuObservation<Self::Element>> {
-        unsafe { super::context_menus::menu_in_window(pid, frame, deadline) }
+    ) -> super::evidence::Observed<Option<MenuObservation<Self::Element>>> {
+        menu_resolution_observed(
+            unsafe { super::context_menus::menu_in_window(pid, frame, deadline) },
+            |element| *element as usize,
+        )
     }
+}
+
+fn menu_list_observed<T>(legacy: Option<T>) -> super::evidence::Observed<Option<T>> {
+    use super::evidence::{EvidenceStatus, Observed, ReadEvidence, ReadSite};
+    let status = if legacy.is_some() {
+        EvidenceStatus::Known
+    } else {
+        EvidenceStatus::Unavailable
+    };
+    Observed {
+        legacy,
+        evidence: vec![ReadEvidence {
+            owner: None,
+            site: ReadSite::MenuWindowList,
+            status,
+            attempt: 0,
+            listing: None,
+        }],
+    }
+}
+
+fn menu_resolution_observed<T>(
+    legacy: Option<MenuObservation<T>>,
+    key: impl FnOnce(&T) -> usize,
+) -> super::evidence::Observed<Option<MenuObservation<T>>> {
+    use super::evidence::{EvidenceStatus, Observed, ReadEvidence, ReadSite};
+    let mut evidence = vec![ReadEvidence {
+        owner: legacy.as_ref().map(|(element, _, _)| key(element)),
+        site: ReadSite::MenuResolution,
+        status: if legacy.is_some() {
+            EvidenceStatus::Known
+        } else {
+            EvidenceStatus::Unavailable
+        },
+        attempt: 0,
+        listing: None,
+    }];
+    if let Some((_, frame, owner)) = &legacy {
+        evidence.push(ReadEvidence {
+            owner: evidence[0].owner,
+            site: ReadSite::MenuFrame,
+            status: if frame.is_some() {
+                EvidenceStatus::Known
+            } else {
+                EvidenceStatus::Unavailable
+            },
+            attempt: 0,
+            listing: None,
+        });
+        evidence.push(ReadEvidence {
+            owner: evidence[0].owner,
+            site: ReadSite::MenuOwnership,
+            status: if owner.is_some() {
+                EvidenceStatus::Known
+            } else {
+                EvidenceStatus::Unavailable
+            },
+            attempt: 0,
+            listing: None,
+        });
+    }
+    Observed { legacy, evidence }
+}
+
+fn menu_discovery_deadline(
+    now: Instant,
+    truncated: bool,
+    remaining: Option<std::time::Duration>,
+) -> Option<Instant> {
+    let deadline = super::context_menus::discovery_deadline(now, truncated, remaining);
+    super::evidence::record_status(
+        None,
+        super::evidence::ReadSite::MenuDiscoveryDeadline,
+        if deadline.is_some() {
+            super::evidence::EvidenceStatus::Known
+        } else if truncated {
+            super::evidence::EvidenceStatus::Unavailable
+        } else {
+            super::evidence::EvidenceStatus::DeadlineExpired
+        },
+    );
+    deadline
 }
 
 impl WalkElementBorrow<super::tree_source::native::NativeSource> for NativeWalkEnvironment {
@@ -1087,15 +1172,18 @@ where
         // A WindowServer list that could not be read leaves open menus
         // unknown: partial.
         let menu_frames = match window_id {
-            Some(_) if !nodes.is_empty() => environment.menu_frames(pid).unwrap_or_else(|| {
-                budget.stop_for_timeout();
-                Vec::new()
-            }),
+            Some(_) if !nodes.is_empty() => environment
+                .menu_frames(pid)
+                .into_walk_legacy()
+                .unwrap_or_else(|| {
+                    budget.stop_for_timeout();
+                    Vec::new()
+                }),
             _ => Vec::new(),
         };
         let discovery = (!menu_frames.is_empty())
             .then(|| {
-                super::context_menus::discovery_deadline(
+                menu_discovery_deadline(
                     Instant::now(),
                     budget.outcome().truncated(),
                     budget.remaining(),
@@ -1107,6 +1195,13 @@ where
         }
         if let (Some(wid), Some(deadline)) = (window_id, discovery) {
             let mut incomplete = menu_frames.len() > super::context_menus::MAX_MENU_WINDOWS;
+            if incomplete {
+                super::evidence::record_status(
+                    None,
+                    super::evidence::ReadSite::MenuWindowCap,
+                    super::evidence::EvidenceStatus::DiscoveryLimit,
+                );
+            }
             let mut walked_menus: Vec<[f64; 4]> = nodes
                 .iter()
                 .filter(|node| node.role == "AXMenu")
@@ -1116,8 +1211,9 @@ where
                 .iter()
                 .take(super::context_menus::MAX_MENU_WINDOWS)
             {
-                let Some((menu, menu_frame, owner)) =
-                    environment.menu_in_window(pid, frame, deadline)
+                let Some((menu, menu_frame, owner)) = environment
+                    .menu_in_window(pid, frame, deadline)
+                    .into_walk_legacy()
                 else {
                     // Nothing readable reached a menu in this menu window.
                     incomplete = true;
