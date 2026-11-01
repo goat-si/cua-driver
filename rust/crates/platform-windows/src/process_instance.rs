@@ -1,8 +1,9 @@
 use cua_driver_core::element_token::ResolvedElement;
 use cua_driver_core::protocol::ToolResult;
 use cua_driver_core::snapshot_store::{
-    InstanceCapture, InstanceEvidence, SnapshotPayload, SnapshotStore,
+    CaptureTicket, InstanceCapture, InstanceEvidence, SnapshotPayload, SnapshotStore,
 };
+use cua_driver_core::window_basis::WindowBasis;
 
 use cua_driver_core::browser::types::ProcessFingerprint;
 
@@ -132,17 +133,77 @@ pub(crate) fn probe(pid: u32, hwnd: u64) -> Probe {
     }
 }
 
-fn publish_window_snapshot<S: SnapshotPayload>(
+/// Capture recorded when the accessibility walk outlives its backstop. The
+/// detached walk worker never publishes; its result is dropped.
+pub(crate) fn walk_timed_out_capture() -> InstanceCapture {
+    InstanceCapture::Failed(
+        "the accessibility walk timed out before process identity could be confirmed".into(),
+    )
+}
+
+/// Every Windows element-snapshot publication goes through these adapters,
+/// so each published snapshot carries the process instance it was read from.
+pub(crate) fn publish_window_snapshot<S: SnapshotPayload>(
     store: &SnapshotStore<S>,
     pid: i32,
     hwnd: u64,
     payload: S,
     session: Option<&str>,
+    screenshot_scale: Option<f64>,
     capture: InstanceCapture,
 ) -> Option<(u32, Vec<u32>)> {
-    store.publish_for_session_with_instance(pid, hwnd, payload, session, None, capture)
+    store.publish_for_session_with_instance(pid, hwnd, payload, session, screenshot_scale, capture)
 }
-fn resolve_with_evidence<S: SnapshotPayload>(
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn publish_window_snapshot_with_basis<S: SnapshotPayload>(
+    store: &SnapshotStore<S>,
+    pid: i32,
+    hwnd: u64,
+    payload: S,
+    session: Option<&str>,
+    screenshot_scale: Option<f64>,
+    basis: Option<WindowBasis>,
+    ticket: &CaptureTicket<S>,
+    capture: InstanceCapture,
+) -> Option<(u32, Vec<u32>, Option<WindowBasis>)> {
+    store.publish_basis_for_session_with_instance(
+        pid,
+        hwnd,
+        payload,
+        session,
+        screenshot_scale,
+        basis,
+        ticket,
+        capture,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn publish_capture_snapshot_with_basis<S: SnapshotPayload>(
+    store: &SnapshotStore<S>,
+    pid: i32,
+    hwnd: u64,
+    payload: S,
+    session: Option<&str>,
+    screenshot_scale: Option<f64>,
+    basis: Option<WindowBasis>,
+    ticket: &CaptureTicket<S>,
+    capture: InstanceCapture,
+) -> Option<(u32, Vec<u32>, Option<WindowBasis>)> {
+    store.publish_capture_basis_for_session_with_instance(
+        pid,
+        hwnd,
+        payload,
+        session,
+        screenshot_scale,
+        basis,
+        ticket,
+        capture,
+    )
+}
+
+pub(crate) fn resolve_with_evidence<S: SnapshotPayload>(
     store: &SnapshotStore<S>,
     pid: i32,
     args: &serde_json::Value,
@@ -150,6 +211,46 @@ fn resolve_with_evidence<S: SnapshotPayload>(
 ) -> Result<ResolvedElement<S::Element>, ToolResult> {
     store.resolve_for_instance(pid, args, evidence)
 }
+
+/// Evidence for an async caller: the fingerprint read runs as a blocking
+/// task; a task that fails to report is unavailable evidence, never a match.
+pub(crate) async fn evidence_from_task<F, Fut>(
+    args: &serde_json::Value,
+    task: F,
+) -> InstanceEvidence
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<
+        Output = Result<Result<ProcessFingerprint, String>, tokio::task::JoinError>,
+    >,
+{
+    if args.get("element_token").is_none() {
+        return InstanceEvidence::NotChecked;
+    }
+    match task().await {
+        Ok(Ok(fp)) => InstanceEvidence::Live(fp),
+        Ok(Err(reason)) => InstanceEvidence::Unavailable(reason),
+        Err(error) => {
+            InstanceEvidence::Unavailable(format!("process fingerprint task failed: {error}"))
+        }
+    }
+}
+
+/// Resolve an element token against the live process instance. The store
+/// lock is taken only by the synchronous resolve after the read completes.
+#[cfg(windows)]
+pub(crate) async fn resolve_live<S: SnapshotPayload>(
+    store: &SnapshotStore<S>,
+    pid: i32,
+    args: &serde_json::Value,
+) -> Result<ResolvedElement<S::Element>, ToolResult> {
+    let evidence = evidence_from_task(args, || {
+        tokio::task::spawn_blocking(move || process_fingerprint(pid as u32))
+    })
+    .await;
+    resolve_with_evidence(store, pid, args, evidence)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -262,6 +363,7 @@ mod tests {
             7,
             Payload,
             Some("owner"),
+            None,
             InstanceCapture::Captured(fp(1)),
         )
         .unwrap()
@@ -273,5 +375,154 @@ mod tests {
             result.unwrap_err().structured_content.unwrap()["refusal"]["code"],
             "process_instance_mismatch"
         );
+    }
+
+    fn refusal_code(
+        result: Result<ResolvedElement<usize>, ToolResult>,
+    ) -> (String, Option<cua_driver_contract::ErrorDisposition>) {
+        let err = match result {
+            Ok(_) => panic!("expected a refusal"),
+            Err(err) => err,
+        };
+        let code = err.structured_content.as_ref().unwrap()["refusal"]["code"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        (code, err.disposition)
+    }
+
+    fn token_args(id: u32) -> serde_json::Value {
+        serde_json::json!({"element_token": cua_driver_core::element_token::token_for(id, 0), "_session_id": "owner"})
+    }
+
+    #[test]
+    fn walk_timeout_capture_refuses_existing_element_as_unverified() {
+        let store = SnapshotStore::new();
+        let id = publish_window_snapshot(
+            &store,
+            42,
+            7,
+            Payload,
+            Some("owner"),
+            None,
+            walk_timed_out_capture(),
+        )
+        .unwrap()
+        .0;
+        let (code, disposition) = refusal_code(resolve_with_evidence(
+            &store,
+            42,
+            &token_args(id),
+            InstanceEvidence::Live(fp(1)),
+        ));
+        assert_eq!(code, "process_instance_unverified");
+        assert_eq!(
+            disposition,
+            Some(cua_driver_contract::ErrorDisposition::NOT_DELIVERED)
+        );
+    }
+
+    #[test]
+    fn ticketed_publications_carry_their_capture() {
+        let store = SnapshotStore::new();
+        let ticket = store.begin_capture(42, 7);
+        let id = publish_window_snapshot_with_basis(
+            &store,
+            42,
+            7,
+            Payload,
+            Some("owner"),
+            Some(1.0),
+            None,
+            &ticket,
+            InstanceCapture::Captured(fp(1)),
+        )
+        .unwrap()
+        .0;
+        assert!(
+            resolve_with_evidence(&store, 42, &token_args(id), InstanceEvidence::Live(fp(1)))
+                .is_ok()
+        );
+        let (code, _) = refusal_code(resolve_with_evidence(
+            &store,
+            42,
+            &token_args(id),
+            InstanceEvidence::Live(fp(2)),
+        ));
+        assert_eq!(code, "process_instance_mismatch");
+
+        // A screenshot refresh of that snapshot keeps its original instance.
+        let refresh = store.begin_capture(42, 7);
+        assert!(store
+            .refresh_basis_for_session(42, 7, Some("owner"), 2.0, None, None, &refresh)
+            .is_some());
+        assert!(
+            resolve_with_evidence(&store, 42, &token_args(id), InstanceEvidence::Live(fp(1)))
+                .is_ok()
+        );
+        let (code, _) = refusal_code(resolve_with_evidence(
+            &store,
+            42,
+            &token_args(id),
+            InstanceEvidence::Live(fp(2)),
+        ));
+        assert_eq!(code, "process_instance_mismatch");
+
+        let other = SnapshotStore::new();
+        let ticket = other.begin_capture(42, 7);
+        let published = publish_capture_snapshot_with_basis(
+            &other,
+            42,
+            7,
+            Payload,
+            Some("owner"),
+            Some(1.0),
+            None,
+            &ticket,
+            InstanceCapture::Failed("identity read failed".into()),
+        );
+        let id = published.expect("capture-only snapshot published").0;
+        assert!(
+            resolve_with_evidence(&other, 42, &token_args(id), InstanceEvidence::Live(fp(1)))
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn fingerprint_task_failure_is_unverified_and_tokenless_reads_skip_it() {
+        let store = SnapshotStore::new();
+        let id = publish_window_snapshot(
+            &store,
+            42,
+            7,
+            Payload,
+            Some("owner"),
+            None,
+            InstanceCapture::Captured(fp(1)),
+        )
+        .unwrap()
+        .0;
+        let args = token_args(id);
+        let evidence = evidence_from_task(&args, || async {
+            tokio::spawn(async { panic!("fingerprint worker") })
+                .await
+                .map(|()| Ok(fp(1)))
+        })
+        .await;
+        assert!(matches!(evidence, InstanceEvidence::Unavailable(_)));
+        let (code, disposition) = refusal_code(resolve_with_evidence(&store, 42, &args, evidence));
+        assert_eq!(code, "process_instance_unverified");
+        assert_eq!(
+            disposition,
+            Some(cua_driver_contract::ErrorDisposition::NOT_DELIVERED)
+        );
+
+        let evidence = evidence_from_task(&serde_json::json!({}), || async {
+            panic!("tokenless reads must not read process identity");
+            #[allow(unreachable_code)]
+            Ok(Ok(fp(1)))
+        })
+        .await;
+        assert!(matches!(evidence, InstanceEvidence::NotChecked));
     }
 }

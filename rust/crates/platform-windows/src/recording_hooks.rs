@@ -142,7 +142,14 @@ pub fn element_window_local_xy(
 ) -> Option<(u64, Option<(f64, f64)>)> {
     let cache = current_runtime_store::<UiaSnapshot>()?;
     let pid_u32 = u32::try_from(pid).ok()?;
-    let resolved = cache.resolve(pid_u32 as i32, args).ok()?;
+    // Synchronous recording path: read live process evidence before taking
+    // the store lock, so a token from a restarted process never resolves.
+    let evidence = crate::process_instance::evidence_for(args, || {
+        crate::process_instance::process_fingerprint(pid_u32)
+    });
+    let resolved = cache
+        .resolve_for_instance(pid_u32 as i32, args, evidence)
+        .ok()?;
     let cua_driver_core::element_token::ResolvedElement::Element {
         window_id, element, ..
     } = resolved
