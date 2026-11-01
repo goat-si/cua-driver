@@ -492,9 +492,11 @@ impl Tool for TypeTextTool {
             && !delivery_mode.is_foreground()
             && matches!(keyboard_policy, BackgroundKeyboardPolicy::Allowed)
         {
-            match super::acquire_key_scope(pid, window_id, false).await {
+            match super::type_text_chars::acquire_key_scope_with_evidence(pid, window_id).await {
                 Ok(scope) => scope,
-                Err(refusal) => return refusal,
+                Err(refusal) => {
+                    return super::not_editable::account_focus_receipt(refusal, token_receipt)
+                }
             }
         } else {
             None

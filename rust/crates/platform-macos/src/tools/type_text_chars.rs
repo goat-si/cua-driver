@@ -164,7 +164,7 @@ fn scope_entry_failure(error: crate::input::skylight::ScopeEntryError) -> ToolRe
     result
 }
 
-async fn acquire_chars_key_scope(
+pub(super) async fn acquire_key_scope_with_evidence(
     pid: i32,
     window_id: Option<u32>,
 ) -> Result<Option<crate::input::skylight::WindowKeyScope>, ToolResult> {
@@ -252,7 +252,7 @@ impl Tool for TypeTextCharsTool {
             None
         };
 
-        let mut key_scope = match acquire_chars_key_scope(pid, window_id).await {
+        let mut key_scope = match acquire_key_scope_with_evidence(pid, window_id).await {
             Ok(scope) => scope,
             Err(refusal) => return refusal,
         };
