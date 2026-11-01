@@ -42,6 +42,9 @@ mod popup_result_tests;
 #[cfg(test)]
 #[path = "set_value/popup_ownership_tests.rs"]
 mod popup_route_tests;
+#[cfg(test)]
+#[path = "set_value/u32_outcome_tests.rs"]
+mod u32_outcome_tests;
 
 use super::ToolState;
 
