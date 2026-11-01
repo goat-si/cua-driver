@@ -1,10 +1,5 @@
 use super::*;
-use std::{
-    cell::{Cell, RefCell},
-    future::Future,
-    pin::Pin,
-    time::Duration,
-};
+use std::{future::Future, pin::Pin, sync::Mutex, time::Duration};
 fn rect(x: f64) -> Rect {
     Rect {
         x,
@@ -45,6 +40,8 @@ fn facts() -> ElementFacts {
             Affordance::KeyDown,
             Affordance::KeyUp,
         ]),
+        advertised_actions: Evidence::Absent,
+        selectable_text: Evidence::Absent,
         role: Evidence::Known("textfield".into()),
         nonspatial_visible: false,
     }
@@ -172,16 +169,26 @@ fn hit_test_five_points() {
 }
 #[derive(Default)]
 struct TestClock {
-    time: Cell<Duration>,
-    sleeps: RefCell<Vec<Duration>>,
+    time: TestTime,
+    sleeps: Mutex<Vec<Duration>>,
+}
+#[derive(Default)]
+struct TestTime(Mutex<Duration>);
+impl TestTime {
+    fn get(&self) -> Duration {
+        *self.0.lock().unwrap()
+    }
+    fn set(&self, value: Duration) {
+        *self.0.lock().unwrap() = value;
+    }
 }
 impl Clock for TestClock {
     fn now(&self) -> Duration {
         self.time.get()
     }
-    fn sleep(&self, d: Duration) -> Pin<Box<dyn Future<Output = ()> + '_>> {
+    fn sleep(&self, d: Duration) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
-            self.sleeps.borrow_mut().push(d);
+            self.sleeps.lock().unwrap().push(d);
             self.time.set(self.time.get() + d);
         })
     }
@@ -315,7 +322,7 @@ async fn wait_zero_clamp_transitions_disposition_json() {
     .await;
     assert_eq!(calls, 2);
     assert_eq!(
-        *c.sleeps.borrow(),
+        *c.sleeps.lock().unwrap(),
         vec![Duration::from_millis(100), Duration::from_millis(50)]
     );
     assert_eq!(report.waited_ms, 150);
@@ -334,7 +341,7 @@ async fn wait_zero_clamp_transitions_disposition_json() {
     .await;
     assert_eq!(report.verdict, Verdict::Pass);
     assert_eq!(report.samples, 2);
-    assert_eq!(report.refusal_json(), None);
+    assert!(report.refusal_result().is_none());
     let c = TestClock::default();
     let mut calls = 0;
     let report = auto_wait(&c, Duration::from_secs(1), true, |_| {
@@ -360,10 +367,12 @@ async fn wait_zero_clamp_transitions_disposition_json() {
     ));
     assert_eq!(report.disposition, None);
     assert_eq!(calls, 2);
-    assert_eq!(
-        report.refusal_json().unwrap()["actionability"]["code"],
-        "policy_denied"
-    );
+    let body = report.refusal_result().unwrap().structured_content.unwrap();
+    assert_eq!(body["refusal"]["code"], "element_not_actionable");
+    assert!(body["refusal"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("policy_denied"));
 }
 
 #[test]
@@ -472,12 +481,13 @@ async fn pending_probe_is_bounded_and_preserves_last_report() {
         report.disposition,
         Some(DispositionIntent::NotDeliveredSafe)
     );
-    assert_eq!(
-        report.refusal_json(),
-        Some(
-            serde_json::json!({"actionability":{"verdict":"terminal","code":"timeout","reason":"enabled is false or absent","waited_ms":150}})
-        )
-    );
+    let result = report.refusal_result().unwrap();
+    let body = result.structured_content.unwrap();
+    assert_eq!(body["refusal"]["code"], "element_not_actionable");
+    assert!(body["refusal"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("timeout: enabled is false or absent (waited 150 ms)"));
 }
 
 #[test]

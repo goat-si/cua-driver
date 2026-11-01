@@ -27,6 +27,8 @@ pub(crate) mod press_key;
 mod right_click;
 mod scroll;
 mod select_text;
+#[cfg(test)]
+pub(crate) use select_text::selection_exposure_allowed as selection_exposure_for_test;
 mod set_value;
 mod set_value_autosubmit;
 mod set_window_frame;
@@ -2238,6 +2240,7 @@ mod recording_start_guard_tests {
     }
 
     #[test]
+    #[ignore = "live: reads pointer location; runs alone in the macOS live lane"]
     fn start_succeeds_for_live_session_owner() {
         let rec = RecordingSession::new();
         let sid = "wb-recording-live-Z7A8B9";
@@ -2251,6 +2254,7 @@ mod recording_start_guard_tests {
     }
 
     #[test]
+    #[ignore = "live: reads pointer location; runs alone in the macOS live lane"]
     fn start_succeeds_for_anonymous_owner() {
         // owner = None (CLI one-shot / legacy shim) is never gated.
         let rec = RecordingSession::new();

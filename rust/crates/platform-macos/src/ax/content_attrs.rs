@@ -6,15 +6,16 @@ use cua_driver_core::snapshot_compaction::{
 };
 use cua_driver_core::walk_budget::WalkBudget;
 
-const CONTENT_ATTRIBUTES: [&str; 6] = [
+const CONTENT_ATTRIBUTES: [&str; 7] = [
     "AXTitle",
     "AXPlaceholderValue",
     "AXDescription",
     "AXIdentifier",
     "AXHelp",
     "AXSubrole",
+    "AXRoleDescription",
 ];
-pub(crate) const CLASSIFICATION_ATTRIBUTES: [&str; 7] = [
+pub(crate) const CLASSIFICATION_ATTRIBUTES: [&str; 8] = [
     "AXRole",
     "AXTitle",
     "AXPlaceholderValue",
@@ -22,14 +23,42 @@ pub(crate) const CLASSIFICATION_ATTRIBUTES: [&str; 7] = [
     "AXIdentifier",
     "AXHelp",
     "AXSubrole",
+    "AXRoleDescription",
 ];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum AttrStatus {
     Known(String),
     Absent,
-    Failed,
+    Failed {
+        error: AXError,
+        listed: AttributeListing,
+    },
+    WrongType,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AttributeListing {
+    Listed,
+    NotListed,
+    ListUnreadable,
+}
+
+impl From<Option<bool>> for AttributeListing {
+    fn from(value: Option<bool>) -> Self {
+        match value {
+            Some(true) => Self::Listed,
+            Some(false) => Self::NotListed,
+            None => Self::ListUnreadable,
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) const FAILED_TEST: AttrStatus = AttrStatus::Failed {
+    error: kAXErrorCannotComplete,
+    listed: AttributeListing::ListUnreadable,
+};
 
 impl AttrStatus {
     fn text(&self) -> Option<&str> {
@@ -39,14 +68,14 @@ impl AttrStatus {
         }
     }
     fn complete(&self) -> bool {
-        !matches!(self, Self::Failed)
+        !matches!(self, Self::Failed { .. } | Self::WrongType)
     }
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct SecurityEvidence {
     role: AttrStatus,
-    attrs: [AttrStatus; 6],
+    attrs: [AttrStatus; 7],
 }
 
 impl SecurityEvidence {
@@ -65,9 +94,47 @@ impl SecurityEvidence {
 }
 
 pub(crate) fn value_read_allowed(evidence: &SecurityEvidence) -> bool {
-    matches!(&evidence.role, AttrStatus::Known(role) if !role.trim().is_empty() && role != "AXUnknown")
-        && evidence.attrs.iter().all(AttrStatus::complete)
-        && !evidence.secure()
+    let valid_role = matches!(&evidence.role, AttrStatus::Known(role) if !role.trim().is_empty() && role != "AXUnknown");
+    if !valid_role || evidence.secure() {
+        return false;
+    }
+    if evidence.attrs[..6].iter().all(AttrStatus::complete) {
+        return true;
+    }
+    // Compatibility exception: a custom secure text area whose only secret
+    // markers are in these unreadable attributes can also be admitted.
+    if evidence.role.text() != Some("AXTextArea") {
+        return false;
+    }
+    let Some(role_description) = evidence.attrs[6].text() else {
+        return false;
+    };
+    if role_description.trim().is_empty()
+        || role_description.to_ascii_lowercase().contains("protected")
+        || is_secure_text_field(&FieldSecurityMeta {
+            role: "AXTextArea",
+            title: Some(role_description),
+            placeholder: None,
+            description: None,
+            identifier: None,
+            help: None,
+            subrole: None,
+            is_password_flag: false,
+        })
+    {
+        return false;
+    }
+    evidence.attrs[..6].iter().enumerate().all(|(index, attr)| {
+        attr.complete()
+            || (matches!(index, 2 | 3)
+                && matches!(
+                    attr,
+                    AttrStatus::Failed {
+                        error,
+                        listed: AttributeListing::Listed
+                    } if *error == kAXErrorFailure
+                ))
+    })
 }
 
 /// Classify only: never read AXValue while gathering security evidence.
@@ -75,17 +142,26 @@ pub(crate) fn classify_value_read<R: super::label_reader::LabelReader>(
     reader: &mut R,
     element: R::Element,
 ) -> bool {
-    let [role, title, placeholder, description, identifier, help, subrole] = reader
-        .security_batch(element)
-        .unwrap_or_else(|| CLASSIFICATION_ATTRIBUTES.map(|name| reader.status(element, name)));
+    let [role, title, placeholder, description, identifier, help, subrole, role_description] =
+        reader
+            .security_batch(element)
+            .unwrap_or_else(|| CLASSIFICATION_ATTRIBUTES.map(|name| reader.status(element, name)));
     value_read_allowed(&SecurityEvidence {
         role,
-        attrs: [title, placeholder, description, identifier, help, subrole],
+        attrs: [
+            title,
+            placeholder,
+            description,
+            identifier,
+            help,
+            subrole,
+            role_description,
+        ],
     })
 }
 
 pub(super) trait ContentReader {
-    fn batch(&mut self) -> Result<[AttrStatus; 6], super::batch_attrs::BatchFailure>;
+    fn batch(&mut self) -> Result<[AttrStatus; 7], super::batch_attrs::BatchFailure>;
     fn string(&mut self, name: &str) -> AttrStatus;
     fn value(&mut self) -> Result<Option<StringishAttrValue>, AXError>;
     fn expired(&self) -> bool;
@@ -118,14 +194,14 @@ pub(super) fn read_with<R: ContentReader>(
     let attrs = match attrs {
         Some(attrs) => attrs,
         None => {
-            let mut result = Vec::with_capacity(6);
+            let mut result = Vec::with_capacity(7);
             for name in CONTENT_ATTRIBUTES {
                 if reader.expired() {
                     return None;
                 }
                 result.push(reader.string(name));
             }
-            result.try_into().expect("six content attributes")
+            result.try_into().expect("seven content attributes")
         }
     };
     let evidence = SecurityEvidence { role, attrs };
@@ -152,7 +228,7 @@ pub(super) fn read_with<R: ContentReader>(
     };
     let label_status = |index: usize| match &evidence.attrs[index] {
         AttrStatus::Known(s) if !s.trim().is_empty() => LabelSlot::Present,
-        AttrStatus::Failed => LabelSlot::Failed,
+        AttrStatus::Failed { .. } | AttrStatus::WrongType => LabelSlot::Failed,
         _ => LabelSlot::Absent,
     };
     let value_status = if !secure && (!allowed || value_failed) {
@@ -399,7 +475,7 @@ pub(crate) unsafe fn read_content_attrs(
     batching_disabled: &mut bool,
 ) -> Option<ContentAttrs> {
     let role = if role == "AXUnknown" {
-        AttrStatus::Failed
+        AttrStatus::WrongType
     } else {
         AttrStatus::Known(role.to_owned())
     };
@@ -420,7 +496,7 @@ struct NativeReader<'a> {
 }
 
 impl ContentReader for NativeReader<'_> {
-    fn batch(&mut self) -> Result<[AttrStatus; 6], super::batch_attrs::BatchFailure> {
+    fn batch(&mut self) -> Result<[AttrStatus; 7], super::batch_attrs::BatchFailure> {
         match unsafe { copy_attrs_batch(self.element, &CONTENT_ATTRIBUTES) } {
             BatchRead::Fallback(failure) => Err(failure),
             BatchRead::Slots(slots) => Ok(std::array::from_fn(|index| string_slot(&slots, index))),
@@ -445,7 +521,7 @@ pub(crate) fn string_slot(slots: &BatchSlots, index: usize) -> AttrStatus {
         None => AttrStatus::Absent,
         Some(raw) => unsafe { string_from_cf(raw) }
             .map(AttrStatus::Known)
-            .unwrap_or(AttrStatus::Failed),
+            .unwrap_or(AttrStatus::WrongType),
     }
 }
 
@@ -463,11 +539,25 @@ pub(crate) unsafe fn read_string_status(element: AXUIElementRef, name: &str) -> 
         core_foundation::base::CFRelease(value);
     }
     if error == kAXErrorSuccess {
-        return decoded.map(AttrStatus::Known).unwrap_or(AttrStatus::Failed);
+        return decoded
+            .map(AttrStatus::Known)
+            .unwrap_or(AttrStatus::WrongType);
     }
-    match single_read_outcome::<String>(error, None, || attribute_listed(element, name)) {
-        Ok(None) => AttrStatus::Absent,
-        _ => AttrStatus::Failed,
+    if [kAXErrorNoValue, kAXErrorAttributeUnsupported].contains(&error) {
+        return AttrStatus::Absent;
+    }
+    let listed = AttributeListing::from(attribute_listed(element, name));
+    if listed == AttributeListing::NotListed
+        && ![
+            kAXErrorCannotComplete,
+            kAXErrorInvalidUIElement,
+            kAXErrorAPIDisabled,
+        ]
+        .contains(&error)
+    {
+        AttrStatus::Absent
+    } else {
+        AttrStatus::Failed { error, listed }
     }
 }
 
@@ -494,6 +584,202 @@ mod tests {
     use crate::ax::label_reader::fake::FakeReader as LabelFakeReader;
 
     #[test]
+    fn an_nstextview_body_value_is_readable() {
+        let mut reader = FakeReader::new();
+        for index in [2, 3] {
+            reader.attrs[index] = AttrStatus::Failed {
+                error: kAXErrorFailure,
+                listed: AttributeListing::Listed,
+            };
+        }
+        reader.attrs[6] = AttrStatus::Known("text entry area".into());
+        let attrs = read_with(
+            AttrStatus::Known("AXTextArea".into()),
+            &mut reader,
+            &mut false,
+        )
+        .unwrap();
+        assert_eq!(attrs.value.as_deref(), Some("value"));
+    }
+
+    fn listed_failure(error: AXError, listed: AttributeListing) -> AttrStatus {
+        AttrStatus::Failed { error, listed }
+    }
+
+    fn measured() -> (AttrStatus, [AttrStatus; 7]) {
+        let mut attrs = std::array::from_fn(|_| AttrStatus::Absent);
+        attrs[2] = listed_failure(kAXErrorFailure, AttributeListing::Listed);
+        attrs[3] = listed_failure(kAXErrorFailure, AttributeListing::Listed);
+        attrs[6] = AttrStatus::Known("text entry area".into());
+        (AttrStatus::Known("AXTextArea".into()), attrs)
+    }
+
+    fn check_entry_points(role: AttrStatus, attrs: [AttrStatus; 7], allowed: bool) {
+        use crate::ax::write_outcome::{read_value_if_allowed, ValueRead};
+        for reject_batch in [false, true] {
+            let mut tree = FakeReader::new();
+            tree.attrs = attrs.clone();
+            tree.reject_batch = reject_batch;
+            let output = read_with(role.clone(), &mut tree, &mut false).unwrap();
+            assert_eq!(
+                tree.trace.iter().any(|name| name == "AXValue"),
+                allowed,
+                "tree {role:?} {attrs:?}"
+            );
+            assert_eq!(output.value_unknown, !allowed && !output.secure);
+            let make_reader = || {
+                let mut reader = LabelFakeReader {
+                    reject_batch,
+                    ..Default::default()
+                };
+                reader.statuses.insert((0, "AXRole".into()), role.clone());
+                for (name, status) in CONTENT_ATTRIBUTES.iter().zip(attrs.iter()) {
+                    reader.statuses.insert((0, (*name).into()), status.clone());
+                }
+                reader.set(0, "AXValue", "value");
+                reader
+            };
+            let mut classifier = make_reader();
+            assert_eq!(
+                classify_value_read(&mut classifier, 0),
+                allowed,
+                "classifier {role:?} {attrs:?}"
+            );
+            assert!(!classifier.trace.iter().any(|(_, name)| name == "AXValue"));
+            let mut direct = make_reader();
+            assert_eq!(
+                matches!(read_value_if_allowed(&mut direct, 0), ValueRead::Allowed(_)),
+                allowed,
+                "direct {role:?} {attrs:?}"
+            );
+            assert_eq!(
+                direct.trace.iter().any(|(_, name)| name == "AXValue"),
+                allowed
+            );
+            let mut select = make_reader();
+            assert_eq!(
+                crate::tools::selection_exposure_for_test(&mut select, 0),
+                allowed,
+                "select {role:?} {attrs:?}"
+            );
+            assert!(!select.trace.iter().any(|(_, name)| name == "AXValue"));
+        }
+    }
+
+    #[test]
+    fn admission_matrix_agrees_across_four_entry_points() {
+        let (role, attrs) = measured();
+        check_entry_points(role.clone(), attrs.clone(), true);
+        let mut ordinary_subrole = attrs.clone();
+        ordinary_subrole[5] = AttrStatus::Known("AXStandardTextArea".into());
+        check_entry_points(role.clone(), ordinary_subrole, true);
+        for index in [2, 3] {
+            let mut single = attrs.clone();
+            single[index] = AttrStatus::Absent;
+            check_entry_points(role.clone(), single, true);
+        }
+        for index in 0..6 {
+            let mut wrong = attrs.clone();
+            wrong[index] = AttrStatus::WrongType;
+            check_entry_points(role.clone(), wrong, false);
+            let mut timeout = attrs.clone();
+            timeout[index] = listed_failure(kAXErrorCannotComplete, AttributeListing::Listed);
+            check_entry_points(role.clone(), timeout, false);
+        }
+        for index in [0, 1, 4, 5] {
+            let mut failed = attrs.clone();
+            failed[index] = listed_failure(kAXErrorFailure, AttributeListing::Listed);
+            check_entry_points(role.clone(), failed, false);
+        }
+        for index in [2, 3] {
+            for listed in [
+                AttributeListing::NotListed,
+                AttributeListing::ListUnreadable,
+            ] {
+                let mut failed = attrs.clone();
+                failed[index] = listed_failure(kAXErrorFailure, listed);
+                check_entry_points(role.clone(), failed, false);
+            }
+        }
+        for index in [0, 1, 2, 3, 4] {
+            let mut marked = attrs.clone();
+            marked[index] = AttrStatus::Known("password".into());
+            check_entry_points(role.clone(), marked, false);
+        }
+        for description in [
+            AttrStatus::Absent,
+            AttrStatus::WrongType,
+            FAILED_TEST,
+            AttrStatus::Known(" ".into()),
+        ] {
+            let mut bad = attrs.clone();
+            bad[6] = description;
+            check_entry_points(role.clone(), bad, false);
+        }
+        for mark in [
+            "secure text field",
+            "password",
+            "passcode entry",
+            "verification code",
+            "one-time code",
+            "security code",
+            "OTP",
+            "totp field",
+            "protected text",
+        ] {
+            let mut bad = attrs.clone();
+            bad[6] = AttrStatus::Known(mark.into());
+            check_entry_points(role.clone(), bad, false);
+        }
+        for bad_role in [
+            AttrStatus::Absent,
+            AttrStatus::WrongType,
+            FAILED_TEST,
+            AttrStatus::Known("".into()),
+            AttrStatus::Known("AXTextField".into()),
+            AttrStatus::Known("AXSecureTextField".into()),
+        ] {
+            check_entry_points(bad_role, attrs.clone(), false);
+        }
+        let mut secure = attrs.clone();
+        secure[5] = AttrStatus::Known("AXSecureTextField".into());
+        check_entry_points(role.clone(), secure, false);
+        let mut plain = std::array::from_fn(|_| AttrStatus::Absent);
+        plain[6] = FAILED_TEST;
+        for ordinary in ["AXTextArea", "AXTextField"] {
+            check_entry_points(AttrStatus::Known(ordinary.into()), plain.clone(), true);
+        }
+    }
+
+    #[test]
+    fn list_lookup_failure_with_failure_codes_is_denied() {
+        let (role, mut attrs) = measured();
+        for index in [2, 3] {
+            attrs[index] = listed_failure(kAXErrorFailure, AttributeListing::ListUnreadable);
+        }
+        check_entry_points(role, attrs, false);
+    }
+
+    #[test]
+    fn value_visible_with_failed_label_evidence_kept() {
+        let (role, attrs) = measured();
+        let mut reader = FakeReader::new();
+        reader.attrs = attrs;
+        let output = read_with(role, &mut reader, &mut false).unwrap();
+        assert_eq!(output.value.as_deref(), Some("value"));
+        assert!(output.read_failed);
+        assert!(!output.value_unknown);
+    }
+
+    #[test]
+    fn same_shape_custom_secure_area_is_admitted() {
+        // No parent or window proof: the only secure marker may be hidden in
+        // either failed label, so this is a compatibility risk, not a proof.
+        let (role, attrs) = measured();
+        check_entry_points(role, attrs, true);
+    }
+
+    #[test]
     fn classification_only_preserves_failed_and_absent_evidence() {
         for reject_batch in [false, true] {
             let mut reader = LabelFakeReader {
@@ -518,7 +804,7 @@ mod tests {
 
     struct FakeReader {
         trace: Vec<String>,
-        attrs: [AttrStatus; 6],
+        attrs: [AttrStatus; 7],
         reject_batch: bool,
         expire_on_classification: bool,
         expired: bool,
@@ -537,7 +823,7 @@ mod tests {
         }
     }
     impl ContentReader for FakeReader {
-        fn batch(&mut self) -> Result<[AttrStatus; 6], super::super::batch_attrs::BatchFailure> {
+        fn batch(&mut self) -> Result<[AttrStatus; 7], super::super::batch_attrs::BatchFailure> {
             self.trace
                 .push(format!("batch:{}", CONTENT_ATTRIBUTES.join(",")));
             if self.reject_batch {
@@ -584,7 +870,7 @@ mod tests {
             reader.trace,
             [
                 "AXRole",
-                "batch:AXTitle,AXPlaceholderValue,AXDescription,AXIdentifier,AXHelp,AXSubrole",
+                "batch:AXTitle,AXPlaceholderValue,AXDescription,AXIdentifier,AXHelp,AXSubrole,AXRoleDescription",
                 "classified",
                 "AXValue"
             ]
@@ -594,7 +880,7 @@ mod tests {
     #[test]
     fn a_failed_role_read_never_reads_the_value() {
         let mut reader = FakeReader::new();
-        let attrs = read_with(AttrStatus::Failed, &mut reader, &mut false).unwrap();
+        let attrs = read_with(FAILED_TEST, &mut reader, &mut false).unwrap();
         assert!(attrs.read_failed);
         assert_eq!(attrs.value, None);
         assert!(
@@ -637,7 +923,7 @@ mod tests {
     fn a_failed_hint_withholds_the_value() {
         for i in 0..6 {
             let mut reader = FakeReader::new();
-            reader.attrs[i] = AttrStatus::Failed;
+            reader.attrs[i] = FAILED_TEST;
             let result = read_with(
                 AttrStatus::Known("AXTextField".into()),
                 &mut reader,
@@ -661,7 +947,7 @@ mod tests {
         let BatchRead::Slots(slots) = batch else {
             panic!("valid batch envelope")
         };
-        assert_eq!(string_slot(&slots, 0), AttrStatus::Failed);
+        assert_eq!(string_slot(&slots, 0), AttrStatus::WrongType);
         let mut reader = FakeReader::new();
         reader.attrs[2] = string_slot(&slots, 0);
         let result = read_with(
@@ -725,6 +1011,7 @@ mod tests {
                 "AXIdentifier",
                 "AXHelp",
                 "AXSubrole",
+                "AXRoleDescription",
                 "classified",
                 "AXValue"
             ]
@@ -744,6 +1031,7 @@ mod tests {
                 "AXIdentifier",
                 "AXHelp",
                 "AXSubrole",
+                "AXRoleDescription",
                 "classified",
                 "AXValue"
             ]
@@ -789,7 +1077,7 @@ mod tests {
         let mut reader = FakeReader::new();
         reader.attrs[2] = match absent {
             Ok(None) => AttrStatus::Absent,
-            _ => AttrStatus::Failed,
+            _ => FAILED_TEST,
         };
         let result = read_with(
             AttrStatus::Known("AXTextField".into()),
@@ -819,7 +1107,7 @@ mod tests {
                 reader.trace,
                 [
                     "AXRole",
-                    "batch:AXTitle,AXPlaceholderValue,AXDescription,AXIdentifier,AXHelp,AXSubrole",
+                    "batch:AXTitle,AXPlaceholderValue,AXDescription,AXIdentifier,AXHelp,AXSubrole,AXRoleDescription",
                     "classified",
                     "AXValue"
                 ]

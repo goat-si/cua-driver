@@ -3137,6 +3137,7 @@ mod tests {
     /// Untargeted background text with nothing text-like focused in the
     /// window is refused before any key event (Finder type-to-select).
     #[test]
+    #[ignore = "live: reads accessibility IPC; runs alone in the macOS live lane"]
     fn untargeted_text_without_a_focused_text_input_is_refused() {
         let result = type_text_in_key_window(
             -1,

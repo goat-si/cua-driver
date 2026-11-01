@@ -1,6 +1,7 @@
 //! Cross-platform accessibility snapshot compaction, static-text summarization,
 //! credential/OTP value redaction, and dense-collection row scheduling.
 
+use crate::tree_boundary::{retain_boundary, BoundaryReason, NodeBoundary};
 use std::collections::HashMap;
 
 /// Minimum number of tab-like children in a tab strip before inactive tabs are compacted.
@@ -41,6 +42,48 @@ pub struct TabStripCompaction {
     pub omitted_count: usize,
     /// Index of the first omitted tab child where the summary line should appear.
     pub first_omitted_index: usize,
+}
+
+impl TabStripCompaction {
+    /// Preserve evidence from already walked omitted child subtrees before discarding them.
+    /// The plan itself operates on metadata, so callers that omit before walking
+    /// have no child boundary to transfer. `children` is a preorder forest with
+    /// one root per plan entry, at a common depth and in plan order.
+    pub fn retain_omitted_boundaries<N: CompactableNode>(
+        &self,
+        children: &mut [N],
+        mut parent: Option<&mut N>,
+    ) -> Vec<BoundaryReason> {
+        let depth = children.first().map(CompactableNode::depth);
+        assert!(
+            children.iter().all(|node| Some(node.depth()) >= depth),
+            "invalid tab child depth"
+        );
+        assert_eq!(
+            self.keep.len(),
+            children
+                .iter()
+                .filter(|node| Some(node.depth()) == depth)
+                .count(),
+            "tab plan and children must match"
+        );
+        let mut read_reasons = Vec::new();
+        let mut root = 0;
+        for child in children {
+            if Some(child.depth()) == depth {
+                root += 1;
+            }
+            if !self.keep[root - 1] {
+                if let Some(boundary) = child.boundary_mut().and_then(Option::take) {
+                    let slot = parent
+                        .as_deref_mut()
+                        .and_then(CompactableNode::boundary_mut);
+                    retain_boundary(&boundary, slot, &mut read_reasons);
+                }
+            }
+        }
+        read_reasons
+    }
 }
 
 /// Whether a parent node can act as a browser tab strip container.
@@ -463,20 +506,23 @@ pub trait CompactableNode {
     fn set_value(&mut self, value: Option<String>);
     fn description(&self) -> Option<&str>;
     fn format_line(&self) -> String;
+    /// Return the node's boundary slot. `None` means this node type does not
+    /// support boundaries; implementers must return the same slot on each call.
+    /// Unavailable ancestor slots send dropped reasons to the read-level result.
+    fn boundary_mut(&mut self) -> Option<&mut Option<NodeBoundary>> {
+        None
+    }
 }
 
-/// Fold actionless rows/groups whose descendants (within depth `<= 3`, `<= 6` snippets,
-/// `<= 220` chars) are exclusively actionless static-text/link nodes into a single line,
-/// and elide empty unlabelled wrapper nodes.
-///
-/// Because only `element_index() == None` nodes are folded or elided, every addressable
-/// node's `element_index` and `parent_element_index` remain completely unchanged.
-pub fn fold_actionless_text_subtrees<N: CompactableNode>(
+/// Fold nodes while returning boundary reasons that have no supporting retained
+/// ancestor. Callers must merge the returned reasons into read-level evidence.
+pub fn fold_actionless_text_subtrees_with_reasons<N: CompactableNode>(
     lines: &mut Vec<(usize, String)>,
     nodes: &mut Vec<N>,
-) {
+) -> Vec<BoundaryReason> {
+    let mut read_reasons = Vec::new();
     if lines.len() != nodes.len() || nodes.is_empty() {
-        return;
+        return read_reasons;
     }
 
     // Pass 1: Elide empty unlabelled actionless wrapper leaves, and hoist children of
@@ -502,6 +548,11 @@ pub fn fold_actionless_text_subtrees<N: CompactableNode>(
             continue;
         }
         let wrapper_depth = nodes[i].depth();
+        if let Some(boundary) = nodes[i].boundary_mut().and_then(Option::take) {
+            let ancestor = (0..i).rev().find(|&j| nodes[j].depth() < wrapper_depth);
+            let slot = ancestor.and_then(|j| nodes[j].boundary_mut());
+            retain_boundary(&boundary, slot, &mut read_reasons);
+        }
         let mut sub_end = i + 1;
         while sub_end < nodes.len() && nodes[sub_end].depth() > wrapper_depth {
             sub_end += 1;
@@ -515,6 +566,32 @@ pub fn fold_actionless_text_subtrees<N: CompactableNode>(
         lines.remove(i);
     }
 
+    // Pass 2 follows below.
+    fold_after_elision(lines, nodes, &mut read_reasons);
+    read_reasons
+}
+
+/// Fold actionless rows/groups whose descendants (within depth `<= 3`, `<= 6` snippets,
+/// `<= 220` chars) are exclusively actionless static-text/link nodes into a single line,
+/// and elide empty unlabelled wrapper nodes.
+///
+/// Because only `element_index() == None` nodes are folded or elided, every addressable
+/// node's `element_index` and `parent_element_index` remain completely unchanged.
+/// Compatibility wrapper for nodes without boundary support. Implementers of
+/// `boundary_mut` must use `fold_actionless_text_subtrees_with_reasons` and
+/// propagate its returned reasons to the read result.
+pub fn fold_actionless_text_subtrees<N: CompactableNode>(
+    lines: &mut Vec<(usize, String)>,
+    nodes: &mut Vec<N>,
+) {
+    let _ = fold_actionless_text_subtrees_with_reasons(lines, nodes);
+}
+
+fn fold_after_elision<N: CompactableNode>(
+    lines: &mut Vec<(usize, String)>,
+    nodes: &mut Vec<N>,
+    read_reasons: &mut Vec<BoundaryReason>,
+) {
     // Pass 2: Fold actionless row/cell/group subtrees that contain only plain static text
     // within MAX_SUMMARY_DEPTH, MAX_SUMMARY_SNIPPETS, and MAX_SUMMARY_CHARS.
     let mut out_lines: Vec<(usize, String)> = Vec::with_capacity(lines.len());
@@ -574,6 +651,15 @@ pub fn fold_actionless_text_subtrees<N: CompactableNode>(
             if all_plain && raw_snippets.len() >= min_snippets {
                 if let Some(summary) = summarize_static_text_snippets(&raw_snippets) {
                     let mut parent_node = old_nodes[idx].take().unwrap();
+                    for descendant in &mut old_nodes[(idx + 1)..sub_end] {
+                        if let Some(boundary) = descendant
+                            .as_mut()
+                            .and_then(CompactableNode::boundary_mut)
+                            .and_then(Option::take)
+                        {
+                            retain_boundary(&boundary, parent_node.boundary_mut(), read_reasons);
+                        }
+                    }
                     let existing_title = parent_node.title().map(str::trim).unwrap_or("");
                     if existing_title != summary {
                         let merged_val = match parent_node.value().map(str::trim) {
@@ -942,6 +1028,189 @@ mod tests {
         fn set_parent_element_index(&mut self, parent: Option<usize>) {
             self.parent_element_index = parent;
         }
+    }
+
+    #[derive(Clone)]
+    struct BoundaryNode {
+        node: MockNode,
+        boundary: Option<NodeBoundary>,
+    }
+    impl CompactableNode for BoundaryNode {
+        fn element_index(&self) -> Option<usize> {
+            self.node.element_index
+        }
+        fn role(&self) -> &str {
+            &self.node.role
+        }
+        fn depth(&self) -> usize {
+            self.node.depth
+        }
+        fn set_depth(&mut self, depth: usize) {
+            self.node.depth = depth;
+        }
+        fn title(&self) -> Option<&str> {
+            self.node.title.as_deref()
+        }
+        fn value(&self) -> Option<&str> {
+            self.node.value.as_deref()
+        }
+        fn set_value(&mut self, value: Option<String>) {
+            self.node.value = value;
+        }
+        fn description(&self) -> Option<&str> {
+            self.node.description.as_deref()
+        }
+        fn format_line(&self) -> String {
+            self.node.format_line()
+        }
+        fn boundary_mut(&mut self) -> Option<&mut Option<NodeBoundary>> {
+            Some(&mut self.boundary)
+        }
+    }
+    fn u20_node(
+        role: &str,
+        depth: usize,
+        index: Option<usize>,
+        text: Option<&str>,
+    ) -> BoundaryNode {
+        BoundaryNode {
+            node: MockNode {
+                element_index: index,
+                parent_element_index: None,
+                role: role.into(),
+                depth,
+                title: None,
+                value: text.map(str::to_owned),
+                description: None,
+            },
+            boundary: None,
+        }
+    }
+    fn u20_boundary(
+        detail: cua_driver_contract::IncompleteReasonDetail,
+        count: u32,
+    ) -> NodeBoundary {
+        NodeBoundary {
+            reasons: vec![BoundaryReason {
+                kind: cua_driver_contract::IncompleteReasonKind::Budget,
+                detail,
+            }],
+            children_skipped: crate::tree_boundary::CountEvidence::Known(count),
+            descendants_omitted: None,
+        }
+    }
+    fn u20_fold(nodes: &mut Vec<BoundaryNode>) -> Vec<BoundaryReason> {
+        let mut lines = nodes.iter().map(|n| (n.depth(), n.format_line())).collect();
+        fold_actionless_text_subtrees_with_reasons(&mut lines, nodes)
+    }
+    #[test]
+    fn u20_elided_wrapper_boundary_reaches_nearest_retained_ancestor() {
+        use cua_driver_contract::IncompleteReasonDetail as D;
+        let mut nodes = vec![
+            u20_node("AXWindow", 0, Some(0), None),
+            u20_node("AXGroup", 1, None, None),
+            u20_node("AXButton", 2, Some(1), None),
+        ];
+        nodes[0].boundary = Some(u20_boundary(D::NodeBudget, 2));
+        nodes[1].boundary = Some(u20_boundary(D::TimeBudget, 9));
+        assert!(u20_fold(&mut nodes).is_empty());
+        let boundary = nodes[0].boundary.as_ref().unwrap();
+        assert_eq!(boundary.reasons.len(), 2);
+        assert_eq!(
+            boundary.children_skipped,
+            crate::tree_boundary::CountEvidence::Known(2)
+        );
+        assert_eq!(boundary.descendants_omitted, Some(true));
+    }
+    #[test]
+    fn u20_wrapper_uses_nearest_ancestor_not_the_root() {
+        use cua_driver_contract::IncompleteReasonDetail as D;
+        let mut nodes = vec![
+            u20_node("AXWindow", 0, Some(0), None),
+            u20_node("AXButton", 1, Some(1), None),
+            u20_node("AXGroup", 2, None, None),
+            u20_node("AXButton", 3, Some(2), None),
+        ];
+        nodes[2].boundary = Some(u20_boundary(D::TimeBudget, 9));
+        assert!(u20_fold(&mut nodes).is_empty());
+        assert!(nodes[0].boundary.is_none());
+        assert_eq!(
+            nodes[1].boundary.as_ref().unwrap().reasons[0].detail,
+            D::TimeBudget
+        );
+    }
+    #[test]
+    fn u20_folded_descendants_boundary_reaches_folding_node() {
+        use cua_driver_contract::IncompleteReasonDetail as D;
+        let mut nodes = vec![
+            u20_node("AXRow", 0, None, None),
+            u20_node("AXStaticText", 1, None, Some("hello")),
+        ];
+        nodes[0].boundary = Some(u20_boundary(D::NodeBudget, 2));
+        nodes[1].boundary = Some(u20_boundary(D::TimeBudget, 9));
+        assert!(u20_fold(&mut nodes).is_empty());
+        assert_eq!(nodes.len(), 1);
+        let boundary = nodes[0].boundary.as_ref().unwrap();
+        assert_eq!(boundary.reasons.len(), 2);
+        assert_eq!(
+            boundary.children_skipped,
+            crate::tree_boundary::CountEvidence::Known(2)
+        );
+        assert_eq!(boundary.descendants_omitted, Some(true));
+    }
+    #[test]
+    fn u20_dropped_root_boundary_becomes_read_reason() {
+        use cua_driver_contract::IncompleteReasonDetail as D;
+        let mut nodes = vec![u20_node("AXGroup", 0, None, None)];
+        nodes[0].boundary = Some(u20_boundary(D::NodeBudget, 2));
+        assert_eq!(u20_fold(&mut nodes).len(), 1);
+        assert!(nodes.is_empty());
+    }
+    #[test]
+    fn u20_tab_plan_transfers_omitted_child_boundary() {
+        use cua_driver_contract::IncompleteReasonDetail as D;
+        let plan = TabStripCompaction {
+            keep: vec![true, false],
+            omitted_count: 1,
+            first_omitted_index: 1,
+        };
+        let mut parent = u20_node("AXTabGroup", 0, Some(0), None);
+        parent.boundary = Some(u20_boundary(D::NodeBudget, 2));
+        let mut children = vec![
+            u20_node("AXTab", 1, Some(1), None),
+            u20_node("AXTab", 1, Some(2), None),
+        ];
+        children[1].boundary = Some(u20_boundary(D::TimeBudget, 9));
+        assert!(plan
+            .retain_omitted_boundaries(&mut children, Some(&mut parent))
+            .is_empty());
+        let boundary = parent.boundary.unwrap();
+        assert_eq!(boundary.reasons.len(), 2);
+        assert_eq!(
+            boundary.children_skipped,
+            crate::tree_boundary::CountEvidence::Known(2)
+        );
+        assert_eq!(boundary.descendants_omitted, Some(true));
+    }
+    #[test]
+    fn u20_tab_plan_transfers_omitted_descendant_boundary() {
+        use cua_driver_contract::IncompleteReasonDetail as D;
+        let plan = TabStripCompaction {
+            keep: vec![true, false],
+            omitted_count: 1,
+            first_omitted_index: 1,
+        };
+        let mut parent = u20_node("AXTabGroup", 0, Some(0), None);
+        let mut children = vec![
+            u20_node("AXTab", 1, Some(1), None),
+            u20_node("AXTab", 1, Some(2), None),
+            u20_node("AXStaticText", 2, None, Some("hidden")),
+        ];
+        children[2].boundary = Some(u20_boundary(D::TimeBudget, 9));
+        assert!(plan
+            .retain_omitted_boundaries(&mut children, Some(&mut parent))
+            .is_empty());
+        assert_eq!(parent.boundary.unwrap().reasons.len(), 1);
     }
 
     #[test]

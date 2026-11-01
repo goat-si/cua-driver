@@ -1,7 +1,7 @@
 use crate::goat::action_latency as latency;
 use async_trait::async_trait;
 use core_foundation::{
-    base::{CFGetTypeID, CFRelease, CFTypeRef, TCFType},
+    base::{CFRelease, CFTypeRef, TCFType},
     string::CFString,
 };
 use cua_driver_core::{
@@ -57,159 +57,11 @@ fn def() -> &'static ToolDef {
     })
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum OptionalStringAttr {
-    Value(Option<String>),
-    /// kAXErrorFailure on two reads in a row: the app answers the
-    /// attribute with a failure every time (TextEdit's text view does so
-    /// for AXDescription), as opposed to a busy app or a timeout.
-    StableFailure,
-    Unreadable,
-}
-
-/// kAXErrorFailure.
-const AX_ERROR_FAILURE: i32 = -25200;
-
-unsafe fn optional_string_attr(element: AXUIElementRef, name: &str) -> OptionalStringAttr {
-    match optional_string_attr_once(element, name) {
-        Err(AX_ERROR_FAILURE) => match optional_string_attr_once(element, name) {
-            Err(AX_ERROR_FAILURE) => OptionalStringAttr::StableFailure,
-            Err(_) => OptionalStringAttr::Unreadable,
-            Ok(value) => value,
-        },
-        Err(_) => OptionalStringAttr::Unreadable,
-        Ok(value) => value,
-    }
-}
-
-/// One read: the value or absence, else the AX error (0 for a value that is
-/// not a string).
-unsafe fn optional_string_attr_once(
-    element: AXUIElementRef,
-    name: &str,
-) -> Result<OptionalStringAttr, i32> {
-    let attr = CFString::new(name);
-    let mut value: CFTypeRef = std::ptr::null();
-    let error = AXUIElementCopyAttributeValue(element, attr.as_concrete_TypeRef(), &mut value);
-    if error == kAXErrorNoValue || error == kAXErrorAttributeUnsupported {
-        if !value.is_null() {
-            CFRelease(value);
-        }
-        return Ok(OptionalStringAttr::Value(None));
-    }
-    if error != kAXErrorSuccess || value.is_null() {
-        if !value.is_null() {
-            CFRelease(value);
-        }
-        return Err(if error == kAXErrorSuccess { 0 } else { error });
-    }
-    if CFGetTypeID(value) != CFString::type_id() {
-        CFRelease(value);
-        return Err(0);
-    }
-    Ok(OptionalStringAttr::Value(Some(
-        CFString::wrap_under_create_rule(value as _).to_string(),
-    )))
-}
-
-/// Whether a selection may be made in an element with these attributes:
-/// role, subrole, title, description, placeholder, identifier, help, then
-/// the role description.
-///
-/// Secure entry is marked by role or subrole (AXSecureTextField), which must
-/// read. The five name hints carry a "password"-style label, the only signal
-/// of a custom field; a failed read of one refuses. One exception, for
-/// TextEdit's document text view (its AXDescription fails with
-/// kAXErrorFailure on every read): an AXTextArea whose role, subrole, role
-/// description and other four hints read cleanly with no security marking
-/// may have a failing description only when it has the document body shape.
-/// This is a compatibility exception, not a security proof: a custom field
-/// with the same shape and a secret marker only in that description is admitted.
-fn selection_exposure_allowed(attributes: &[OptionalStringAttr; 8]) -> bool {
-    if !matches!(attributes[0], OptionalStringAttr::Value(_))
-        || !matches!(attributes[1], OptionalStringAttr::Value(_))
-        || attributes[2..7]
-            .iter()
-            .any(|attr| matches!(attr, OptionalStringAttr::Unreadable))
-    {
-        return false;
-    }
-    let value = |index: usize| match &attributes[index] {
-        OptionalStringAttr::Value(value) => value.as_deref(),
-        OptionalStringAttr::StableFailure | OptionalStringAttr::Unreadable => None,
-    };
-    let Some(role) = value(0).filter(|role| !role.trim().is_empty()) else {
-        return false;
-    };
-    let failed_hints = attributes[2..7]
-        .iter()
-        .filter(|attr| matches!(attr, OptionalStringAttr::StableFailure))
-        .count();
-    if failed_hints > 0 {
-        let role_description_clean = match &attributes[7] {
-            OptionalStringAttr::Value(Some(text)) => {
-                let lower = text.to_ascii_lowercase();
-                // The shared classifier's full keyword set (password,
-                // passcode, verification/one-time/security code, secure,
-                // otp/totp), plus "protected".
-                !lower.trim().is_empty()
-                    && !lower.contains("protected")
-                    && !cua_driver_core::snapshot_compaction::is_secure_text_field(
-                        &cua_driver_core::snapshot_compaction::FieldSecurityMeta {
-                            role,
-                            subrole: None,
-                            title: Some(text),
-                            description: None,
-                            placeholder: None,
-                            identifier: None,
-                            help: None,
-                            is_password_flag: false,
-                        },
-                    )
-            }
-            _ => false,
-        };
-        if role != "AXTextArea" || failed_hints > 1 || !role_description_clean {
-            return false;
-        }
-    }
-    !cua_driver_core::snapshot_compaction::is_secure_text_field(
-        &cua_driver_core::snapshot_compaction::FieldSecurityMeta {
-            role,
-            subrole: value(1),
-            title: value(2),
-            description: value(3),
-            placeholder: value(4),
-            identifier: value(5),
-            help: value(6),
-            is_password_flag: false,
-        },
-    )
-}
-
-#[derive(Clone, Copy)]
-struct DocumentShape<'a> {
-    parent_role: Option<&'a str>,
-    window_subrole: Option<&'a str>,
-}
-
-fn selection_exposure_with_shape(
-    attributes: &[OptionalStringAttr; 8],
-    shape: DocumentShape<'_>,
+pub(crate) fn selection_exposure_allowed<R: crate::ax::label_reader::LabelReader>(
+    reader: &mut R,
+    element: R::Element,
 ) -> bool {
-    let failed_hints = attributes[2..7]
-        .iter()
-        .filter(|a| matches!(a, OptionalStringAttr::StableFailure))
-        .count();
-    if failed_hints > 0
-        && (failed_hints != 1
-            || !matches!(attributes[3], OptionalStringAttr::StableFailure)
-            || shape.parent_role != Some("AXScrollArea")
-            || shape.window_subrole != Some("AXStandardWindow"))
-    {
-        return false;
-    }
-    selection_exposure_allowed(attributes)
+    crate::ax::content_attrs::classify_value_read(reader, element)
 }
 
 fn find_occurrences(value: &str, needle: &str) -> Vec<(usize, usize)> {
@@ -310,30 +162,8 @@ unsafe fn select_text_blocking(
     suffix: Option<&str>,
     selection: &str,
 ) -> Result<(String, SelectedTextRange, usize, usize), SelectError> {
-    let attributes = selection_attributes_with(|name| optional_string_attr(element, name));
-    let (parent_role, window_subrole) =
-        if matches!(attributes[3], OptionalStringAttr::StableFailure) {
-            let read_related = |name: &str, attr: &str| {
-                copy_element_attr(element, name).and_then(|related| {
-                    let value = copy_string_attr(related, attr);
-                    CFRelease(related as CFTypeRef);
-                    value
-                })
-            };
-            (
-                read_related("AXParent", "AXRole"),
-                read_related("AXWindow", "AXSubrole"),
-            )
-        } else {
-            (None, None)
-        };
-    if !selection_exposure_with_shape(
-        &attributes,
-        DocumentShape {
-            parent_role: parent_role.as_deref(),
-            window_subrole: window_subrole.as_deref(),
-        },
-    ) {
+    let mut reader = crate::ax::label_reader::NativeLabelReader;
+    if !selection_exposure_allowed(&mut reader, element) {
         return Err(
             "select_text refuses secure fields, and fields whose security attributes could not be read"
                 .into(),
@@ -407,22 +237,6 @@ unsafe fn select_text_blocking(
         ));
     }
     Ok((selected_text, range, occurrence, match_count))
-}
-
-fn selection_attributes_with(
-    mut read: impl FnMut(&str) -> OptionalStringAttr,
-) -> [OptionalStringAttr; 8] {
-    [
-        "AXRole",
-        "AXSubrole",
-        "AXTitle",
-        "AXDescription",
-        "AXPlaceholderValue",
-        "AXIdentifier",
-        "AXHelp",
-        "AXRoleDescription",
-    ]
-    .map(&mut read)
 }
 
 #[async_trait]
@@ -544,27 +358,180 @@ impl Tool for SelectTextTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ax::content_attrs::{AttrStatus, AttributeListing};
+    use crate::ax::label_reader::fake::FakeReader;
+
+    fn text_area_with_failing_hints() -> FakeReader {
+        let mut reader = FakeReader::default();
+        reader.set(0, "AXRole", "AXTextArea");
+        reader.set(0, "AXRoleDescription", "text entry area");
+        for name in ["AXDescription", "AXIdentifier"] {
+            reader.statuses.insert(
+                (0, name.into()),
+                AttrStatus::Failed {
+                    error: kAXErrorFailure,
+                    listed: AttributeListing::Listed,
+                },
+            );
+        }
+        reader
+    }
+
+    fn set_status(reader: &mut FakeReader, name: &str, status: AttrStatus) {
+        reader.statuses.insert((0, name.into()), status);
+    }
 
     #[test]
     fn selection_reader_requests_the_existing_attribute_order() {
-        let mut trace = Vec::new();
-        let _ = selection_attributes_with(|name| {
-            trace.push(name.to_owned());
-            OptionalStringAttr::Value(None)
-        });
-        assert_eq!(
-            trace,
-            [
-                "AXRole",
-                "AXSubrole",
-                "AXTitle",
-                "AXDescription",
-                "AXPlaceholderValue",
-                "AXIdentifier",
-                "AXHelp",
-                "AXRoleDescription"
-            ]
-        );
+        // The shared classifier batches in its own order, also used for replay.
+        let expected = [
+            "AXRole",
+            "AXTitle",
+            "AXPlaceholderValue",
+            "AXDescription",
+            "AXIdentifier",
+            "AXHelp",
+            "AXSubrole",
+            "AXRoleDescription",
+        ];
+        for reject_batch in [false, true] {
+            let mut reader = text_area_with_failing_hints();
+            reader.reject_batch = reject_batch;
+            assert!(selection_exposure_allowed(&mut reader, 0));
+            let trace: Vec<_> = reader.trace.iter().map(|(_, name)| name.as_str()).collect();
+            assert_eq!(trace, expected, "reject_batch={reject_batch}");
+        }
+    }
+
+    #[test]
+    fn secure_and_password_marked_fields_are_refused() {
+        for role in ["AXTextField", "AXTextArea"] {
+            let mut reader = text_area_with_failing_hints();
+            reader.set(0, "AXRole", role);
+            set_status(&mut reader, "AXDescription", AttrStatus::Absent);
+            set_status(&mut reader, "AXIdentifier", AttrStatus::Absent);
+            reader.set(0, "AXSubrole", "AXSecureTextField");
+            assert!(!selection_exposure_allowed(&mut reader, 0), "{role}");
+        }
+        let mut reader = text_area_with_failing_hints();
+        reader.set(0, "AXRole", "AXSecureTextField");
+        assert!(!selection_exposure_allowed(&mut reader, 0));
+
+        for name in [
+            "AXTitle",
+            "AXPlaceholderValue",
+            "AXDescription",
+            "AXIdentifier",
+            "AXHelp",
+        ] {
+            let mut reader = text_area_with_failing_hints();
+            set_status(&mut reader, name, AttrStatus::Known("Password".into()));
+            assert!(!selection_exposure_allowed(&mut reader, 0), "{name}");
+        }
+        for marker in [
+            "secure text field",
+            "password",
+            "passcode entry",
+            "verification code",
+            "one-time code",
+            "security code",
+            "OTP",
+            "totp field",
+            "protected text",
+        ] {
+            let mut reader = text_area_with_failing_hints();
+            reader.set(0, "AXRoleDescription", marker);
+            assert!(!selection_exposure_allowed(&mut reader, 0), "{marker}");
+        }
+    }
+
+    #[test]
+    fn security_metadata_fails_closed() {
+        for name in ["AXRole", "AXSubrole", "AXRoleDescription"] {
+            for status in [
+                AttrStatus::Failed {
+                    error: kAXErrorFailure,
+                    listed: AttributeListing::Listed,
+                },
+                AttrStatus::WrongType,
+            ] {
+                let mut reader = text_area_with_failing_hints();
+                set_status(&mut reader, name, status.clone());
+                assert!(
+                    !selection_exposure_allowed(&mut reader, 0),
+                    "{name}: {status:?}"
+                );
+            }
+        }
+        for name in ["AXDescription", "AXIdentifier"] {
+            for status in [
+                AttrStatus::WrongType,
+                AttrStatus::Failed {
+                    error: kAXErrorCannotComplete,
+                    listed: AttributeListing::Listed,
+                },
+                AttrStatus::Failed {
+                    error: kAXErrorFailure,
+                    listed: AttributeListing::ListUnreadable,
+                },
+            ] {
+                for reject_batch in [false, true] {
+                    let mut reader = text_area_with_failing_hints();
+                    reader.reject_batch = reject_batch;
+                    set_status(&mut reader, name, status.clone());
+                    assert!(
+                        !selection_exposure_allowed(&mut reader, 0),
+                        "{name}: {status:?}, reject_batch={reject_batch}"
+                    );
+                    assert!(!reader.trace.iter().any(|(_, name)| name == "AXValue"));
+                }
+            }
+        }
+        for name in ["AXTitle", "AXPlaceholderValue", "AXHelp"] {
+            let mut reader = text_area_with_failing_hints();
+            set_status(
+                &mut reader,
+                name,
+                AttrStatus::Failed {
+                    error: kAXErrorFailure,
+                    listed: AttributeListing::Listed,
+                },
+            );
+            assert!(!selection_exposure_allowed(&mut reader, 0), "{name}");
+        }
+        for name in ["AXRole", "AXRoleDescription"] {
+            let mut reader = text_area_with_failing_hints();
+            set_status(&mut reader, name, AttrStatus::Absent);
+            assert!(!selection_exposure_allowed(&mut reader, 0), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_non_textarea_with_failing_hints_is_refused() {
+        for role in ["AXTextField", "AXComboBox", "AXGroup"] {
+            for name in ["AXDescription", "AXIdentifier"] {
+                let mut reader = text_area_with_failing_hints();
+                reader.set(0, "AXRole", role);
+                for other in ["AXDescription", "AXIdentifier"] {
+                    if other != name {
+                        set_status(&mut reader, other, AttrStatus::Absent);
+                    }
+                }
+                assert!(
+                    !selection_exposure_allowed(&mut reader, 0),
+                    "{role}: {name}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn same_shape_custom_field_is_admitted_by_the_exception() {
+        // A custom secure area with its only markers in unreadable hints is
+        // indistinguishable from the measured non-secure text area.
+        let mut reader = text_area_with_failing_hints();
+        assert!(selection_exposure_allowed(&mut reader, 0));
+        assert!(!reader.trace.iter().any(|(_, name)| name == "AXValue"));
     }
 
     #[test]
@@ -596,175 +563,22 @@ mod tests {
     }
 
     #[test]
-    fn security_metadata_fails_closed() {
-        let ordinary: [OptionalStringAttr; 8] = std::array::from_fn(|index| {
-            OptionalStringAttr::Value(match index {
-                0 => Some("AXTextField".into()),
-                7 => Some("text field".into()),
-                _ => None,
-            })
-        });
-        assert!(selection_exposure_allowed(&ordinary));
-        let mut secure = ordinary.clone();
-        secure[0] = OptionalStringAttr::Value(Some("AXSecureTextField".into()));
-        assert!(!selection_exposure_allowed(&secure));
-        let mut unreadable = ordinary;
-        unreadable[6] = OptionalStringAttr::Unreadable;
-        assert!(!selection_exposure_allowed(&unreadable));
-    }
-
-    /// TextEdit's document text view as read live (this Mac, 30 Oct 2026):
-    /// AXSubrole, AXTitle and AXPlaceholderValue unsupported, AXDescription
-    /// kAXErrorFailure on every read, AXIdentifier "First Text View", AXHelp
-    /// no value, AXRoleDescription "text entry area".
-    fn textedit_text_area() -> [OptionalStringAttr; 8] {
-        [
-            OptionalStringAttr::Value(Some("AXTextArea".into())),
-            OptionalStringAttr::Value(None),
-            OptionalStringAttr::Value(None),
-            OptionalStringAttr::StableFailure,
-            OptionalStringAttr::Value(None),
-            OptionalStringAttr::Value(Some("First Text View".into())),
-            OptionalStringAttr::Value(None),
-            OptionalStringAttr::Value(Some("text entry area".into())),
-        ]
-    }
-
-    fn body_shape() -> DocumentShape<'static> {
-        DocumentShape {
-            parent_role: Some("AXScrollArea"),
-            window_subrole: Some("AXStandardWindow"),
-        }
-    }
-
-    #[test]
-    fn select_text_exception_requires_the_document_body_shape() {
-        let attrs = textedit_text_area();
-        for shape in [
-            DocumentShape {
-                parent_role: None,
-                window_subrole: Some("AXStandardWindow"),
-            },
-            DocumentShape {
-                parent_role: Some("AXGroup"),
-                window_subrole: Some("AXStandardWindow"),
-            },
-            DocumentShape {
-                parent_role: Some("AXScrollArea"),
-                window_subrole: None,
-            },
-        ] {
-            assert!(!selection_exposure_with_shape(&attrs, shape));
-        }
-        let mut other_hint = attrs;
-        other_hint[3] = OptionalStringAttr::Value(None);
-        other_hint[2] = OptionalStringAttr::StableFailure;
-        assert!(!selection_exposure_with_shape(&other_hint, body_shape()));
-    }
-
-    #[test]
-    fn a_non_body_custom_field_with_a_failing_hint_is_refused() {
-        assert!(!selection_exposure_with_shape(
-            &textedit_text_area(),
-            DocumentShape {
-                parent_role: Some("AXGroup"),
-                window_subrole: Some("AXStandardWindow")
-            }
-        ));
-    }
-
-    #[test]
-    fn textedit_body_shape_is_still_allowed() {
-        assert!(selection_exposure_with_shape(
-            &textedit_text_area(),
-            body_shape()
-        ));
-    }
-
-    #[test]
-    fn same_shape_custom_field_is_admitted_by_the_exception() {
-        assert!(selection_exposure_with_shape(
-            &textedit_text_area(),
-            body_shape()
-        ));
-    }
-
-    #[test]
-    fn textedit_text_area_is_selectable() {
-        assert!(selection_exposure_allowed(&textedit_text_area()));
-        // Ordinary text area and text field with every hint absent.
-        for role in ["AXTextArea", "AXTextField"] {
-            let mut plain = textedit_text_area();
-            plain[0] = OptionalStringAttr::Value(Some(role.into()));
-            plain[3] = OptionalStringAttr::Value(None);
-            assert!(selection_exposure_allowed(&plain), "{role}");
-        }
-    }
-
-    #[test]
-    fn failed_hint_reads_refuse_outside_the_one_stable_text_area_case() {
-        let refused = |change: &dyn Fn(&mut [OptionalStringAttr; 8])| {
-            let mut attrs = textedit_text_area();
-            change(&mut attrs);
-            !selection_exposure_allowed(&attrs)
-        };
-        // A transient or other error (cannot complete, timeout) on a hint.
-        assert!(refused(&|a| a[3] = OptionalStringAttr::Unreadable));
-        // Two hints failing.
-        assert!(refused(&|a| a[6] = OptionalStringAttr::StableFailure));
-        // The same failure on a single-line field.
-        assert!(refused(
-            &|a| a[0] = OptionalStringAttr::Value(Some("AXTextField".into()))
-        ));
-        // Role description missing, unreadable or naming secure entry.
-        assert!(refused(&|a| a[7] = OptionalStringAttr::Value(None)));
-        assert!(refused(&|a| a[7] = OptionalStringAttr::Unreadable));
-        for marking in [
-            "secure text field",
-            "password",
-            "passcode entry",
-            "verification code",
-            "one-time code",
-            "security code",
-            "OTP",
-            "totp field",
-            "protected text",
-        ] {
-            assert!(
-                refused(&|a| a[7] = OptionalStringAttr::Value(Some(marking.into()))),
-                "{marking}"
+    fn a_textedit_like_body_is_selectable() {
+        use crate::ax::content_attrs::{AttrStatus, AttributeListing};
+        use crate::ax::label_reader::fake::FakeReader;
+        let mut reader = FakeReader::default();
+        reader.set(0, "AXRole", "AXTextArea");
+        reader.set(0, "AXRoleDescription", "text entry area");
+        for name in ["AXDescription", "AXIdentifier"] {
+            reader.statuses.insert(
+                (0, name.into()),
+                AttrStatus::Failed {
+                    error: kAXErrorFailure,
+                    listed: AttributeListing::Listed,
+                },
             );
         }
-        // Role or subrole not read cleanly.
-        assert!(refused(&|a| a[0] = OptionalStringAttr::Unreadable));
-        assert!(refused(&|a| a[1] = OptionalStringAttr::Unreadable));
-        assert!(refused(&|a| a[1] = OptionalStringAttr::StableFailure));
-        assert!(refused(&|a| a[0] = OptionalStringAttr::Value(None)));
-    }
-
-    #[test]
-    fn secure_and_password_marked_fields_are_refused() {
-        let refused = |change: &dyn Fn(&mut [OptionalStringAttr; 8])| {
-            let mut attrs = textedit_text_area();
-            change(&mut attrs);
-            !selection_exposure_allowed(&attrs)
-        };
-        assert!(refused(
-            &|a| a[0] = OptionalStringAttr::Value(Some("AXSecureTextField".into()))
-        ));
-        for role in ["AXTextField", "AXTextArea"] {
-            assert!(refused(&|a| {
-                a[0] = OptionalStringAttr::Value(Some(role.into()));
-                a[3] = OptionalStringAttr::Value(None);
-                a[1] = OptionalStringAttr::Value(Some("AXSecureTextField".into()));
-            }));
-        }
-        // A readable password label next to the failing description.
-        assert!(refused(
-            &|a| a[4] = OptionalStringAttr::Value(Some("Password".into()))
-        ));
-        assert!(refused(
-            &|a| a[5] = OptionalStringAttr::Value(Some("one-time-code".into()))
-        ));
+        assert!(selection_exposure_allowed(&mut reader, 0));
+        assert!(!reader.trace.iter().any(|(_, name)| name == "AXValue"));
     }
 }

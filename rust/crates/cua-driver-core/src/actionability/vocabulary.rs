@@ -23,7 +23,7 @@ pub enum Affordance {
     Drag,
 }
 
-pub fn supported_affordances(intent: Intent) -> &'static [Affordance] {
+pub fn supported_affordances(intent: Intent<'_>) -> &'static [Affordance] {
     use Affordance::*;
     match intent {
         Intent::Click | Intent::DoubleClick | Intent::TripleClick => &[Press],
@@ -42,6 +42,8 @@ pub fn supported_affordances(intent: Intent) -> &'static [Affordance] {
         Intent::KeyUp => &[KeyUp],
         Intent::Hover => &[Hover],
         Intent::Drag => &[Drag],
+        Intent::Open => &[Open],
+        Intent::SelectText | Intent::PerformAction { .. } => &[],
     }
 }
 

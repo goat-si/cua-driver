@@ -7,6 +7,7 @@ publish = false
 
 [features]
 default = ["yaml", "rego", "script"]
+test-support = []
 yaml = ["dep:regex"]
 rego = ["dep:regorus"]
 # `run_script` tool: an embedded QuickJS engine (rquickjs and quickjs-ng,
@@ -62,6 +63,7 @@ rquickjs = { version = "0.14", default-features = false, features = ["std"], opt
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+cua-driver-core = { path = ".", default-features = false, features = ["test-support"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

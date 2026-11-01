@@ -532,6 +532,7 @@ fn tool_with_token(pid: i32) -> (super::super::click::ClickTool, String, Arc<Too
 }
 
 #[tokio::test]
+#[ignore = "live: reads HID idle time; runs alone in the macOS live lane"]
 async fn b4_review_simulate_refuses_a_different_hit_before_dispatch() {
     let pid = 1_000_151;
     let mut fake = Fake::new(pid);
@@ -580,6 +581,7 @@ fn b4_review_checked_matching_hit_is_accepted() {
 }
 
 #[tokio::test]
+#[ignore = "live: reads HID idle time, NSWorkspace, SkyLight, window list; runs alone in the macOS live lane"]
 async fn an_element_count_two_takes_the_checked_pointer_route() {
     let pid = 1_000_101;
     let fake = Arc::new(Fake::new(pid));
@@ -609,6 +611,7 @@ async fn an_element_count_two_takes_the_checked_pointer_route() {
 }
 
 #[tokio::test]
+#[ignore = "live: reads HID idle time, NSWorkspace, SkyLight, event tap, window list; runs alone in the macOS live lane"]
 async fn an_element_axopen_double_click_skips_the_pointer_prologue() {
     let pid = 1_000_106;
     let mut fake = Fake::new(pid);
@@ -628,6 +631,7 @@ async fn an_element_axopen_double_click_skips_the_pointer_prologue() {
 }
 
 #[tokio::test]
+#[ignore = "live: reads HID idle time, NSWorkspace, window list; runs alone in the macOS live lane"]
 async fn a_point_off_the_element_is_refused_before_the_prologue() {
     let pid = 1_000_108;
     let mut fake = Fake::new(pid);
@@ -649,6 +653,7 @@ async fn a_point_off_the_element_is_refused_before_the_prologue() {
 }
 
 #[tokio::test]
+#[ignore = "live: reads HID idle time, NSWorkspace, window list; runs alone in the macOS live lane"]
 async fn a_point_that_fails_after_activation_is_unverifiable() {
     let pid = 1_000_109;
     let mut fake = Fake::new(pid);
@@ -690,6 +695,7 @@ fn a_recheck_failure_with_nothing_sent_is_a_refusal() {
 }
 
 #[tokio::test]
+#[ignore = "live: reads HID idle time, NSWorkspace, window list; runs alone in the macOS live lane"]
 async fn an_unconfirmed_background_activation_is_reported_as_uncertain() {
     let pid = 1_000_110;
     let mut fake = Fake::new(pid);
@@ -756,6 +762,7 @@ fn only_a_pending_key_hand_back_is_a_clean_prologue_refusal() {
 }
 
 #[tokio::test]
+#[ignore = "live: reads HID idle time, NSWorkspace, window list; runs alone in the macOS live lane"]
 async fn a_refused_pointer_prologue_sends_nothing() {
     let pid = 1_000_107;
     let mut fake = Fake::new(pid);
@@ -780,6 +787,7 @@ async fn a_refused_pointer_prologue_sends_nothing() {
 }
 
 #[tokio::test]
+#[ignore = "live: reads HID idle time, SkyLight, accessibility IPC, session lock state, window list; runs alone in the macOS live lane"]
 async fn an_element_count_one_keeps_the_existing_route() {
     let pid = 1_000_102;
     let fake = Arc::new(Fake::new(pid));
@@ -826,6 +834,7 @@ async fn a_bad_count_is_refused_before_anything_is_sent() {
 }
 
 #[tokio::test]
+#[ignore = "live: reads HID idle time; runs alone in the macOS live lane"]
 async fn an_element_multi_click_needs_a_plain_left_press() {
     let pid = 1_000_104;
     let fake = Arc::new(Fake::new(pid));
@@ -867,6 +876,7 @@ fn the_count_schema_matches_the_element_behavior() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live: reads HID idle time, NSWorkspace, SkyLight, window list; runs alone in the macOS live lane"]
 async fn cancelling_an_element_multi_click_keeps_the_lease_until_input_finishes() {
     let pid = 1_000_105;
     let fake = Arc::new(Fake::new(pid));

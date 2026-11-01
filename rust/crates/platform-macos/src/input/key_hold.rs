@@ -238,6 +238,7 @@ mod tests {
     /// A bare-global key reaches the HID queue: it must be in the HID history,
     /// or a pending pixel focus restoration abandons with reason user_input.
     #[test]
+    #[ignore = "live: reads HID idle time; runs alone in the macOS live lane"]
     fn bare_global_hid_post_is_recorded_as_the_drivers_own() {
         let since = std::time::Instant::now();
         let mut sent = false;

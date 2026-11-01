@@ -1,4 +1,5 @@
 mod basis;
+use crate::browser::types::ProcessFingerprint;
 use crate::element_token::{
     format_snapshot_id, parse_token, refusal, token_for, ResolvedElement, LRU_CAP_PER_PID,
     STALE_TOKEN_ERROR,
@@ -15,6 +16,24 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 /// (an in-process Rust API) can set it.
 pub const NATIVE_WINDOW_PIXELS_ARG: &str = "_native_window_pixels";
 
+/// Capture identity around the read. Failure remains protected and refuses
+/// resolution until a fresh publication replaces the snapshot.
+#[derive(Clone, Debug)]
+pub enum InstanceCapture {
+    Captured(ProcessFingerprint),
+    Failed(String),
+}
+
+/// Evidence fetched by the async caller after selecting the target pid.
+/// Await the platform lookup before calling the synchronous resolver; do not
+/// hold the store mutex across that lookup.
+#[derive(Clone, Debug)]
+pub enum InstanceEvidence {
+    Live(ProcessFingerprint),
+    Unavailable(String),
+    NotChecked,
+}
+
 pub trait SnapshotPayload: Send + Sync + 'static {
     type Element;
     fn len(&self) -> usize;
@@ -28,6 +47,8 @@ struct Snapshot<S> {
     id: u32,
     window_id: u64,
     publisher: Option<String>,
+    // None is the explicitly unprotected rollout mode of the legacy publishers.
+    instance: Option<InstanceCapture>,
     screenshot_owner: Option<String>,
     screenshot_scale: Option<f64>,
     /// Window size in points when the screenshot was taken. A tree-only read
@@ -309,6 +330,130 @@ pub struct SnapshotStore<S: SnapshotPayload> {
 pub(super) type RetiredTickets = Arc<Mutex<Vec<(i32, u64, u64)>>>;
 
 impl<S: SnapshotPayload> SnapshotStore<S> {
+    /// Publish a protected semantic snapshot. Both sides need a start time;
+    /// an absent executable is allowed, while a known executable change causes
+    /// a refusal and requires a new read. Failed captures never downgrade to
+    /// the unprotected mode used by the legacy publication APIs.
+    pub fn publish_for_session_with_instance(
+        &self,
+        pid: i32,
+        window_id: u64,
+        payload: S,
+        session: Option<&str>,
+        screenshot_scale: Option<f64>,
+        instance: InstanceCapture,
+    ) -> Option<(u32, Vec<u32>)> {
+        self.publish_snapshot_with_instance(
+            pid,
+            window_id,
+            payload,
+            session,
+            (screenshot_scale, None),
+            (true, None),
+            Some(instance),
+        )
+        .map(|(id, invalidated, _)| (id, invalidated))
+    }
+
+    /// Protected form of [`Self::publish_sized_for_session`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn publish_sized_for_session_with_instance(
+        &self,
+        pid: i32,
+        window_id: u64,
+        payload: S,
+        session: Option<&str>,
+        screenshot_scale: Option<f64>,
+        window_size: Option<(f64, f64)>,
+        instance: InstanceCapture,
+    ) -> Option<(u32, Vec<u32>)> {
+        self.publish_snapshot_with_instance(
+            pid,
+            window_id,
+            payload,
+            session,
+            (screenshot_scale, window_size),
+            (true, None),
+            Some(instance),
+        )
+        .map(|(id, invalidated, _)| (id, invalidated))
+    }
+
+    /// Protected form of [`Self::publish_capture_for_session`].
+    pub fn publish_capture_for_session_with_instance(
+        &self,
+        pid: i32,
+        window_id: u64,
+        payload: S,
+        session: Option<&str>,
+        screenshot_scale: Option<f64>,
+        instance: InstanceCapture,
+    ) -> Option<(u32, Vec<u32>)> {
+        self.publish_snapshot_with_instance(
+            pid,
+            window_id,
+            payload,
+            session,
+            (screenshot_scale, None),
+            (false, None),
+            Some(instance),
+        )
+        .map(|(id, invalidated, _)| (id, invalidated))
+    }
+
+    /// Protected form of [`Self::publish_basis_for_session`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn publish_basis_for_session_with_instance(
+        &self,
+        pid: i32,
+        window_id: u64,
+        payload: S,
+        session: Option<&str>,
+        screenshot_scale: Option<f64>,
+        basis: Option<crate::window_basis::WindowBasis>,
+        ticket: &CaptureTicket<S>,
+        instance: InstanceCapture,
+    ) -> Option<(u32, Vec<u32>, Option<crate::window_basis::WindowBasis>)> {
+        if !self.owns(ticket, pid, window_id) {
+            return None;
+        }
+        self.publish_snapshot_with_instance(
+            pid,
+            window_id,
+            payload,
+            session,
+            (screenshot_scale, None),
+            (true, Some((ticket.ticket(), basis))),
+            Some(instance),
+        )
+    }
+
+    /// Protected form of [`Self::publish_capture_basis_for_session`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn publish_capture_basis_for_session_with_instance(
+        &self,
+        pid: i32,
+        window_id: u64,
+        payload: S,
+        session: Option<&str>,
+        screenshot_scale: Option<f64>,
+        basis: Option<crate::window_basis::WindowBasis>,
+        ticket: &CaptureTicket<S>,
+        instance: InstanceCapture,
+    ) -> Option<(u32, Vec<u32>, Option<crate::window_basis::WindowBasis>)> {
+        if !self.owns(ticket, pid, window_id) {
+            return None;
+        }
+        self.publish_snapshot_with_instance(
+            pid,
+            window_id,
+            payload,
+            session,
+            (screenshot_scale, None),
+            (false, Some((ticket.ticket(), basis))),
+            Some(instance),
+        )
+    }
     pub fn new() -> Self {
         Self {
             runtime_scope: current_runtime_scope(),
@@ -458,6 +603,39 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
             Option<(u64, Option<crate::window_basis::WindowBasis>)>,
         ),
     ) -> Option<(u32, Vec<u32>, Option<crate::window_basis::WindowBasis>)> {
+        self.publish_snapshot_with_instance(
+            pid,
+            window_id,
+            payload,
+            session,
+            (screenshot_scale, window_size),
+            (semantic, basis_ticket),
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn publish_snapshot_with_instance(
+        &self,
+        pid: i32,
+        window_id: u64,
+        payload: S,
+        session: Option<&str>,
+        (screenshot_scale, window_size): (Option<f64>, Option<(f64, f64)>),
+        (semantic, basis_ticket): (
+            bool,
+            Option<(u64, Option<crate::window_basis::WindowBasis>)>,
+        ),
+        instance: Option<InstanceCapture>,
+    ) -> Option<(u32, Vec<u32>, Option<crate::window_basis::WindowBasis>)> {
+        let instance = instance.map(|capture| match capture {
+            InstanceCapture::Captured(fp)
+                if fp.start_time.is_none() || fp.pid != i64::from(pid) =>
+            {
+                InstanceCapture::Failed("capture lacks a start time or has a different pid".into())
+            }
+            capture => capture,
+        });
         let (id, retired, stored) = {
             let mut inner = self.lock_for_tickets();
             if session.is_some_and(crate::session::is_session_ended) {
@@ -518,6 +696,7 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
                 id,
                 window_id,
                 publisher: session.map(str::to_owned),
+                instance,
                 screenshot_owner: session.map(str::to_owned),
                 screenshot_scale: scale,
                 screenshot_window_size: frame_size,
@@ -782,6 +961,18 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
         pid: i32,
         args: &serde_json::Value,
     ) -> Result<ResolvedElement<S::Element>, ToolResult> {
+        self.resolve_for_instance(pid, args, InstanceEvidence::NotChecked)
+    }
+
+    /// Resolve using fresh process evidence obtained by the async caller.
+    /// Legacy publishers store no instance and remain unprotected; callers
+    /// adopting protected publication must switch to this method together.
+    pub fn resolve_for_instance(
+        &self,
+        pid: i32,
+        args: &serde_json::Value,
+        live: InstanceEvidence,
+    ) -> Result<ResolvedElement<S::Element>, ToolResult> {
         let Some(token) = args
             .get("element_token")
             .and_then(serde_json::Value::as_str)
@@ -829,6 +1020,19 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
                 "stale_element_token",
                 "snapshot belongs to another session; call get_window_state in this session".into(),
             ));
+        }
+        let failure = match (&snapshot.instance, live) {
+            (None, _) => None,
+            (Some(InstanceCapture::Failed(_)), _) => Some("process identity could not be captured"),
+            (Some(InstanceCapture::Captured(stored)), InstanceEvidence::Live(live))
+                if stored.start_time.is_some() && live.start_time.is_some() => {
+                    (!stored.matches(&live)).then_some("the process that owned this snapshot has exited or restarted; call get_window_state again")
+                }
+            (Some(InstanceCapture::Captured(_)), _) => Some("process identity could not be verified"),
+        };
+        if let Some(message) = failure {
+            drop(element);
+            return Err(refusal("stale_element_token", message.into()));
         }
         Ok(ResolvedElement::Element {
             window_id: snapshot.window_id,
@@ -960,6 +1164,228 @@ mod tests {
     use crate::element_token::token_for;
     use crate::snapshot_test_support::Payload;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn fingerprint(start_time: Option<u64>, executable: Option<&str>) -> ProcessFingerprint {
+        ProcessFingerprint {
+            pid: 42,
+            start_time,
+            executable: executable.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn instance_restarted_process_is_refused() {
+        let cache = SnapshotStore::new();
+        let id = cache
+            .publish_for_session_with_instance(
+                42,
+                7,
+                Payload(vec![10]),
+                Some("owner"),
+                None,
+                InstanceCapture::Captured(fingerprint(Some(1), Some("/app"))),
+            )
+            .unwrap()
+            .0;
+        let args = serde_json::json!({"element_token": token_for(id, 0), "_session_id": "owner"});
+        assert!(cache
+            .resolve_for_instance(
+                42,
+                &args,
+                InstanceEvidence::Live(fingerprint(Some(1), Some("/app")))
+            )
+            .is_ok());
+        let err = cache
+            .resolve_for_instance(
+                42,
+                &args,
+                InstanceEvidence::Live(fingerprint(Some(2), Some("/app"))),
+            )
+            .unwrap_err();
+        let content = err.structured_content.unwrap();
+        assert_eq!(content["refusal"]["code"], "stale_element_token");
+        assert!(content["refusal"]["message"].as_str().unwrap().contains("the process that owned this snapshot has exited or restarted; call get_window_state again"));
+    }
+
+    #[test]
+    fn instance_evidence_and_capture_fail_closed() {
+        let cache = SnapshotStore::new();
+        let fp = fingerprint(Some(1), Some("/app"));
+        let publish = |instance| {
+            cache
+                .publish_for_session_with_instance(
+                    42,
+                    7,
+                    Payload(vec![10]),
+                    Some("owner"),
+                    None,
+                    instance,
+                )
+                .unwrap()
+                .0
+        };
+        let id = publish(InstanceCapture::Captured(fp.clone()));
+        let args = serde_json::json!({"element_token": token_for(id, 0), "_session_id": "owner"});
+        for live in [
+            InstanceEvidence::NotChecked,
+            InstanceEvidence::Unavailable("denied".into()),
+            InstanceEvidence::Live(fingerprint(None, Some("/app"))),
+            InstanceEvidence::Live(fingerprint(Some(1), Some("/updated"))),
+        ] {
+            let err = cache.resolve_for_instance(42, &args, live).unwrap_err();
+            assert_eq!(
+                err.structured_content.unwrap()["refusal"]["code"],
+                "stale_element_token"
+            );
+        }
+        assert!(cache.resolve(42, &args).is_err());
+        for capture in [
+            InstanceCapture::Failed("denied".into()),
+            InstanceCapture::Captured(fingerprint(None, None)),
+        ] {
+            let id = publish(capture);
+            let args =
+                serde_json::json!({"element_token": token_for(id, 0), "_session_id": "owner"});
+            let err = cache
+                .resolve_for_instance(42, &args, InstanceEvidence::Live(fp.clone()))
+                .unwrap_err();
+            assert!(crate::snapshot_test_support::text(&err)
+                .contains("process identity could not be captured"));
+        }
+        let mut wrong_pid = fp.clone();
+        wrong_pid.pid = 43;
+        let id = publish(InstanceCapture::Captured(wrong_pid));
+        let args = serde_json::json!({"element_token": token_for(id, 0), "_session_id": "owner"});
+        let err = cache
+            .resolve_for_instance(42, &args, InstanceEvidence::Live(fp.clone()))
+            .unwrap_err();
+        assert!(crate::snapshot_test_support::text(&err)
+            .contains("process identity could not be captured"));
+        let id = publish(InstanceCapture::Captured(fp.clone()));
+        let args = serde_json::json!({"element_token": token_for(id, 0), "_session_id": "owner"});
+        assert!(cache
+            .resolve_for_instance(42, &args, InstanceEvidence::Live(fp))
+            .is_ok());
+    }
+
+    #[test]
+    fn instance_precedence_refresh_and_unprotected_rollout() {
+        let cache = SnapshotStore::new();
+        let fp = fingerprint(Some(1), None);
+        let id = cache
+            .publish_for_session_with_instance(
+                42,
+                7,
+                Payload(vec![10]),
+                Some("owner"),
+                Some(1.0),
+                InstanceCapture::Captured(fp.clone()),
+            )
+            .unwrap()
+            .0;
+        let token = token_for(id, 0);
+        let foreign = serde_json::json!({"element_token": token, "_session_id": "other"});
+        let err = cache
+            .resolve_for_instance(42, &foreign, InstanceEvidence::NotChecked)
+            .unwrap_err();
+        assert!(crate::snapshot_test_support::text(&err)
+            .contains("snapshot belongs to another session"));
+        let conflict =
+            serde_json::json!({"element_token": token, "_session_id": "other", "window_id": 8});
+        assert_eq!(
+            cache
+                .resolve_for_instance(42, &conflict, InstanceEvidence::NotChecked)
+                .unwrap_err()
+                .structured_content
+                .unwrap()["refusal"]["code"],
+            "conflicting_element_target"
+        );
+        let range = serde_json::json!({"element_token": token_for(id, 1), "_session_id": "other"});
+        assert_eq!(
+            cache
+                .resolve_for_instance(42, &range, InstanceEvidence::NotChecked)
+                .unwrap_err()
+                .structured_content
+                .unwrap()["refusal"]["code"],
+            "invalid_element_token"
+        );
+        let missing = serde_json::json!({"element_token": token_for(id.wrapping_add(100000), 0), "_session_id": "other", "window_id": 8});
+        assert_eq!(
+            cache
+                .resolve_for_instance(42, &missing, InstanceEvidence::NotChecked)
+                .unwrap_err()
+                .structured_content
+                .unwrap()["refusal"]["code"],
+            "stale_element_token"
+        );
+        let owner = serde_json::json!({"element_token": token, "_session_id": "owner"});
+        assert_eq!(cache.pid_for_token(&owner), Some(42));
+        assert_eq!(
+            cache.refresh_screenshot_for_session(42, 7, Some("owner"), 2.0, None),
+            Some(id)
+        );
+        assert!(cache.resolve(42, &owner).is_err());
+        assert!(cache
+            .resolve_for_instance(42, &owner, InstanceEvidence::Live(fp))
+            .is_ok());
+        let id = cache
+            .publish_for_session(42, 7, Payload(vec![10]), Some("owner"), None)
+            .unwrap()
+            .0;
+        let args = serde_json::json!({"element_token": token_for(id, 0), "_session_id": "owner"});
+        assert!(cache.resolve(42, &args).is_ok());
+        for live in [
+            InstanceEvidence::NotChecked,
+            InstanceEvidence::Unavailable("denied".into()),
+        ] {
+            assert!(cache.resolve_for_instance(42, &args, live).is_ok());
+        }
+    }
+
+    #[test]
+    fn instance_ticket_publication_and_refusal_drop_retained_element() {
+        struct TrackedPayload(Arc<AtomicUsize>);
+        struct TrackedElement(Arc<AtomicUsize>);
+        impl Drop for TrackedElement {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        impl SnapshotPayload for TrackedPayload {
+            type Element = TrackedElement;
+            fn len(&self) -> usize {
+                1
+            }
+            fn retain(&self, index: usize) -> Option<TrackedElement> {
+                (index == 0).then(|| TrackedElement(self.0.clone()))
+            }
+        }
+        let drops = Arc::new(AtomicUsize::new(0));
+        let cache = SnapshotStore::new();
+        let ticket = cache.begin_capture(42, 7);
+        let fp = fingerprint(Some(5), None);
+        let id = cache
+            .publish_basis_for_session_with_instance(
+                42,
+                7,
+                TrackedPayload(drops.clone()),
+                Some("owner"),
+                None,
+                None,
+                &ticket,
+                InstanceCapture::Captured(fp),
+            )
+            .unwrap()
+            .0;
+        let args = serde_json::json!({"element_token": token_for(id, 0), "_session_id": "owner"});
+        let err = match cache.resolve_for_instance(42, &args, InstanceEvidence::NotChecked) {
+            Err(err) => err,
+            Ok(_) => panic!("missing identity evidence accepted"),
+        };
+        assert!(crate::snapshot_test_support::text(&err)
+            .contains("process identity could not be verified"));
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn with_latest_visits_only_current_window_and_payload() {

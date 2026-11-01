@@ -277,7 +277,7 @@ mod tests {
     /// parallel lib run and run alone, by exact name, in the macOS slow lane
     /// (goat-si/cua-driver#151).
     #[test]
-    #[ignore = "reads live AppKit/Window Server state; the macOS slow lane runs it alone"]
+    #[ignore = "live: reads the system cursor through AppKit; runs alone in the macOS live lane"]
     fn probe_degrades_to_unknown_without_appkit() {
         if appkit_cursors_available() {
             // An AppKit-hosted runner: then the probe must return a real

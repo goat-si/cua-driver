@@ -372,14 +372,28 @@ impl Tool for HotkeyTool {
                 super::menu_equivalent::Combo::parse(&modifiers, &key),
             ) {
                 let lookup = combo.clone();
-                let menu_item = latency::spawn_action_blocking(move || {
+                let lookup_result = super::menu_equivalent::spawn_lookup(move || {
                     let native = !super::type_text::is_browser_pid(pid)
                         && !crate::browser::electron_js::ElectronJs::is_electron(pid);
-                    lookup_native_menu(native, || super::menu_equivalent::find(pid, &lookup))
+                    super::menu_equivalent::lookup_native_menu(native, || {
+                        super::menu_equivalent::find(pid, &lookup)
+                    })
                 })
-                .await
-                .ok()
-                .flatten();
+                .await;
+                let menu_item = match super::menu_equivalent::lookup_worker_result(lookup_result) {
+                    super::menu_equivalent::InitialLookup::Lookup(
+                        super::menu_equivalent::MenuLookup::Found(item),
+                    ) => Some(item),
+                    super::menu_equivalent::InitialLookup::Lookup(
+                        super::menu_equivalent::MenuLookup::Incomplete(_),
+                    ) => {
+                        return super::menu_equivalent::lookup_refusal("hotkey");
+                    }
+                    super::menu_equivalent::InitialLookup::Skipped
+                    | super::menu_equivalent::InitialLookup::Lookup(
+                        super::menu_equivalent::MenuLookup::Absent,
+                    ) => None,
+                };
                 if let Some(item) = menu_item {
                     let shared_combo = combo.clone();
                     let shared_display = key_display.clone();
@@ -760,6 +774,7 @@ fn window_menu_route<T>(element: Option<usize>, route: impl FnOnce() -> T) -> Op
 }
 
 /// Only native applications use this menu lookup.
+#[cfg(test)]
 fn lookup_native_menu<T>(native: bool, find: impl FnOnce() -> Option<T>) -> Option<T> {
     if native {
         find()
@@ -878,6 +893,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "live: reads NSWorkspace; runs alone in the macOS live lane"]
     async fn desktop_hotkey_cancellation_releases_real_dispatch_transitions() {
         cancel_real_desktop_hotkey(false).await;
         cancel_real_desktop_hotkey(true).await;
@@ -1058,5 +1074,32 @@ mod tests {
         assert!(screen_sharing_modifier_delivery_error(true, true, true, Some(7)).is_none());
         assert!(screen_sharing_modifier_delivery_error(true, false, false, None).is_none());
         assert!(screen_sharing_modifier_delivery_error(false, true, false, None).is_none());
+    }
+}
+
+#[cfg(test)]
+mod menu_lookup_tests {
+    use super::super::menu_equivalent::{self, InitialLookup, MenuLookup};
+    #[tokio::test]
+    async fn worker_failure_is_not_absent() {
+        let worker =
+            menu_equivalent::spawn_lookup(|| -> InitialLookup { panic!("fake lookup failure") });
+        let lookup = menu_equivalent::lookup_worker_result(worker.await);
+        assert!(matches!(
+            lookup,
+            InitialLookup::Lookup(MenuLookup::Incomplete(_))
+        ));
+        let result = menu_equivalent::lookup_refusal("hotkey");
+        let fields = result.structured_content.unwrap();
+        assert_eq!(fields["effect"], "refused");
+        assert_eq!(fields["dispatched"], false);
+        assert_eq!(fields["keys_sent"], false);
+    }
+    #[test]
+    fn skipped_lookup_keeps_todays_route() {
+        assert!(matches!(
+            menu_equivalent::lookup_native_menu(false, || panic!("must skip")),
+            InitialLookup::Skipped
+        ));
     }
 }

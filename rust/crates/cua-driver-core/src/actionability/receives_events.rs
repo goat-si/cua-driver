@@ -15,6 +15,9 @@ pub enum Hit {
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HitEvidence {
+    /// Whether this hit test used the target window's own content hierarchy.
+    #[serde(default)]
+    pub target_window: bool,
     pub attempted: u8,
     pub unknown: u8,
     pub occluded: u8,
@@ -38,7 +41,21 @@ pub fn candidate_points(r: Rect) -> [Point; 5] {
 
 /// Stops at the first confirmed point. This does not validate a later action coordinate.
 pub fn collect_hits(bounds: Rect, mut hit_test: impl FnMut(Point) -> Hit) -> HitEvidence {
+    collect_hits_scoped(bounds, &mut hit_test, false)
+}
+
+/// Collect hits from the target window's own hit-test API, without activating it.
+pub fn collect_window_hits(bounds: Rect, mut hit_test: impl FnMut(Point) -> Hit) -> HitEvidence {
+    collect_hits_scoped(bounds, &mut hit_test, true)
+}
+
+fn collect_hits_scoped(
+    bounds: Rect,
+    hit_test: &mut impl FnMut(Point) -> Hit,
+    target_window: bool,
+) -> HitEvidence {
     let mut result = HitEvidence {
+        target_window,
         attempted: 0,
         unknown: 0,
         occluded: 0,
