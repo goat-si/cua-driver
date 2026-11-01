@@ -377,6 +377,15 @@ impl Drop for NativePopupEnv {
     }
 }
 
+pub(super) fn option_value(read: crate::ax::write_outcome::ValueRead) -> Option<String> {
+    use crate::ax::write_outcome::{ValueObs, ValueRead};
+    match read {
+        ValueRead::Allowed(ValueObs::Text(value)) => Some(value),
+        ValueRead::Allowed(ValueObs::Failed(_) | ValueObs::Number(_) | ValueObs::OtherType) => None,
+        ValueRead::Allowed(ValueObs::Missing) | ValueRead::Withheld => Some(String::new()),
+    }
+}
+
 fn children(element: &Retained) -> Option<Vec<Retained>> {
     use crate::ax::bindings::{
         kAXErrorNoValue, kAXErrorSuccess, AXUIElementCopyAttributeValue, AXUIElementGetTypeID,
@@ -458,7 +467,7 @@ impl PopupEnv for NativePopupEnv {
     }
 
     fn options(&mut self, menu: &Retained) -> ListRead<Retained> {
-        use crate::ax::write_outcome::{read_value_if_allowed, ValueObs, ValueRead};
+        use crate::ax::write_outcome::read_value_if_allowed;
         let Some(items) = children(menu) else {
             return ListRead::Failed;
         };
@@ -474,13 +483,12 @@ impl PopupEnv for NativePopupEnv {
             else {
                 return ListRead::Incomplete;
             };
-            let value = match read_value_if_allowed(
+            let value = match option_value(read_value_if_allowed(
                 &mut crate::ax::label_reader::NativeLabelReader,
                 element,
-            ) {
-                ValueRead::Allowed(ValueObs::Text(value)) => value,
-                ValueRead::Allowed(ValueObs::Failed(_)) => return ListRead::Incomplete,
-                _ => String::new(),
+            )) {
+                Some(value) => value,
+                None => return ListRead::Incomplete,
             };
             if role == "AXMenuItem" {
                 result.push(OptionEntry {
