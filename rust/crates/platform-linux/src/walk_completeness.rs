@@ -96,6 +96,12 @@ impl Completeness {
         }
     }
 
+    pub(crate) fn application_children(&mut self, dropped: bool) {
+        if dropped {
+            self.record(true, Event::ChildrenFailed, None);
+        }
+    }
+
     pub(crate) fn closed_menu(&mut self, in_scope: bool, position: usize) {
         if in_scope {
             self.closed_menu_owners.push(position);

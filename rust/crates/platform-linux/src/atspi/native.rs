@@ -593,6 +593,19 @@ impl RawObjectRef {
     }
 }
 
+fn application_child_refs(children: &[atspi::ObjectRefOwned]) -> (Vec<RawObjectRef>, bool) {
+    let mut dropped = false;
+    let refs = children
+        .iter()
+        .filter_map(|child| {
+            let raw = RawObjectRef::from_atspi(child);
+            dropped |= raw.is_none();
+            raw
+        })
+        .collect();
+    (refs, dropped)
+}
+
 /// A toggle's AT-SPI state (goat-si/goat#1261): INDETERMINATE is mixed, CHECKED is on,
 /// and so is PRESSED on a toggle button, which is how GTK 4 reports one. `None` for a role
 /// that does not toggle.
@@ -1377,32 +1390,17 @@ async fn collect_visited_bounded_opts<'a>(
     // chrome. `frame_ordinal` is the seed's position in `get_children()` order
     // and is likewise inherited, so every node carries the identity of the
     // top-level window it belongs to.
-    let mut dropped_app_child = false;
-    let (seeds, app_answered): (Vec<RawObjectRef>, bool) = match probed {
-        Some(children) => (
-            children
-                .iter()
-                .filter_map(|child| {
-                    let raw = RawObjectRef::from_atspi(child);
-                    dropped_app_child |= raw.is_none();
-                    raw
-                })
-                .collect(),
-            true,
-        ),
+    let (seeds, app_answered, dropped_app_child) = match probed {
+        Some(children) => {
+            let (seeds, dropped) = application_child_refs(&children);
+            (seeds, true, dropped)
+        }
         None => match call(app.get_children()).await {
-            Some(Ok(children)) => (
-                children
-                    .iter()
-                    .filter_map(|child| {
-                        let raw = RawObjectRef::from_atspi(child);
-                        dropped_app_child |= raw.is_none();
-                        raw
-                    })
-                    .collect(),
-                true,
-            ),
-            _ => (Vec::new(), false),
+            Some(Ok(children)) => {
+                let (seeds, dropped) = application_child_refs(&children);
+                (seeds, true, dropped)
+            }
+            _ => (Vec::new(), false, false),
         },
     };
     if !app_answered {
@@ -1440,9 +1438,7 @@ async fn collect_visited_bounded_opts<'a>(
     use crate::walk_completeness::{Completeness, Event};
     use cua_driver_contract::CountEvidence;
     let mut completeness = Completeness::new(xid == 0 || scoped_frame.is_some());
-    if dropped_app_child {
-        completeness.record(true, Event::ChildrenFailed, None);
-    }
+    completeness.application_children(dropped_app_child);
     if xid != 0 && scoped_frame.is_none() {
         completeness.record(true, Event::ScopeMismatch, None);
     }
@@ -2677,13 +2673,45 @@ fn insert_passive_markers(markdown: &str, markers: &[(usize, String)]) -> String
 #[cfg(test)]
 mod boundary_markdown_tests {
     use super::{
-        indexed_closed_menu_owners, insert_passive_markers, menu_skip_after_open_evidence,
-        menu_skip_candidate, proven_closed_menu,
+        application_child_refs, indexed_closed_menu_owners, insert_passive_markers,
+        menu_skip_after_open_evidence, menu_skip_candidate, proven_closed_menu,
     };
     use crate::walk_completeness::{ChildRead, Completeness, NodeOmission};
     use cua_driver_contract::CountEvidence;
     use cua_driver_core::walk_budget::WalkBudget;
     use serde_json::json;
+
+    #[test]
+    fn dropped_application_reference_records_failure_and_keeps_valid_siblings() {
+        let refs = [
+            atspi::ObjectRefOwned::from_static_str_unchecked(":1.42", "/first"),
+            atspi::ObjectRefOwned::default(),
+            atspi::ObjectRefOwned::from_static_str_unchecked(":1.42", "/last"),
+        ];
+        let (seeds, dropped) = application_child_refs(&refs);
+        assert_eq!(
+            seeds
+                .iter()
+                .map(|seed| seed.path.as_str())
+                .collect::<Vec<_>>(),
+            ["/first", "/last"]
+        );
+        let mut completeness = Completeness::new(true);
+        completeness.application_children(dropped);
+        let mut budget = WalkBudget::new(1000, usize::MAX);
+        budget.assert_exhaustive();
+        for reason in &completeness.reasons {
+            budget.record_skip(*reason);
+        }
+        let mut output = json!({});
+        budget.outcome().apply(&mut output);
+        assert_eq!(output["observation_complete"], false);
+        assert!(output["observation_incomplete_reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|reason| reason["detail"] == "child_enumeration_failed"));
+    }
 
     fn menu_evidence(
         skipped: bool,
