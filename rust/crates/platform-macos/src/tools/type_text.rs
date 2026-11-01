@@ -1234,29 +1234,42 @@ fn replacement_readable(
 
 // Preserve the replacement sequence in one place so the native route and
 // deterministic tests observe the same write, readback and document mark.
+struct TextWriteContext {
+    settable: crate::ax::write_outcome::Settable,
+    prior: cua_driver_core::mutation::PriorInput,
+}
+
 fn replace_ax_with(
     attribute: &str,
     before: &str,
     text: &str,
+    context: TextWriteContext,
     send: impl FnOnce() -> i32,
-    read: impl FnOnce() -> crate::ax::write_outcome::ValueRead,
-    mark: impl FnOnce(),
+    mark: impl FnOnce() -> crate::document_edit::DocumentEdited,
     verify: impl FnOnce() -> (bool, Option<usize>),
-) -> anyhow::Result<(bool, Option<usize>)> {
-    let err = send();
-    if err != kAXErrorSuccess {
-        let after = read();
-        if after == crate::ax::write_outcome::ValueRead::Withheld {
-            return Ok((false, None));
-        }
-        if after.text().as_deref() != Some(text) {
-            anyhow::bail!("AXUIElementSetAttributeValue({attribute}) failed with error {err}; replacement was not confirmed and no retry was sent")
-        }
+) -> anyhow::Result<(bool, Option<usize>, crate::document_edit::DocumentEdited)> {
+    use crate::ax::write_outcome::{native_write_outcome, NativeWriteKind, Settable};
+    use cua_driver_core::mutation::{ChainResult, WriteOutcome};
+    let call_ran = context.settable != Settable::No;
+    let err = if call_ran { send() } else { kAXErrorSuccess };
+    let outcome = native_write_outcome(
+        NativeWriteKind::SetAttribute,
+        call_ran,
+        &context.settable,
+        err,
+    );
+    let chain =
+        ChainResult::from_recorded(vec![outcome], context.prior).expect("one replacement setter");
+    if outcome != WriteOutcome::Delivered {
+        return Err(TextWriteError { message: format!("AXUIElementSetAttributeValue({attribute}) was not confirmed (native error {err}, called={call_ran}); no retry was sent"), chain }.into());
     }
-    if before != text {
-        mark();
-    }
-    Ok(verify())
+    let document = if before != text {
+        mark()
+    } else {
+        crate::document_edit::DocumentEdited::NotADocument
+    };
+    let (verified, delivered) = verify();
+    Ok((verified, delivered, document))
 }
 
 enum InsertRead {
@@ -1754,7 +1767,12 @@ fn cgevent_type_verified(
     request: KeyTextRequest<'_>,
     before: Option<&str>,
     checks: KeyFocusChecks,
-) -> anyhow::Result<(bool, Option<usize>, bool)> {
+) -> anyhow::Result<(
+    bool,
+    Option<usize>,
+    bool,
+    crate::document_edit::DocumentEdited,
+)> {
     let KeyReceiver {
         pid,
         window_id,
@@ -1869,21 +1887,19 @@ fn cgevent_type_verified(
                     "replace:true selection outcome was uncertain and the target changed; no AXValue fallback was sent"
                 )
             }
-            let (verified, delivered) = replace_ax_with(
+            let (verified, delivered, document) = replace_ax_with(
                 "AXValue",
                 before,
                 text,
-                || unsafe { set_string_attr(element, "AXValue", text) },
-                || {
-                    crate::ax::write_outcome::read_value_if_allowed(
-                        &mut crate::ax::label_reader::NativeLabelReader,
-                        element,
-                    )
+                TextWriteContext {
+                    settable: unsafe {
+                        crate::ax::write_outcome::query_settable(element, "AXValue")
+                    },
+                    prior: cua_driver_core::mutation::PriorInput::MayHaveDelivered,
                 },
-                || {
-                    let _ = unsafe {
-                        crate::document_edit::ensure_marked_after_ax_write(pid, element, false)
-                    };
+                || unsafe { set_string_attr(element, "AXValue", text) },
+                || unsafe {
+                    crate::document_edit::ensure_marked_after_ax_write(pid, element, false)
                 },
                 || {
                     await_replacement_delivery(
@@ -1893,7 +1909,7 @@ fn cgevent_type_verified(
                     )
                 },
             )?;
-            return Ok((verified, delivered, true));
+            return Ok((verified, delivered, true, document));
         }
         if web_delivery {
             if text.is_empty() {
@@ -1902,21 +1918,19 @@ fn cgevent_type_verified(
                 crate::input::keyboard::type_text_with_delay(pid, text, delay_ms)?;
             }
         } else {
-            let (verified, delivered) = replace_ax_with(
+            let (verified, delivered, document) = replace_ax_with(
                 "AXSelectedText",
                 before,
                 text,
-                || unsafe { set_string_attr(element, "AXSelectedText", text) },
-                || {
-                    crate::ax::write_outcome::read_value_if_allowed(
-                        &mut crate::ax::label_reader::NativeLabelReader,
-                        element,
-                    )
+                TextWriteContext {
+                    settable: unsafe {
+                        crate::ax::write_outcome::query_settable(element, "AXSelectedText")
+                    },
+                    prior: cua_driver_core::mutation::PriorInput::MayHaveDelivered,
                 },
-                || {
-                    let _ = unsafe {
-                        crate::document_edit::ensure_marked_after_ax_write(pid, element, false)
-                    };
+                || unsafe { set_string_attr(element, "AXSelectedText", text) },
+                || unsafe {
+                    crate::document_edit::ensure_marked_after_ax_write(pid, element, false)
                 },
                 || {
                     await_replacement_delivery(
@@ -1926,13 +1940,18 @@ fn cgevent_type_verified(
                     )
                 },
             )?;
-            return Ok((verified, delivered, true));
+            return Ok((verified, delivered, true, document));
         }
         let deadline = std::time::Instant::now() + DELIVERY_DRAIN_TIMEOUT;
         let (verified, delivered) = await_replacement_delivery(text, deadline, || {
             read_axvalue_bound(pid, element_ptr_and_idx, window_id)
         });
-        return Ok((verified, delivered, !web_delivery));
+        return Ok((
+            verified,
+            delivered,
+            !web_delivery,
+            crate::document_edit::DocumentEdited::NotADocument,
+        ));
     }
     // First-keystroke settle (foreground rung only — caller passes `settle_ms > 0`).
     // Even once the window is front and the element focused, the surface isn't
@@ -1993,9 +2012,19 @@ fn cgevent_type_verified(
         },
     );
     if withheld.get() {
-        Ok((false, None, false))
+        Ok((
+            false,
+            None,
+            false,
+            crate::document_edit::DocumentEdited::NotADocument,
+        ))
     } else {
-        Ok((verified, delivered, false))
+        Ok((
+            verified,
+            delivered,
+            false,
+            crate::document_edit::DocumentEdited::NotADocument,
+        ))
     }
 }
 
@@ -2654,7 +2683,7 @@ fn type_text_in_key_window(
                 },
             )
         };
-        let ((verified, delivered_chars, ax_replacement), fronted) = match window_id {
+        let ((verified, delivered_chars, ax_replacement, document), fronted) = match window_id {
             Some(wid) if screen_sharing_target => {
                 // Screen Sharing forwards physical HID transitions to the
                 // guest. PID-routed Unicode events all carry keycode 0 (the A
@@ -2686,7 +2715,15 @@ fn type_text_in_key_window(
                         crate::input::keyboard::type_text_physical_global(text, delay_ms)
                     },
                 )?;
-                ((false, None, false), true)
+                (
+                    (
+                        false,
+                        None,
+                        false,
+                        crate::document_edit::DocumentEdited::NotADocument,
+                    ),
+                    true,
+                )
             }
             Some(wid) if is_browser_pid(pid) => {
                 // A browser needs a real activation, and its text focus kept.
@@ -2723,7 +2760,12 @@ fn type_text_in_key_window(
                     .and_then(|element| unsafe { copy_raw_attr(element, SELECTED_RANGE) });
                 super::bring_to_front::activate_exact_window_blocking(pid, wid);
                 await_front_settled(pid, wid);
-                let mut typed_delivery = (false, None, false);
+                let mut typed_delivery = (
+                    false,
+                    None,
+                    false,
+                    crate::document_edit::DocumentEdited::NotADocument,
+                );
                 let fronted =
                     crate::input::skylight::with_foreground_assist(pid as libc::pid_t, wid, || {
                         if let Some(element) = remembered {
@@ -2758,7 +2800,12 @@ fn type_text_in_key_window(
                 // result; with_foreground_assist returns whether it actually
                 // fronted (Ok(false) when the fronting SPIs are unavailable —
                 // the keystrokes still ran, just as background input).
-                let mut typed_delivery = (false, None, false);
+                let mut typed_delivery = (
+                    false,
+                    None,
+                    false,
+                    crate::document_edit::DocumentEdited::NotADocument,
+                );
                 let fronted = crate::input::skylight::with_foreground_assist(
                     pid as libc::pid_t,
                     wid,
@@ -2778,7 +2825,7 @@ fn type_text_in_key_window(
         // background keystrokes and `path` must say so honestly.
         return Ok(TypeTextDelivery::Typed(TypeTextOutcome {
             detail: if ax_replacement {
-                " via verified native whole-field replacement".to_owned()
+                format!(" via native whole-field replacement{}", document.note())
             } else {
                 format!(" via foreground keystrokes ({delay_ms}ms delay)")
             },
@@ -2807,7 +2854,7 @@ fn type_text_in_key_window(
             "type_text: pid {pid} is a terminal emulator; skipping AX value-set, \
              using CGEvent key-event synthesis"
         );
-        let (verified, delivered_chars, _) = cgevent_type_verified(
+        let (verified, delivered_chars, _, _) = cgevent_type_verified(
             KeyReceiver {
                 pid,
                 window_id,
@@ -3025,30 +3072,31 @@ fn type_text_in_key_window(
     // --- Background rung 2: CGEvent keystrokes with read-back. ---
     // Never clear here: a partial AX write is rare, and clearing would violate
     // insert-at-cursor semantics.
-    let (verified, delivered_chars, ax_replacement) = ax_insert_then_keys(ax_attempt, || {
-        cgevent_type_verified(
-            KeyReceiver {
-                pid,
-                window_id,
-                element: element_ptr_and_idx,
-            },
-            KeyTextRequest {
-                text,
-                delay_ms,
-                settle_ms: 0,
-                replace,
-                single_terminal_return: chromium_native_submission,
-            },
-            before.as_deref(),
-            KeyFocusChecks {
-                exact_focus: focused_key_route,
-                recheck_editability_after_settle: false,
-            },
-        )
-    })?;
+    let (verified, delivered_chars, ax_replacement, document) =
+        ax_insert_then_keys(ax_attempt, || {
+            cgevent_type_verified(
+                KeyReceiver {
+                    pid,
+                    window_id,
+                    element: element_ptr_and_idx,
+                },
+                KeyTextRequest {
+                    text,
+                    delay_ms,
+                    settle_ms: 0,
+                    replace,
+                    single_terminal_return: chromium_native_submission,
+                },
+                before.as_deref(),
+                KeyFocusChecks {
+                    exact_focus: focused_key_route,
+                    recheck_editability_after_settle: false,
+                },
+            )
+        })?;
     Ok(TypeTextDelivery::Typed(TypeTextOutcome {
         detail: if ax_replacement {
-            " via verified native whole-field replacement".to_owned()
+            format!(" via native whole-field replacement{}", document.note())
         } else {
             format!(" via CGEvent ({delay_ms}ms delay)")
         },
@@ -3285,7 +3333,10 @@ mod selection_outcome_tests {
 mod u32_outcome_tests {
     use super::*;
     use crate::ax::bindings::{kAXErrorCannotComplete, kAXErrorIllegalArgument};
+    use crate::ax::write_outcome::Settable;
     use crate::ax::write_outcome::{ValueObs, ValueRead};
+    use crate::document_edit::DocumentEdited;
+    use cua_driver_core::mutation::PriorInput;
     use std::cell::Cell;
 
     #[test]
@@ -3295,15 +3346,27 @@ mod u32_outcome_tests {
             "AXValue",
             "old",
             "new",
+            TextWriteContext {
+                settable: Settable::Yes,
+                prior: PriorInput::MayHaveDelivered,
+            },
             || kAXErrorCannotComplete,
-            || ValueRead::Allowed(ValueObs::Text("new".into())),
-            || marks.set(marks.get() + 1),
-            || (true, Some(3)),
+            || {
+                marks.set(marks.get() + 1);
+                DocumentEdited::NotMarked
+            },
+            || panic!("late matching readback must not run after timeout"),
         );
         assert_eq!(marks.get(), 0, "uncertain write must not mark the document");
-        assert!(
-            result.is_err(),
-            "late readback cannot confirm a timed-out write"
+        let error = result.unwrap_err();
+        let projected = text_delivery_failure("type_text failed", &error);
+        assert_eq!(
+            projected.structured_content.unwrap()["effect"],
+            "unverifiable"
+        );
+        assert_eq!(
+            projected.disposition,
+            Some(cua_driver_contract::ErrorDisposition::SUSPECTED_NOOP)
         );
     }
 
@@ -3314,16 +3377,59 @@ mod u32_outcome_tests {
             "AXSelectedText",
             "old",
             "new",
+            TextWriteContext {
+                settable: Settable::Yes,
+                prior: PriorInput::MayHaveDelivered,
+            },
             || kAXErrorIllegalArgument,
-            || ValueRead::Allowed(ValueObs::Text("new".into())),
-            || marks.set(marks.get() + 1),
-            || (true, Some(3)),
+            || {
+                marks.set(marks.get() + 1);
+                DocumentEdited::NotMarked
+            },
+            || panic!("illegal argument must not be promoted by readback"),
         );
-        assert!(
-            result.is_err(),
-            "sent illegal-argument error remains unconfirmed"
+        let error = result.unwrap_err();
+        assert!(error
+            .to_string()
+            .contains(&kAXErrorIllegalArgument.to_string()));
+        let projected = text_delivery_failure("type_text failed", &error);
+        assert_eq!(
+            projected.structured_content.unwrap()["effect"],
+            "unverifiable"
+        );
+        assert_eq!(
+            projected.disposition,
+            Some(cua_driver_contract::ErrorDisposition::SUSPECTED_NOOP)
         );
         assert_eq!(marks.get(), 0);
+        let (_, _, document) = replace_ax_with(
+            "AXSelectedText",
+            "old",
+            "new",
+            TextWriteContext {
+                settable: Settable::Yes,
+                prior: PriorInput::MayHaveDelivered,
+            },
+            || kAXErrorSuccess,
+            || DocumentEdited::NotMarked,
+            || (true, Some(3)),
+        )
+        .unwrap();
+        assert!(document.note().contains("may keep the old content"));
+        let projected = type_text_outcome_result(
+            TypeTextOutcome {
+                detail: format!(" via native whole-field replacement{}", document.note()),
+                path: PATH_AX,
+                verified: true,
+                delivered_chars: Some(3),
+                web_area: WebAreaClassification::NonWebContent,
+            },
+            3,
+            false,
+            false,
+            "",
+        );
+        assert!(projected.content.iter().any(|item| matches!(item, cua_driver_core::protocol::Content::Text { text, .. } if text.contains("may keep the old content"))));
     }
 
     #[test]
