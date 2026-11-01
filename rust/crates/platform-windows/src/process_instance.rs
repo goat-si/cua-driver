@@ -48,6 +48,90 @@ pub(crate) fn evidence_for(
     }
 }
 
+#[cfg(windows)]
+pub(crate) fn process_fingerprint(pid: u32) -> Result<ProcessFingerprint, String> {
+    use windows::core::PWSTR;
+    use windows::Win32::Foundation::{
+        CloseHandle, GetLastError, FILETIME, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    };
+    use windows::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, QueryFullProcessImageNameW, WaitForSingleObject,
+        PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+    };
+    unsafe {
+        let handle = OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+            false,
+            pid,
+        )
+        .map_err(|e| format!("OpenProcess({pid}): {e}"))?;
+        let result = (|| {
+            match WaitForSingleObject(handle, 0) {
+                WAIT_TIMEOUT => (),
+                WAIT_OBJECT_0 => return Err(format!("process {pid} has exited")),
+                WAIT_FAILED => {
+                    return Err(format!("WaitForSingleObject({pid}): {:?}", GetLastError()))
+                }
+                other => return Err(format!("WaitForSingleObject({pid}): unexpected {other:?}")),
+            }
+            let mut creation = FILETIME::default();
+            let mut exit = FILETIME::default();
+            let mut kernel = FILETIME::default();
+            let mut user = FILETIME::default();
+            GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user)
+                .map_err(|e| format!("GetProcessTimes({pid}): {e}"))?;
+            let mut path = vec![0u16; 32768];
+            let mut len = path.len() as u32;
+            QueryFullProcessImageNameW(
+                handle,
+                PROCESS_NAME_FORMAT(0),
+                PWSTR(path.as_mut_ptr()),
+                &mut len,
+            )
+            .map_err(|e| format!("QueryFullProcessImageNameW({pid}): {e}"))?;
+            let executable =
+                String::from_utf16(&path[..len as usize]).map_err(|e| e.to_string())?;
+            Ok(ProcessFingerprint {
+                pid: i64::from(pid),
+                start_time: Some(
+                    (u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime),
+                ),
+                executable: Some(executable),
+            })
+        })();
+        let _ = CloseHandle(handle);
+        result
+    }
+}
+
+#[cfg(windows)]
+fn window_owner(hwnd: u64) -> Result<u32, String> {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{GetWindowThreadProcessId, IsWindow};
+    unsafe {
+        let window = HWND(hwnd as usize as *mut _);
+        if !IsWindow(window).as_bool() {
+            return Err("the window no longer exists".into());
+        }
+        let mut pid = 0;
+        if GetWindowThreadProcessId(window, Some(&mut pid)) == 0 || pid == 0 {
+            return Err(format!(
+                "cannot read window owner: {:?}",
+                windows::Win32::Foundation::GetLastError()
+            ));
+        }
+        Ok(pid)
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn probe(pid: u32, hwnd: u64) -> Probe {
+    Probe {
+        fingerprint: process_fingerprint(pid),
+        window_owner: window_owner(hwnd),
+    }
+}
+
 fn publish_window_snapshot<S: SnapshotPayload>(
     store: &SnapshotStore<S>,
     pid: i32,
@@ -87,6 +171,29 @@ mod tests {
             executable: Some("app".into()),
         }
     }
+    #[cfg(windows)]
+    #[test]
+    fn live_process_fingerprints_and_exited_child() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let pid = std::process::id();
+        let first = process_fingerprint(pid).unwrap();
+        let second = process_fingerprint(pid).unwrap();
+        assert!(first.start_time.is_some());
+        assert!(first.matches(&second));
+        let mut child = Command::new("cmd")
+            .args(["/c", "set /p line="])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        let child_pid = child.id();
+        assert!(process_fingerprint(child_pid).unwrap().start_time.is_some());
+        writeln!(child.stdin.as_mut().unwrap(), "release").unwrap();
+        child.wait().unwrap();
+        assert!(process_fingerprint(child_pid).is_err());
+    }
+
     #[test]
     fn capture_requires_stable_instance_and_owner() {
         fn probe(
