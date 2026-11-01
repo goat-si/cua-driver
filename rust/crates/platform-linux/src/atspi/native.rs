@@ -6361,15 +6361,10 @@ async fn set_value_on(
         .await
         .map_err(|e| anyhow!("interface proxies unavailable: {e}"))?;
     if proxies.editable_text().await.is_ok() {
-        use crate::text_write_policy::{Reason, TextWriteOutcome};
-        match run_native_editable_route(acc, value, EditableRoute::Replace).await? {
-            TextWriteOutcome::Acknowledged => return Ok(()),
-            TextWriteOutcome::Uncertain { step } => return Err(WriteUncertain { step }.into()),
-            TextWriteOutcome::Partial { step } => return Err(WritePartial { step }.into()),
-            TextWriteOutcome::NothingWritten {
-                reason: Reason::GateClosed,
-            } => return Err(WriteDispatchClosed.into()),
-            TextWriteOutcome::NothingWritten { .. } => {}
+        if !replacement_needs_value(
+            run_native_editable_route(acc, value, EditableRoute::Replace).await?,
+        )? {
+            return Ok(());
         }
     }
     if has_value {
@@ -6379,35 +6374,56 @@ async fn set_value_on(
             .await
             .map_err(|e| anyhow!("Value unavailable: {e}"))?;
         let dispatch = TEXT_DISPATCH.with(Arc::clone);
-        dispatch
-            .gate
-            .enter_mutator()
-            .map_err(|_| WriteDispatchClosed)?;
-        dispatch.ledger.record_sent();
-        dispatch.step.store(5, Ordering::SeqCst);
-        let result = call(value_proxy.set_current_value(v)).await;
-        let classified = if matches!(result, Some(Ok(()))) {
-            Ok(crate::text_write_policy::MutationResult::Acknowledged)
-        } else {
-            Err(crate::text_write_policy::CallClass::PossiblyExecuted)
-        };
-        dispatch.ledger.record_result(classified);
-        dispatch.gate.finish_mutator();
-        return match classified {
-            Ok(_) => Ok(()),
-            Err(_) => Err(WriteUncertain {
-                step: crate::text_write_policy::WriteStep {
-                    step: crate::text_write_policy::Step::SetValue,
-                    bytes: value.len(),
-                    units: None,
-                },
-            }
-            .into()),
-        };
+        return dispatch_numeric_value(&dispatch, value.len(), value_proxy.set_current_value(v))
+            .await;
     }
     Err(anyhow!(
         "{NO_VALUE_ROUTE}: {label} exposes neither EditableText nor Value"
     ))
+}
+
+async fn dispatch_numeric_value(
+    dispatch: &TextWriteDispatch,
+    bytes: usize,
+    future: impl std::future::Future<Output = zbus::Result<()>>,
+) -> Result<()> {
+    use crate::text_write_policy::{CallClass, MutationResult, Step, WriteStep};
+    dispatch
+        .gate
+        .enter_mutator()
+        .map_err(|_| WriteDispatchClosed)?;
+    dispatch.ledger.record_sent();
+    dispatch.step.store(5, Ordering::SeqCst);
+    let classified = if matches!(call(future).await, Some(Ok(()))) {
+        Ok(MutationResult::Acknowledged)
+    } else {
+        Err(CallClass::PossiblyExecuted)
+    };
+    dispatch.ledger.record_result(classified);
+    dispatch.gate.finish_mutator();
+    classified.map(|_| ()).map_err(|_| {
+        WriteUncertain {
+            step: WriteStep {
+                step: Step::SetValue,
+                bytes,
+                units: None,
+            },
+        }
+        .into()
+    })
+}
+
+fn replacement_needs_value(outcome: crate::text_write_policy::TextWriteOutcome) -> Result<bool> {
+    use crate::text_write_policy::{Reason, TextWriteOutcome};
+    match outcome {
+        TextWriteOutcome::Acknowledged => Ok(false),
+        TextWriteOutcome::Uncertain { step } => Err(WriteUncertain { step }.into()),
+        TextWriteOutcome::Partial { step } => Err(WritePartial { step }.into()),
+        TextWriteOutcome::NothingWritten {
+            reason: Reason::GateClosed,
+        } => Err(WriteDispatchClosed.into()),
+        TextWriteOutcome::NothingWritten { .. } => Ok(true),
+    }
 }
 
 fn parse_value_number(value: &str) -> Result<f64> {
@@ -6422,13 +6438,52 @@ fn parse_value_number(value: &str) -> Result<f64> {
 
 #[cfg(test)]
 mod numeric_value_tests {
-    use super::parse_value_number;
+    use super::*;
+    use crate::text_write_policy::{Reason, Step, TextWriteOutcome, WriteStep};
     #[test]
     fn non_finite_value_is_rejected_before_dispatch() {
         for value in ["NaN", "inf", "-inf"] {
             assert!(parse_value_number(value).is_err(), "{value}");
         }
         assert_eq!(parse_value_number("2.5").unwrap(), 2.5);
+    }
+
+    #[test]
+    fn only_nothing_written_can_reach_the_value_route() {
+        assert!(replacement_needs_value(TextWriteOutcome::NothingWritten {
+            reason: Reason::Refused
+        })
+        .unwrap());
+        assert!(replacement_needs_value(TextWriteOutcome::NothingWritten {
+            reason: Reason::Unsupported
+        })
+        .unwrap());
+        assert!(!replacement_needs_value(TextWriteOutcome::Acknowledged).unwrap());
+        let step = WriteStep {
+            step: Step::InsertText,
+            bytes: 3,
+            units: Some(3),
+        };
+        for outcome in [
+            TextWriteOutcome::Uncertain { step },
+            TextWriteOutcome::Partial { step },
+        ] {
+            let error = replacement_needs_value(outcome).unwrap_err();
+            assert!(!is_no_value_route(&error));
+        }
+    }
+
+    #[test]
+    fn value_error_after_dispatch_is_uncertain() {
+        let dispatch = TextWriteDispatch::default();
+        let error = runtime()
+            .block_on(dispatch_numeric_value(&dispatch, 3, async {
+                Err(zbus::Error::InvalidReply)
+            }))
+            .unwrap_err();
+        assert!(error.downcast_ref::<WriteUncertain>().is_some());
+        assert!(dispatch.ledger.sent());
+        assert!(dispatch.ledger.possibly_executed());
     }
 }
 
