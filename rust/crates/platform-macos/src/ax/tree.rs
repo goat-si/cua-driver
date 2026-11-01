@@ -444,6 +444,29 @@ pub(super) fn apply_owned_label_claims(nodes: &mut [AXNode], claims: Vec<(usize,
     }
 }
 
+fn fold_with_owned_items(lines: &mut Vec<(usize, String)>, nodes: &mut Vec<AXNode>) {
+    // The core folder only sees rendered depth; a missing item wrapper can
+    // make unrelated text appear to belong to an unindexed row or cell.
+    // Protect those owners during folding so their original children remain.
+    let protected: std::collections::HashSet<usize> = nodes
+        .iter_mut()
+        .filter_map(|node| {
+            if node.element_index.is_none() && node.owned_row_label.is_some() {
+                node.element_index = Some(usize::MAX);
+                Some(node.element_ptr)
+            } else {
+                None
+            }
+        })
+        .collect();
+    fold_actionless_text_subtrees(lines, nodes);
+    for node in nodes {
+        if node.element_index == Some(usize::MAX) && protected.contains(&node.element_ptr) {
+            node.element_index = None;
+        }
+    }
+}
+
 fn is_addressable(
     role: &str,
     actions_present: bool,
@@ -890,7 +913,7 @@ fn walk_tree_with_web_content(
     // Folding merges text rows into their parent; an exhaustive walk keeps
     // every row it visited.
     if !exhaustive_nodes() {
-        fold_actionless_text_subtrees(&mut lines, &mut nodes);
+        fold_with_owned_items(&mut lines, &mut nodes);
     }
     nodes.retain(|n| n.role != "AXTabStripSummary");
     let mut line_nodes = align_line_nodes(&lines, &nodes);
@@ -3394,7 +3417,7 @@ pub(crate) fn test_fold_and_filter(mut nodes: Vec<AXNode>, query: &str) -> (Vec<
         .iter()
         .map(|node| (node.depth, format_node_line(node)))
         .collect();
-    fold_actionless_text_subtrees(&mut lines, &mut nodes);
+    fold_with_owned_items(&mut lines, &mut nodes);
     let mapping = align_line_nodes(&lines, &nodes);
     let rendered = filter_tree_with_original_text(&lines, &mapping, &nodes, query);
     (nodes, rendered)

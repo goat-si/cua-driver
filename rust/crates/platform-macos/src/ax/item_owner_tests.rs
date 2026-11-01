@@ -156,6 +156,19 @@ fn compaction_does_not_assign_foreign_text_to_an_unindexed_cell() {
 }
 
 #[test]
+fn unindexed_cell_keeps_all_owned_children_after_compaction() {
+    let nodes = walk_fake_mode(
+        &item("AXCell", false, vec![text("first"), text("second")]),
+        true,
+    );
+    assert_eq!(nodes.len(), 3);
+    assert!(nodes[0].element_index.is_none());
+    assert_eq!(nodes[1].value.as_deref(), Some("first"));
+    assert_eq!(nodes[2].value.as_deref(), Some("second"));
+    assert_eq!(test_build_observation_array(&nodes)[0]["label"], "first");
+}
+
+#[test]
 fn deferred_row_keeps_both_owners() {
     use super::dense_rows::DeferredRow;
     use super::snapshot::RetainedElement;
