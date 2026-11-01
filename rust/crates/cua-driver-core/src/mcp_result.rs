@@ -140,11 +140,20 @@ pub fn finalize_error_disposition(tool: &str, mut normalized: Value) -> Value {
             }
             Some(value)
                 if effect_evidence == ErrorDisposition::DELIVERED
+                    && structured.get("effect").and_then(Value::as_str) == Some("unverifiable")
                     && value.delivery == cua_driver_contract::InputDelivery::DeliveryUncertain =>
             {
-                // The explicit delivery evidence is more specific than the
-                // effect-derived default; either way retry is unsafe.
+                // An unverifiable effect does not prove delivery, so explicit
+                // uncertainty is the truthful value; retry stays unsafe. A
+                // partial effect proves some input landed and keeps
+                // delivered_unverified.
                 ErrorDisposition::SUSPECTED_NOOP
+            }
+            Some(value)
+                if effect_evidence == ErrorDisposition::DELIVERED
+                    && value.delivery == cua_driver_contract::InputDelivery::DeliveryUncertain =>
+            {
+                effect_evidence
             }
             Some(value) => value,
             None => evidence,
@@ -355,7 +364,7 @@ mod tests {
         );
         assert_eq!(
             partial["structuredContent"]["disposition"],
-            serde_json::json!({"delivery": "delivery_uncertain", "retry": "unsafe"})
+            serde_json::json!({"delivery": "delivered_unverified", "retry": "unsafe"})
         );
     }
     use super::*;
