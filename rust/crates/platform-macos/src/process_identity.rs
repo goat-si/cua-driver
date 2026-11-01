@@ -29,13 +29,22 @@ pub(crate) fn process_fingerprint(pid: i64) -> Option<ProcessFingerprint> {
 
 fn fingerprint_with(pid: i64, reader: &impl ProcessReader) -> Option<ProcessFingerprint> {
     let native_pid = i32::try_from(pid).ok().filter(|pid| *pid > 0)?;
-    let (seconds, micros) = process_start_stamp_with(native_pid, |pid, info| reader.info(pid, info))?;
+    let (seconds, micros) =
+        process_start_stamp_with(native_pid, |pid, info| reader.info(pid, info))?;
     if micros >= 1_000_000 {
         return None;
     }
-    let start_time = seconds.checked_mul(1_000_000)?;
+    let start_time = seconds.checked_mul(1_000_000)?.checked_add(micros)?;
     let executable = reader.executable(native_pid);
-    Some(ProcessFingerprint { pid, start_time: Some(start_time), executable })
+    let after = process_start_stamp_with(native_pid, |pid, info| reader.info(pid, info))?;
+    if after != (seconds, micros) {
+        return None;
+    }
+    Some(ProcessFingerprint {
+        pid,
+        start_time: Some(start_time),
+        executable,
+    })
 }
 
 #[cfg(test)]
@@ -54,19 +63,34 @@ mod u33_identity_tests {
 
     impl FakeReader {
         fn new(info: &[InfoResult], executable: Option<&str>) -> Self {
-            Self { info: RefCell::new(info.iter().copied().collect()), executable: executable.map(str::to_owned), calls: Cell::new(0) }
+            Self {
+                info: RefCell::new(info.iter().copied().collect()),
+                executable: executable.map(str::to_owned),
+                calls: Cell::new(0),
+            }
         }
     }
 
     impl ProcessReader for FakeReader {
         fn info(&self, _pid: i32, info: &mut libc::proc_bsdinfo) -> libc::c_int {
             self.calls.set(self.calls.get() + 1);
-            match self.info.borrow_mut().pop_front().expect("unexpected info read") {
-                Some((length, sec, usec)) => { info.pbi_start_tvsec = sec; info.pbi_start_tvusec = usec; length }
+            match self
+                .info
+                .borrow_mut()
+                .pop_front()
+                .expect("unexpected info read")
+            {
+                Some((length, sec, usec)) => {
+                    info.pbi_start_tvsec = sec;
+                    info.pbi_start_tvusec = usec;
+                    length
+                }
                 None => 0,
             }
         }
-        fn executable(&self, _pid: i32) -> Option<String> { self.executable.clone() }
+        fn executable(&self, _pid: i32) -> Option<String> {
+            self.executable.clone()
+        }
     }
 
     fn full(sec: u64, usec: u64) -> InfoResult {
@@ -79,7 +103,12 @@ mod u33_identity_tests {
 
     #[test]
     fn packs_seconds_and_microseconds() {
-        assert_eq!(fingerprint_with(42, &stable(12, 345_678, None)).unwrap().start_time, Some(12_345_678));
+        assert_eq!(
+            fingerprint_with(42, &stable(12, 345_678, None))
+                .unwrap()
+                .start_time,
+            Some(12_345_678)
+        );
     }
 
     #[test]
@@ -97,7 +126,13 @@ mod u33_identity_tests {
     #[test]
     fn rejects_start_time_overflow() {
         assert_eq!(fingerprint_with(42, &stable(u64::MAX, 1, None)), None);
-        assert_eq!(fingerprint_with(42, &stable(u64::MAX / 1_000_000, u64::MAX % 1_000_000 + 1, None)), None);
+        assert_eq!(
+            fingerprint_with(
+                42,
+                &stable(u64::MAX / 1_000_000, u64::MAX % 1_000_000 + 1, None)
+            ),
+            None
+        );
     }
 
     #[test]
@@ -118,15 +153,32 @@ mod u33_identity_tests {
 
     #[test]
     fn unreadable_start_has_no_identity() {
-        assert_eq!(fingerprint_with(42, &FakeReader::new(&[None], Some("/a"))), None);
-        assert_eq!(fingerprint_with(42, &FakeReader::new(&[full(12, 1), None], Some("/a"))), None);
+        assert_eq!(
+            fingerprint_with(42, &FakeReader::new(&[None], Some("/a"))),
+            None
+        );
+        assert_eq!(
+            fingerprint_with(42, &FakeReader::new(&[full(12, 1), None], Some("/a"))),
+            None
+        );
     }
 
     #[test]
     fn executable_is_optional_and_exact() {
-        assert_eq!(fingerprint_with(42, &stable(12, 1, None)).unwrap().executable, None);
+        assert_eq!(
+            fingerprint_with(42, &stable(12, 1, None))
+                .unwrap()
+                .executable,
+            None
+        );
         let path = "/Applications/Example.app/Contents/MacOS/Example";
-        assert_eq!(fingerprint_with(42, &stable(12, 1, Some(path))).unwrap().executable.as_deref(), Some(path));
+        assert_eq!(
+            fingerprint_with(42, &stable(12, 1, Some(path)))
+                .unwrap()
+                .executable
+                .as_deref(),
+            Some(path)
+        );
     }
 
     #[test]

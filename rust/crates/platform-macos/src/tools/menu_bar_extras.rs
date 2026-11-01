@@ -68,7 +68,6 @@ struct ProcessIdentity {
     start_time: (u64, u64),
 }
 
-
 fn identity(pid: i32) -> Result<ProcessIdentity, String> {
     crate::ax::enablement::process_start_stamp(pid)
         .map(|start_time| ProcessIdentity { pid, start_time })

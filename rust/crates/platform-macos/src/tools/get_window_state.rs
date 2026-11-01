@@ -21,7 +21,6 @@ struct PanelAttestation {
     start_time: (u64, u64),
 }
 
-
 fn panel_attestation(pid: i32, window_id: u32) -> Option<PanelAttestation> {
     let owner = crate::windows::resolve_window_owner(pid, window_id);
     let crate::ax::WindowScope::OwnerPidMismatch { owner_pid, .. } =
