@@ -181,6 +181,40 @@ fn failed_scrollbar_probe_reports_attribute_read_failed() {
 }
 
 #[test]
+fn failed_tab_probe_reports_attribute_read_failed() {
+    use crate::ax::tree_source::ReadFailure;
+    let source = Fake::new(
+        &[(1, 1, 1, &[])],
+        vec![
+            step(
+                "text 1 AXTitle",
+                Reply::Text(Read::Unknown(ReadFailure::WrongType)),
+            ),
+            step("text 1 AXDescription", Reply::Text(Read::Absent)),
+            step("text 1 AXRoleDescription", Reply::Text(Read::Absent)),
+        ],
+    );
+    let root = source.handle(1);
+    let evidence = crate::ax::evidence::EvidenceScope::start();
+    let mut budget = WalkBudget::nodes_only(10);
+    let plan =
+        plan_macos_tab_strip_observed(&source, &root, "AXGroup", &[], &mut budget, &mut false)
+            .into_walk_legacy();
+    assert!(plan.is_none());
+    record_attribute_failures(&mut budget);
+    let mut output = json!({});
+    budget.outcome().apply(&mut output);
+    assert!(output["observation_incomplete_reasons"]
+        .as_array()
+        .unwrap()
+        .contains(&json!({"kind":"provider_failure", "detail":"attribute_read_failed"})));
+    let _ = evidence.finish(());
+    drop(root);
+    source.assert_consumed();
+    source.assert_lifetimes(&[]);
+}
+
+#[test]
 fn recovered_batch_fallback_is_not_incomplete() {
     let (tree, trace) = super::walker_seam_tests::canonical_walk_fixture("recovered");
     assert!(trace.iter().any(|entry| entry == "status 1 AXTitle"));
