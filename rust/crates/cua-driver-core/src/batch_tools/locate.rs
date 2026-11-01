@@ -1774,19 +1774,41 @@ fn near_misses(read: &Read, spec: &ElementSpec) -> String {
 }
 
 pub(crate) fn describe_element(element: &Value) -> String {
+    use crate::snapshot_compaction::{
+        is_secure_text_field, redact_if_secure, redact_mirrored_secure_name, FieldSecurityMeta,
+    };
     let role = element
         .get("role")
         .and_then(Value::as_str)
         .unwrap_or("element");
+    let label = label_of(element);
+    let value = element.get("value").and_then(Value::as_str);
+    let meta = FieldSecurityMeta {
+        role,
+        subrole: element.get("subrole").and_then(Value::as_str),
+        title: element.get("name").and_then(Value::as_str),
+        description: label,
+        placeholder: element.get("placeholder").and_then(Value::as_str),
+        identifier: element.get("identifier").and_then(Value::as_str),
+        help: element.get("help").and_then(Value::as_str),
+        is_password_flag: element.get("secure").and_then(Value::as_bool) == Some(true)
+            || element
+                .get("states")
+                .and_then(Value::as_array)
+                .is_some_and(|states| states.iter().any(|state| state.as_str() == Some("secure"))),
+    };
+    let secure = is_secure_text_field(&meta);
+    let safe_label = redact_mirrored_secure_name(secure, label.map(str::to_owned), value);
+    let (safe_value, _) = redact_if_secure(&meta, value.map(str::to_owned), None);
     let mut out = match element.get("element_index").and_then(Value::as_u64) {
         Some(index) => format!("[{index}] {role}"),
         None => role.to_owned(),
     };
-    if let Some(label) = label_of(element) {
+    if let Some(label) = safe_label.as_deref() {
         out.push_str(&format!(" \"{}\"", clip(label, 60)));
     }
-    if let Some(value) = element.get("value").and_then(Value::as_str) {
-        if Some(value) != label_of(element) {
+    if let Some(value) = safe_value.as_deref() {
+        if Some(value) != safe_label.as_deref() {
             out.push_str(&format!(" value=\"{}\"", clip(value, 60)));
         }
     }
@@ -1999,6 +2021,20 @@ mod tests {
             "label": label,
             "frame": {"x": 0, "y": 0, "w": 10, "h": 10},
         })
+    }
+
+    #[test]
+    fn secure_candidates_never_render_unsanitized_name_or_value() {
+        for row in [
+            json!({"element_index": 1, "role": "AXSecureTextField", "label": "SECRET-NAME", "value": "SECRET-VALUE"}),
+            json!({"element_index": 1, "role": "edit", "secure": true, "label": "SECRET-NAME", "value": "SECRET-VALUE"}),
+            json!({"element_index": 1, "role": "edit", "states": ["secure"], "label": "SECRET-NAME", "value": "SECRET-VALUE"}),
+        ] {
+            let rendered = describe_element(&row);
+            assert!(!rendered.contains("SECRET-NAME"), "{rendered}");
+            assert!(!rendered.contains("SECRET-VALUE"), "{rendered}");
+            assert!(rendered.contains("[redacted]"), "{rendered}");
+        }
     }
 
     #[test]
