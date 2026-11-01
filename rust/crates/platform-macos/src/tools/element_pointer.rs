@@ -751,6 +751,9 @@ pub(super) async fn click_element(state: &ToolState, request: ElementClick) -> T
             .await
             .unwrap_or(false)
     };
+    let use_ax_open = super::actionability::may_use_semantic_route(
+        &cua_driver_core::actionability::Evidence::Known(use_ax_open),
+    );
     let lease = if foreground {
         None
     } else {

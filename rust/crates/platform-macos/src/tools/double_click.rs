@@ -156,6 +156,9 @@ impl Tool for DoubleClickTool {
             })
             .await
             .unwrap_or(false);
+            let has_ax_open = super::actionability::may_use_semantic_route(
+                &cua_driver_core::actionability::Evidence::Known(has_ax_open),
+            );
             let mutation_lease = if !delivery_mode.is_foreground() {
                 let action = background_action_for_element(has_ax_open);
                 match super::gate_background_window_action(pid, wid, Some(element_ptr), action)

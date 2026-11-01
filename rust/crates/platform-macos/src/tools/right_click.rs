@@ -392,6 +392,9 @@ impl RightClickTool {
                     return super::pre_dispatch_refusal("action_unavailable", message);
                 }
             };
+            let advertises_show_menu = super::actionability::may_use_semantic_route(
+                &cua_driver_core::actionability::Evidence::Known(advertises_show_menu),
+            );
 
             // The context menu steals key focus from the user's app when the
             // target is in the background; the guard hands it back.

@@ -57,6 +57,80 @@ fn assert_same(a: &ToolResult, b: &ToolResult) {
     assert_eq!(a.action_record, b.action_record);
     assert_eq!(a.disposition, b.disposition);
 }
+
+async fn open_action_read_failure_blocks_fallback(route: &'static str) {
+    for reason in ["AX error -25204", "wrong CF type in action names"] {
+        let clock = FakeClock::default();
+        let pixel = AtomicUsize::new(0);
+        let ax = AtomicUsize::new(0);
+        let chosen = may_use_semantic_route(&Evidence::Unknown(reason.into()));
+        let result = super::super::double_click::dispatch_open(
+            &clock, Duration::from_millis(200), chosen, route,
+            |_, _| Box::pin(async move { semantic::unavailable(reason.into()) }),
+            |_| async { if chosen { ax.fetch_add(1, Ordering::SeqCst); } else { pixel.fetch_add(1, Ordering::SeqCst); } success() },
+        ).await;
+        assert!(result.is_err(), "{route}: unknown action names must not dispatch");
+        assert_eq!(pixel.load(Ordering::SeqCst), 0);
+        assert_eq!(ax.load(Ordering::SeqCst), 0);
+    }
+    let clock = FakeClock::default();
+    let pixel = AtomicUsize::new(0);
+    let chosen = may_use_semantic_route(&Evidence::Known(false));
+    let result = super::super::double_click::dispatch_open(
+        &clock, Duration::ZERO, chosen, route,
+        |_, _| Box::pin(async { panic!("proven absent should use pixel fallback") }),
+        |_| async { pixel.fetch_add(1, Ordering::SeqCst); success() },
+    ).await;
+    assert!(result.is_ok());
+    assert_eq!(pixel.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn double_click_unknown_action_names_block_pixel_and_ax() {
+    open_action_read_failure_blocks_fallback("double_click").await;
+}
+
+#[tokio::test]
+async fn click_count_two_unknown_action_names_block_pixel_and_ax() {
+    open_action_read_failure_blocks_fallback("click_count_2").await;
+}
+
+#[tokio::test]
+async fn right_click_unknown_action_names_block_pixel_and_ax() {
+    for reason in ["AX error -25204", "wrong CF type in action names"] {
+        let clock = FakeClock::default();
+        let pixel = AtomicUsize::new(0);
+        let ax = AtomicUsize::new(0);
+        let chosen = may_use_semantic_route(&Evidence::Unknown(reason.into()));
+        let result = super::super::right_click::dispatch_show_menu(
+            &clock, Duration::from_millis(200), chosen, (),
+            |_, _| Box::pin(async move { semantic::unavailable(reason.into()) }),
+            |_| async { if chosen { ax.fetch_add(1, Ordering::SeqCst); } else { pixel.fetch_add(1, Ordering::SeqCst); } success() },
+        ).await;
+        assert!(result.is_err(), "unknown action names must not dispatch");
+        assert_eq!(pixel.load(Ordering::SeqCst), 0);
+        assert_eq!(ax.load(Ordering::SeqCst), 0);
+    }
+    let clock = FakeClock::default();
+    let pixel = AtomicUsize::new(0);
+    let chosen = may_use_semantic_route(&Evidence::Known(false));
+    let result = super::super::right_click::dispatch_show_menu(
+        &clock, Duration::ZERO, chosen, (),
+        |_, _| Box::pin(async { panic!("proven absent should use pixel fallback") }),
+        |_| async { pixel.fetch_add(1, Ordering::SeqCst); success() },
+    ).await;
+    assert!(result.is_ok());
+    assert_eq!(pixel.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn click_right_and_open_use_semantic_intents() {
+    use semantic::SemanticIntent;
+    assert!(matches!(super::super::click::click_semantic_intent("AXShowMenu"), SemanticIntent::RightClick));
+    assert!(matches!(super::super::click::click_semantic_intent("AXOpen"), SemanticIntent::Open));
+    assert!(matches!(super::super::click::click_semantic_intent("AXPress"), SemanticIntent::Click));
+    assert!(matches!(super::super::click::click_semantic_intent("Name:exact"), SemanticIntent::PerformAction(name) if name == "Name:exact"));
+}
 #[tokio::test]
 async fn click_axpress_refusal_prevents_first_effect() {
     let clock = FakeClock::default();

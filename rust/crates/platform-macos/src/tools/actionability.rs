@@ -299,6 +299,10 @@ pub(crate) fn evaluate(
 ) -> ActionabilityReport {
     actionability::evaluate(intent, facts, policy)
 }
+
+pub(super) fn may_use_semantic_route(advertised: &Evidence<bool>) -> bool {
+    matches!(advertised, Evidence::Known(true))
+}
 pub(crate) async fn wait<C, P, F>(
     clock: &C,
     budget: Duration,

@@ -39,6 +39,14 @@ use core_foundation::base::{CFRelease, CFTypeRef, TCFType};
 use super::pixel_route::PixelClickRoute;
 use super::ToolState;
 
+pub(super) fn click_semantic_intent(action: &str) -> super::actionability::semantic::SemanticIntent {
+    if action == "AXPress" {
+        super::actionability::semantic::SemanticIntent::Click
+    } else {
+        super::actionability::semantic::SemanticIntent::PerformAction(action.to_owned())
+    }
+}
+
 pub(super) async fn dispatch_custom_action<C, P, A, F, T>(
     clock: &(impl cua_driver_core::actionability::Clock + Sync),
     budget: std::time::Duration,
@@ -1867,7 +1875,7 @@ impl ClickTool {
             let action_lease = _mutation_lease.take();
             let probe_target = element_guard.clone();
             let clock = super::actionability::semantic_clock();
-            let use_battery = effective_action == "press";
+            let use_battery = matches!(click_semantic_intent(&resolved_action), super::actionability::semantic::SemanticIntent::Click);
             let perform = |action_lease| async move {
                 let prior_front = apps::frontmost_pid();
                 let snapshot = if foreground {
@@ -1968,9 +1976,7 @@ impl ClickTool {
                             probe_target.clone(),
                             pid,
                             wid,
-                            super::actionability::semantic::SemanticIntent::PerformAction(
-                                action.clone(),
-                            ),
+                            click_semantic_intent(action),
                         )
                     },
                     |(lease, _)| perform(lease),
