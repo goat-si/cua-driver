@@ -836,6 +836,23 @@ fn type_text_outcome_result(
 /// `effect:"unverifiable"`, so the caller reads the field before typing again.
 pub(crate) fn text_delivery_failure(prefix: &str, error: &anyhow::Error) -> ToolResult {
     let message = format!("{prefix}: {error:#}");
+    if let Some(write) = error.downcast_ref::<TextWriteError>() {
+        let effect = if write.chain.no_input() {
+            "refused"
+        } else {
+            "unverifiable"
+        };
+        let mut result = ToolResult::error(message).with_structured(serde_json::json!({
+            "path": "ax", "effect": effect, "verified": false,
+        }));
+        if let Some(disposition) = write.chain.error_disposition(
+            cua_driver_core::mutation::Postcondition::Indeterminate,
+            false,
+        ) {
+            result = result.with_disposition(disposition);
+        }
+        return result;
+    }
     match error.downcast_ref::<crate::input::keyboard::PasteMayHaveLanded>() {
         Some(paste) => ToolResult::error(format!(
             "{message}. Read the field before typing the text again."
@@ -848,6 +865,13 @@ pub(crate) fn text_delivery_failure(prefix: &str, error: &anyhow::Error) -> Tool
         })),
         None => ToolResult::error(message),
     }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+struct TextWriteError {
+    message: String,
+    chain: cua_driver_core::mutation::ChainResult,
 }
 
 // ── Blocking implementation ───────────────────────────────────────────────────
@@ -1819,7 +1843,15 @@ fn cgevent_type_verified(
             crate::input::keyboard::press_key(pid, "a", &["command"])?;
             wait_for_full_selection(pid, wid, ptr, before)
         } else {
-            select_entire_native_value(pid, wid, ptr, before)
+            // The element focus write above has already run, independently of
+            // the following selected-range setter.
+            match select_entire_native_value(pid, wid, ptr, before, cua_driver_core::mutation::PriorInput::MayHaveDelivered) {
+                FullSelection::Selected => true,
+                FullSelection::Unsupported => false,
+                FullSelection::AllocationFailed(chain) => return Err(TextWriteError { message: "Could not allocate the full-selection range; no replacement payload was sent".into(), chain }.into()),
+                FullSelection::NativeFailed(error, chain) => return Err(TextWriteError { message: format!("AXSelectedTextRange returned error {error}; no replacement payload was sent"), chain }.into()),
+                FullSelection::Unconfirmed(chain) => return Err(TextWriteError { message: "Full selection was not confirmed; no replacement payload was sent".into(), chain }.into()),
+            }
         };
         if !selected {
             if web_delivery {
@@ -2089,32 +2121,99 @@ fn replacement_text_role_allowed(role: &str, subrole: &str) -> bool {
     )
 }
 
-fn select_entire_native_value(pid: i32, window_id: u32, element_ptr: usize, before: &str) -> bool {
+enum FullSelection {
+    Selected,
+    Unsupported,
+    AllocationFailed(cua_driver_core::mutation::ChainResult),
+    NativeFailed(i32, cua_driver_core::mutation::ChainResult),
+    Unconfirmed(cua_driver_core::mutation::ChainResult),
+}
+
+fn select_entire_with(
+    settable: crate::ax::write_outcome::Settable,
+    prior: cua_driver_core::mutation::PriorInput,
+    allocate: impl FnOnce() -> bool,
+    send: impl FnOnce() -> i32,
+    confirm: impl FnOnce() -> bool,
+) -> FullSelection {
+    use crate::ax::write_outcome::{native_write_outcome, NativeWriteKind, Settable};
+    use cua_driver_core::mutation::{ChainResult, WriteOutcome};
+    if settable == Settable::No {
+        let outcome = native_write_outcome(
+            NativeWriteKind::SetAttribute,
+            false,
+            &settable,
+            kAXErrorSuccess,
+        );
+        let _chain = ChainResult::from_recorded(vec![outcome], prior).expect("one selection rung");
+        return FullSelection::Unsupported;
+    }
+    if !allocate() {
+        let outcome = native_write_outcome(
+            NativeWriteKind::SetAttribute,
+            false,
+            &settable,
+            kAXErrorSuccess,
+        );
+        return FullSelection::AllocationFailed(
+            ChainResult::from_recorded(vec![outcome], prior).expect("one selection rung"),
+        );
+    }
+    let error = send();
+    let outcome = native_write_outcome(NativeWriteKind::SetAttribute, true, &settable, error);
+    let chain = ChainResult::from_recorded(vec![outcome], prior).expect("one selection rung");
+    if outcome != WriteOutcome::Delivered {
+        return FullSelection::NativeFailed(error, chain);
+    }
+    if confirm() {
+        FullSelection::Selected
+    } else {
+        FullSelection::Unconfirmed(chain)
+    }
+}
+
+fn select_entire_native_value(
+    pid: i32,
+    window_id: u32,
+    element_ptr: usize,
+    before: &str,
+    prior: cua_driver_core::mutation::PriorInput,
+) -> FullSelection {
     use core_foundation::{base::TCFType, string::CFString};
     let element = element_ptr as AXUIElementRef;
     let range = CfRange {
         location: 0,
         length: before.encode_utf16().count() as isize,
     };
-    let value = unsafe {
-        crate::ax::bindings::AXValueCreate(
-            crate::ax::bindings::kAXValueCFRangeType,
-            &range as *const CfRange as *const _,
-        )
-    };
-    if value.is_null() {
-        return false;
-    }
-    let attr = CFString::new(SELECTED_RANGE);
-    let _ = unsafe {
-        crate::ax::bindings::AXUIElementSetAttributeValue(
-            element,
-            attr.as_concrete_TypeRef(),
-            value as _,
-        )
-    };
-    unsafe { CFRelease(value as _) };
-    wait_for_full_selection(pid, window_id, element_ptr, before)
+    let value = std::cell::Cell::new(std::ptr::null());
+    let settable = unsafe { crate::ax::write_outcome::query_settable(element, SELECTED_RANGE) };
+    select_entire_with(
+        settable,
+        prior,
+        || {
+            let allocated = unsafe {
+                crate::ax::bindings::AXValueCreate(
+                    crate::ax::bindings::kAXValueCFRangeType,
+                    &range as *const CfRange as *const _,
+                )
+            };
+            value.set(allocated);
+            !allocated.is_null()
+        },
+        || {
+            let attr = CFString::new(SELECTED_RANGE);
+            let error = unsafe {
+                crate::ax::bindings::AXUIElementSetAttributeValue(
+                    element,
+                    attr.as_concrete_TypeRef(),
+                    value.get() as _,
+                )
+            };
+            unsafe { CFRelease(value.get() as _) };
+            error
+        },
+        || wait_for_full_selection(pid, window_id, element_ptr, before),
+    )
 }
 
 fn wait_for_full_selection(pid: i32, window_id: u32, element_ptr: usize, before: &str) -> bool {
@@ -3101,6 +3200,84 @@ pub(super) fn restore_decision(
         Some(true) => RestoreDecision::Restore,
         Some(false) => RestoreDecision::NotNeeded,
         None => RestoreDecision::Refuse,
+    }
+}
+
+#[cfg(test)]
+mod selection_outcome_tests {
+    use super::*;
+    use crate::ax::bindings::{kAXErrorAPIDisabled, kAXErrorCannotComplete};
+    use crate::ax::write_outcome::Settable;
+    use cua_driver_core::mutation::{Postcondition, PriorInput};
+    use std::cell::Cell;
+
+    #[test]
+    fn select_all_keeps_preflight_allocation_write_and_confirmation_distinct() {
+        let calls = Cell::new(0);
+        let absent = select_entire_with(
+            Settable::No,
+            PriorInput::None,
+            || panic!("unsupported must not allocate"),
+            || panic!("unsupported must not write"),
+            || panic!("unsupported must not confirm"),
+        );
+        assert!(matches!(absent, FullSelection::Unsupported));
+        let alloc = select_entire_with(
+            Settable::Yes,
+            PriorInput::None,
+            || false,
+            || panic!("allocation failed"),
+            || panic!("allocation failed"),
+        );
+        let FullSelection::AllocationFailed(chain) = alloc else {
+            panic!("allocation failure was lost");
+        };
+        assert!(chain.no_input());
+        for error in [kAXErrorCannotComplete, kAXErrorAPIDisabled] {
+            let result = select_entire_with(
+                Settable::Yes,
+                PriorInput::MayHaveDelivered,
+                || true,
+                || {
+                    calls.set(calls.get() + 1);
+                    error
+                },
+                || panic!("failed write must not be confirmed"),
+            );
+            let FullSelection::NativeFailed(raw, chain) = result else {
+                panic!("native error was lost");
+            };
+            assert_eq!(raw, error);
+            assert_eq!(
+                chain.error_disposition(Postcondition::Indeterminate, false),
+                Some(cua_driver_contract::ErrorDisposition::SUSPECTED_NOOP)
+            );
+        }
+        assert_eq!(calls.get(), 2);
+        let result = select_entire_with(
+            Settable::Yes,
+            PriorInput::None,
+            || true,
+            || kAXErrorSuccess,
+            || false,
+        );
+        let FullSelection::Unconfirmed(chain) = result else {
+            panic!("confirmation failure was lost");
+        };
+        assert_eq!(
+            chain.error_disposition(Postcondition::Indeterminate, false),
+            Some(cua_driver_contract::ErrorDisposition::DELIVERED)
+        );
+        assert!(matches!(
+            select_entire_with(
+                Settable::Yes,
+                PriorInput::None,
+                || true,
+                || kAXErrorSuccess,
+                || true
+            ),
+            FullSelection::Selected
+        ));
     }
 }
 
