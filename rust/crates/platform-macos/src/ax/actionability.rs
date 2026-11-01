@@ -1,5 +1,11 @@
-//! Isolated accessibility reads for the actionability adapter.
+//! State-preserving, content-free accessibility reads for actionability.
 use super::bindings::*;
+use core_foundation::{
+    array::{CFArrayGetCount, CFArrayGetValueAtIndex, CFArrayRef},
+    base::{CFGetTypeID, CFRelease, CFTypeRef, TCFType},
+    boolean::CFBoolean,
+    string::CFString,
+};
 use cua_driver_core::actionability::{Evidence, Rect};
 
 pub(crate) trait Reader {
@@ -11,37 +17,129 @@ pub(crate) trait Reader {
     fn settable(&mut self, element: Self::Element, attribute: &str) -> Evidence<bool>;
 }
 
-/// The element must remain valid for every call made through this reader.
+/// A native reader; callers must provide a live retained element for every read.
 pub(crate) struct NativeReader;
 
-impl Reader for NativeReader {
-    type Element = AXUIElementRef;
-
-    fn boolean(&mut self, element: Self::Element, attribute: &str) -> Evidence<bool> {
-        unsafe { copy_bool_attr(element, attribute) }.map_or(Evidence::Absent, Evidence::Known)
-    }
-    fn string(&mut self, element: Self::Element, attribute: &str) -> Evidence<String> {
-        assert_ne!(attribute, "AXValue");
-        assert_ne!(attribute, "AXSelectedText");
-        unsafe { copy_string_attr(element, attribute) }.map_or(Evidence::Absent, Evidence::Known)
-    }
-    fn actions(&mut self, element: Self::Element) -> Evidence<Vec<String>> {
-        Evidence::Known(unsafe { copy_action_names(element) })
-    }
-    fn frame(&mut self, element: Self::Element) -> Evidence<Rect> {
-        unsafe { element_screen_rect(element) }.map_or(Evidence::Absent, |[x, y, width, height]| {
-            Evidence::Known(Rect { x, y, width, height })
-        })
-    }
-    fn settable(&mut self, element: Self::Element, attribute: &str) -> Evidence<bool> {
-        Evidence::Known(unsafe { is_attribute_settable(element, attribute) })
+fn error<T>(code: AXError) -> Evidence<T> {
+    if code == kAXErrorAttributeUnsupported || code == kAXErrorNoValue {
+        Evidence::Absent
+    } else {
+        Evidence::Unknown(format!("AX error {code}"))
     }
 }
 
-// Initial compatibility seam: like the existing helpers, failures disappear.
-pub(crate) fn observe<T>(evidence: Evidence<T>) -> Evidence<T> {
-    match evidence {
-        Evidence::Unknown(_) => Evidence::Absent,
-        other => other,
+unsafe fn attr<T>(
+    element: AXUIElementRef,
+    name: &str,
+    decode: impl FnOnce(CFTypeRef) -> Option<T>,
+) -> Evidence<T> {
+    assert!(
+        name != "AXValue" && name != "AXSelectedText",
+        "content reads are forbidden"
+    );
+    let attribute = CFString::new(name);
+    let mut value: CFTypeRef = std::ptr::null();
+    let code = AXUIElementCopyAttributeValue(element, attribute.as_concrete_TypeRef(), &mut value);
+    let result = if code != kAXErrorSuccess {
+        error(code)
+    } else if value.is_null() {
+        Evidence::Absent
+    } else {
+        decode(value).map_or_else(
+            || Evidence::Unknown(format!("wrong CF type for {name}")),
+            Evidence::Known,
+        )
+    };
+    if !value.is_null() {
+        CFRelease(value);
     }
+    result
+}
+
+impl Reader for NativeReader {
+    type Element = AXUIElementRef;
+    fn boolean(&mut self, element: Self::Element, attribute: &str) -> Evidence<bool> {
+        assert!(!cfg!(test), "live AX access is forbidden in tests");
+        unsafe {
+            attr(element, attribute, |v| {
+                (CFGetTypeID(v) == CFBoolean::type_id())
+                    .then(|| CFBoolean::wrap_under_get_rule(v as _).into())
+            })
+        }
+    }
+    fn string(&mut self, element: Self::Element, attribute: &str) -> Evidence<String> {
+        assert!(!cfg!(test), "live AX access is forbidden in tests");
+        assert_eq!(attribute, "AXRole", "only target role can be read");
+        unsafe { attr(element, attribute, |v| string_from_cf(v)) }
+    }
+    fn actions(&mut self, element: Self::Element) -> Evidence<Vec<String>> {
+        assert!(!cfg!(test), "live AX access is forbidden in tests");
+        unsafe {
+            let mut names: CFArrayRef = std::ptr::null();
+            let code = AXUIElementCopyActionNames(element, &mut names);
+            if code != kAXErrorSuccess {
+                if !names.is_null() {
+                    CFRelease(names as CFTypeRef);
+                }
+                return error(code);
+            }
+            if names.is_null() {
+                return Evidence::Absent;
+            }
+            if CFGetTypeID(names as CFTypeRef)
+                != core_foundation::array::CFArray::<CFTypeRef>::type_id()
+            {
+                CFRelease(names as CFTypeRef);
+                return Evidence::Unknown("wrong CF type for action names".into());
+            }
+            let mut actions = Vec::new();
+            for i in 0..CFArrayGetCount(names) {
+                let value = CFArrayGetValueAtIndex(names, i) as CFTypeRef;
+                let Some(action) = string_from_cf(value) else {
+                    CFRelease(names as CFTypeRef);
+                    return Evidence::Unknown("wrong CF type in action names".into());
+                };
+                actions.push(action);
+            }
+            CFRelease(names as CFTypeRef);
+            Evidence::Known(actions)
+        }
+    }
+    fn frame(&mut self, element: Self::Element) -> Evidence<Rect> {
+        assert!(!cfg!(test), "live AX access is forbidden in tests");
+        let (position, size) = unsafe {
+            (
+                attr(element, "AXPosition", |v| point_from_cf(v)),
+                attr(element, "AXSize", |v| size_from_cf(v)),
+            )
+        };
+        match (position, size) {
+            (Evidence::Unknown(e), _) | (_, Evidence::Unknown(e)) => Evidence::Unknown(e),
+            (Evidence::Known((x, y)), Evidence::Known((width, height))) => Evidence::Known(Rect {
+                x,
+                y,
+                width,
+                height,
+            }),
+            _ => Evidence::Absent,
+        }
+    }
+    fn settable(&mut self, element: Self::Element, attribute: &str) -> Evidence<bool> {
+        assert!(!cfg!(test), "live AX access is forbidden in tests");
+        unsafe {
+            let name = CFString::new(attribute);
+            let mut value = 0_u8;
+            let code =
+                AXUIElementIsAttributeSettable(element, name.as_concrete_TypeRef(), &mut value);
+            if code == kAXErrorSuccess {
+                Evidence::Known(value != 0)
+            } else {
+                error(code)
+            }
+        }
+    }
+}
+
+pub(crate) fn observe<T>(evidence: Evidence<T>) -> Evidence<T> {
+    evidence
 }
