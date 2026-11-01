@@ -2021,6 +2021,10 @@ fn walk_element<S: AxTreeSource>(
 ) {
     if depth > max_depth {
         note_skipped();
+        budget.record_cut(IncompleteReason {
+            kind: IncompleteReasonKind::PolicyOmission,
+            detail: IncompleteReasonDetail::DepthLimit,
+        });
         return;
     }
     // Node and time budget: a refused node is counted as discovered but not
@@ -2722,7 +2726,13 @@ fn walk_children<S: AxTreeSource>(
         match source.observed_children(element).into_walk_legacy() {
             Read::Absent => {}
             Read::Known(below) if below.is_empty() => {}
-            Read::Known(_below) => note_skipped(),
+            Read::Known(_below) => {
+                note_skipped();
+                budget.record_cut(IncompleteReason {
+                    kind: IncompleteReasonKind::PolicyOmission,
+                    detail: IncompleteReasonDetail::DepthLimit,
+                });
+            }
             Read::Unknown(_) => note_skipped(),
         }
         return;
@@ -4760,6 +4770,8 @@ mod selectable_row_tests {
     }
 }
 
+#[cfg(test)]
+mod completeness_tests;
 #[cfg(test)]
 mod evidence_preservation_tests;
 #[cfg(test)]
