@@ -880,9 +880,9 @@ jobs:
       - name: The default platform-macos lib run makes no observed live call
         run: python3 tools/macos-live-call-probe/check.py --probe "$RUNNER_TEMP/live.dylib" default "${{ steps.live-probe.outputs.binary }}"
       - name: Run each live platform-macos test alone
-        # The hosted runner's pasteboard is disposable: run.py opts the native
-        # clipboard round trip in for its own process.
-        run: python3 tools/macos-live-tests/run.py "${{ steps.live-probe.outputs.binary }}"
+        # The hosted runner's pasteboard is disposable, so the native clipboard
+        # round trip is allowed to overwrite it here (and only with this flag).
+        run: python3 tools/macos-live-tests/run.py --allow-clipboard "${{ steps.live-probe.outputs.binary }}"
       - name: Run cua-driver-core unit tests on macOS
         working-directory: rust
         run: cargo test --locked -p cua-driver-core --lib
