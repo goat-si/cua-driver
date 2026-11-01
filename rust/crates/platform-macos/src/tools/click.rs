@@ -3091,7 +3091,11 @@ fn ax_click_structured(
 /// selection_verified, selection_via_pixel)`.
 type AxClickOutcome = (String, bool, Option<ClickEvidence>, bool);
 
+#[derive(Clone, Copy)]
+enum SelectionSite { First, PostPress }
+
 async fn dispatch_post_press_selection<C, P, A, F, T>(
+    site: SelectionSite,
     clock: &(impl cua_driver_core::actionability::Clock + Sync),
     budget: std::time::Duration,
     prior: cua_driver_core::mutation::PriorInput,
@@ -3115,6 +3119,10 @@ where
     A: FnOnce(C) -> F,
     F: std::future::Future<Output = T>,
 {
+    // The first site currently writes inside the press worker without a gate.
+    if matches!(site, SelectionSite::First) {
+        return Ok(write(candidate).await);
+    }
     let report = super::actionability::wait(
         clock,
         budget,
@@ -3258,6 +3266,7 @@ async fn run_post_press_selection(
     let prior = history.prior;
     let history_for_write = history.clone();
     let result = dispatch_post_press_selection(
+        SelectionSite::PostPress,
         &clock,
         cua_driver_core::actionability::DEFAULT_BUDGET,
         prior,
@@ -3359,6 +3368,7 @@ mod u32_stage_tests {
         let writes = AtomicUsize::new(0);
         let write_count = &writes;
         let result = dispatch_post_press_selection(
+            SelectionSite::PostPress,
             &FakeClock,
             Duration::ZERO,
             PriorInput::None,
@@ -3401,6 +3411,7 @@ mod u32_stage_tests {
         let probe_binding = current_target.clone();
         let write_binding = current_target.clone();
         let result = dispatch_post_press_selection(
+            SelectionSite::PostPress,
             &FakeClock,
             Duration::ZERO,
             PriorInput::None,
@@ -3478,6 +3489,7 @@ mod u32_stage_tests {
             (PriorInput::MayHaveDelivered, None),
         ] {
             let report = dispatch_post_press_selection(
+                SelectionSite::PostPress,
                 &FakeClock,
                 Duration::ZERO,
                 prior,
@@ -3503,6 +3515,32 @@ mod u32_stage_tests {
             .unwrap_err();
             assert_eq!(report.disposition, expected);
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn selection_gate_refusal_blocks_both_selection_sites() {
+        let writes = [AtomicUsize::new(0), AtomicUsize::new(0)];
+        let mut refused = [false; 2];
+        for (index, site) in [SelectionSite::First, SelectionSite::PostPress].into_iter().enumerate() {
+            let counter = &writes[index];
+            let result = dispatch_post_press_selection(
+                site, &FakeClock, Duration::ZERO, PriorInput::None, 73_u32,
+                |candidate, _| Box::pin(async move {
+                    assert_eq!(*candidate, 73);
+                    ActionabilityReport {
+                        verdict: Verdict::Terminal { code: "disabled", reason: "disabled".into() },
+                        checks: vec![], waited_ms: 0, samples: 0, last_facts: None, disposition: None,
+                    }
+                }),
+                |candidate| async move {
+                    assert_eq!(candidate, 73);
+                    counter.fetch_add(1, Ordering::SeqCst);
+                },
+            ).await;
+            refused[index] = result.is_err();
+        }
+        assert_eq!([writes[0].load(Ordering::SeqCst), writes[1].load(Ordering::SeqCst)], [0, 0], "both refusals must prevent AXSelected");
+        assert_eq!(refused, [true, true]);
     }
 }
 
