@@ -903,6 +903,23 @@ impl AxAttempt {
     }
 }
 
+fn ax_insert_then_keys<T>(_attempt: AxAttempt, send_keys: impl FnOnce() -> T) -> T {
+    send_keys()
+}
+
+fn ax_attempt_from_progress(
+    progress: Option<TypedProgress>,
+    unchanged_web_readback: bool,
+) -> AxAttempt {
+    match progress {
+        Some(TypedProgress::Unchanged) if unchanged_web_readback => AxAttempt::Unverifiable,
+        Some(TypedProgress::Unchanged) => AxAttempt::Unchanged,
+        Some(TypedProgress::Unverifiable) => AxAttempt::Unverifiable,
+        None => AxAttempt::Rejected,
+        Some(TypedProgress::Complete | TypedProgress::Partial(_)) => unreachable!(),
+    }
+}
+
 fn synthesis_preflight(
     route: TextDeliveryRoute,
     requested_chars: usize,
@@ -1191,6 +1208,33 @@ fn replacement_readable(
     Ok(())
 }
 
+// Preserve the replacement sequence in one place so the native route and
+// deterministic tests observe the same write, readback and document mark.
+fn replace_ax_with(
+    attribute: &str,
+    before: &str,
+    text: &str,
+    send: impl FnOnce() -> i32,
+    read: impl FnOnce() -> crate::ax::write_outcome::ValueRead,
+    mark: impl FnOnce(),
+    verify: impl FnOnce() -> (bool, Option<usize>),
+) -> anyhow::Result<(bool, Option<usize>)> {
+    let err = send();
+    if err != kAXErrorSuccess {
+        let after = read();
+        if after == crate::ax::write_outcome::ValueRead::Withheld {
+            return Ok((false, None));
+        }
+        if after.text().as_deref() != Some(text) {
+            anyhow::bail!("AXUIElementSetAttributeValue({attribute}) failed with error {err}; replacement was not confirmed and no retry was sent")
+        }
+    }
+    if before != text {
+        mark();
+    }
+    Ok(verify())
+}
+
 enum InsertRead {
     Withheld,
     Readable { error: i32, value: Option<String> },
@@ -1275,6 +1319,16 @@ fn typed_progress(before: Option<&str>, after: Option<&str>, text: &str) -> Type
     } else {
         TypedProgress::Partial(delivered)
     }
+}
+
+fn ax_insert_progress(
+    before: Option<&str>,
+    after: Option<&str>,
+    text: &str,
+    _selection: Option<(usize, usize)>,
+    _bound: bool,
+) -> TypedProgress {
+    typed_progress(before, after, text)
 }
 
 /// Read the focused/target field's `AXValue`, for before/after read-back.
@@ -1721,28 +1775,30 @@ fn cgevent_type_verified(
                     "replace:true selection outcome was uncertain and the target changed; no AXValue fallback was sent"
                 )
             }
-            let err = unsafe { set_string_attr(element, "AXValue", text) };
-            if err != kAXErrorSuccess {
-                let after = crate::ax::write_outcome::read_value_if_allowed(
-                    &mut crate::ax::label_reader::NativeLabelReader,
-                    element,
-                );
-                if after == crate::ax::write_outcome::ValueRead::Withheld {
-                    return Ok((false, None, true));
-                }
-                if after.text().as_deref() != Some(text) {
-                    anyhow::bail!("AXUIElementSetAttributeValue(AXValue) failed with error {err}; replacement was not confirmed and no retry was sent")
-                }
-            }
-            if before != text {
-                let _ = unsafe {
-                    crate::document_edit::ensure_marked_after_ax_write(pid, element, false)
-                };
-            }
-            let deadline = std::time::Instant::now() + DELIVERY_DRAIN_TIMEOUT;
-            let (verified, delivered) = await_replacement_delivery(text, deadline, || {
-                read_axvalue_bound(pid, element_ptr_and_idx, window_id)
-            });
+            let (verified, delivered) = replace_ax_with(
+                "AXValue",
+                before,
+                text,
+                || unsafe { set_string_attr(element, "AXValue", text) },
+                || {
+                    crate::ax::write_outcome::read_value_if_allowed(
+                        &mut crate::ax::label_reader::NativeLabelReader,
+                        element,
+                    )
+                },
+                || {
+                    let _ = unsafe {
+                        crate::document_edit::ensure_marked_after_ax_write(pid, element, false)
+                    };
+                },
+                || {
+                    await_replacement_delivery(
+                        text,
+                        std::time::Instant::now() + DELIVERY_DRAIN_TIMEOUT,
+                        || read_axvalue_bound(pid, element_ptr_and_idx, window_id),
+                    )
+                },
+            )?;
             return Ok((verified, delivered, true));
         }
         if web_delivery {
@@ -1752,26 +1808,31 @@ fn cgevent_type_verified(
                 crate::input::keyboard::type_text_with_delay(pid, text, delay_ms)?;
             }
         } else {
-            let err = unsafe { set_string_attr(element, "AXSelectedText", text) };
-            if err != kAXErrorSuccess {
-                let after = crate::ax::write_outcome::read_value_if_allowed(
-                    &mut crate::ax::label_reader::NativeLabelReader,
-                    element,
-                );
-                if after == crate::ax::write_outcome::ValueRead::Withheld {
-                    return Ok((false, None, true));
-                }
-                if after.text().as_deref() != Some(text) {
-                    anyhow::bail!(
-                        "AXUIElementSetAttributeValue(AXSelectedText) failed with error {err}; replacement was not confirmed and no retry was sent"
+            let (verified, delivered) = replace_ax_with(
+                "AXSelectedText",
+                before,
+                text,
+                || unsafe { set_string_attr(element, "AXSelectedText", text) },
+                || {
+                    crate::ax::write_outcome::read_value_if_allowed(
+                        &mut crate::ax::label_reader::NativeLabelReader,
+                        element,
                     )
-                }
-            }
-            if before != text {
-                let _ = unsafe {
-                    crate::document_edit::ensure_marked_after_ax_write(pid, element, false)
-                };
-            }
+                },
+                || {
+                    let _ = unsafe {
+                        crate::document_edit::ensure_marked_after_ax_write(pid, element, false)
+                    };
+                },
+                || {
+                    await_replacement_delivery(
+                        text,
+                        std::time::Instant::now() + DELIVERY_DRAIN_TIMEOUT,
+                        || read_axvalue_bound(pid, element_ptr_and_idx, window_id),
+                    )
+                },
+            )?;
+            return Ok((verified, delivered, true));
         }
         let deadline = std::time::Instant::now() + DELIVERY_DRAIN_TIMEOUT;
         let (verified, delivered) = await_replacement_delivery(text, deadline, || {
@@ -2665,6 +2726,13 @@ fn type_text_in_key_window(
     } else if let Some((element, owns, idx_opt)) = ax_target {
         let role = unsafe { copy_string_attr(element, "AXRole") }.unwrap_or_default();
         let title = unsafe { copy_string_attr(element, "AXTitle") }.unwrap_or_default();
+        let selection = if before_withheld {
+            None
+        } else {
+            unsafe { selected_range(element) }
+        };
+        let bound =
+            window_id.is_some_and(|wid| element_in_requested_window(pid, wid, element as usize));
         let insertion = send_ax_insert_and_read(
             before_withheld,
             || unsafe { set_string_attr(element, "AXSelectedText", text) },
@@ -2699,7 +2767,13 @@ fn type_text_in_key_window(
             InsertRead::Readable { error, value } => (error, value),
         };
         let ax_progress = if err == kAXErrorSuccess {
-            Some(typed_progress(before.as_deref(), after.as_deref(), text))
+            Some(ax_insert_progress(
+                before.as_deref(),
+                after.as_deref(),
+                text,
+                selection,
+                bound,
+            ))
         } else {
             None
         };
@@ -2745,13 +2819,7 @@ fn type_text_in_key_window(
                 web_area: outcome_web_area,
             }));
         }
-        ax_attempt = match ax_progress {
-            Some(TypedProgress::Unchanged) if unchanged_web_readback => AxAttempt::Unverifiable,
-            Some(TypedProgress::Unchanged) => AxAttempt::Unchanged,
-            Some(TypedProgress::Unverifiable) => AxAttempt::Unverifiable,
-            None => AxAttempt::Rejected,
-            Some(TypedProgress::Complete | TypedProgress::Partial(_)) => unreachable!(),
-        };
+        ax_attempt = ax_attempt_from_progress(ax_progress, unchanged_web_readback);
         tracing::debug!(
             "AX write did not land for {role} \"{title}\" (err={err}); \
              falling back to CGEvent keystrokes"
@@ -2782,25 +2850,27 @@ fn type_text_in_key_window(
     // --- Background rung 2: CGEvent keystrokes with read-back. ---
     // Never clear here: a partial AX write is rare, and clearing would violate
     // insert-at-cursor semantics.
-    let (verified, delivered_chars, ax_replacement) = cgevent_type_verified(
-        KeyReceiver {
-            pid,
-            window_id,
-            element: element_ptr_and_idx,
-        },
-        KeyTextRequest {
-            text,
-            delay_ms,
-            settle_ms: 0,
-            replace,
-            single_terminal_return: chromium_native_submission,
-        },
-        before.as_deref(),
-        KeyFocusChecks {
-            exact_focus: focused_key_route,
-            recheck_editability_after_settle: false,
-        },
-    )?;
+    let (verified, delivered_chars, ax_replacement) = ax_insert_then_keys(ax_attempt, || {
+        cgevent_type_verified(
+            KeyReceiver {
+                pid,
+                window_id,
+                element: element_ptr_and_idx,
+            },
+            KeyTextRequest {
+                text,
+                delay_ms,
+                settle_ms: 0,
+                replace,
+                single_terminal_return: chromium_native_submission,
+            },
+            before.as_deref(),
+            KeyFocusChecks {
+                exact_focus: focused_key_route,
+                recheck_editability_after_settle: false,
+            },
+        )
+    })?;
     Ok(TypeTextDelivery::Typed(TypeTextOutcome {
         detail: if ax_replacement {
             " via verified native whole-field replacement".to_owned()
@@ -2955,6 +3025,80 @@ pub(super) fn restore_decision(
         Some(true) => RestoreDecision::Restore,
         Some(false) => RestoreDecision::NotNeeded,
         None => RestoreDecision::Refuse,
+    }
+}
+
+#[cfg(test)]
+mod u32_outcome_tests {
+    use super::*;
+    use crate::ax::bindings::{kAXErrorCannotComplete, kAXErrorIllegalArgument};
+    use crate::ax::write_outcome::{ValueObs, ValueRead};
+    use std::cell::Cell;
+
+    #[test]
+    fn replace_axvalue_timeout_with_matching_readback_sends_no_document_keys() {
+        let marks = Cell::new(0);
+        let result = replace_ax_with(
+            "AXValue",
+            "old",
+            "new",
+            || kAXErrorCannotComplete,
+            || ValueRead::Allowed(ValueObs::Text("new".into())),
+            || marks.set(marks.get() + 1),
+            || (true, Some(3)),
+        );
+        assert_eq!(marks.get(), 0, "uncertain write must not mark the document");
+        assert!(
+            result.is_err(),
+            "late readback cannot confirm a timed-out write"
+        );
+    }
+
+    #[test]
+    fn replace_selected_text_illegal_argument_is_sent_unconfirmed() {
+        let marks = Cell::new(0);
+        let result = replace_ax_with(
+            "AXSelectedText",
+            "old",
+            "new",
+            || kAXErrorIllegalArgument,
+            || ValueRead::Allowed(ValueObs::Text("new".into())),
+            || marks.set(marks.get() + 1),
+            || (true, Some(3)),
+        );
+        assert!(
+            result.is_err(),
+            "sent illegal-argument error remains unconfirmed"
+        );
+        assert_eq!(marks.get(), 0);
+    }
+
+    #[test]
+    fn insert_timeout_never_falls_through_to_keys() {
+        let insertion = send_ax_insert_and_read(
+            false,
+            || kAXErrorCannotComplete,
+            || ValueRead::Allowed(ValueObs::Text("old".into())),
+        );
+        let attempt = match insertion {
+            InsertRead::Readable { error, .. } if error != kAXErrorSuccess => {
+                ax_attempt_from_progress(None, false)
+            }
+            _ => panic!("expected the native timeout"),
+        };
+        let keys = Cell::new(0);
+        ax_insert_then_keys(attempt, || keys.set(keys.get() + 1));
+        assert_eq!(keys.get(), 0, "a timed-out insertion must not post keys");
+    }
+
+    #[test]
+    fn utf16_selected_splice_requires_exact_bound_target() {
+        let progress = ax_insert_progress(Some("😀old"), Some("😀oldx"), "😀", Some((2, 0)), false);
+        assert_eq!(
+            progress,
+            TypedProgress::Unverifiable,
+            "a pre-existing substring is not an inserted splice"
+        );
     }
 }
 
