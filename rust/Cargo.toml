@@ -60,7 +60,7 @@ hmac = "0.12"
 
 # Build scripts and proc macros run on the build host and are never shipped. Release builds strip
 # them by default, and Xcode 27's strip leaves release proc-macro dylibs that rustc cannot load
-# ("can't find crate for `serde_derive`"), so leave them unstripped (goat-si/cua-driver#26).
+# ("can't find crate for `serde_derive`"), so leave them unstripped (goat-si/goat-cu#26).
 # Shipped binaries keep the release profile's default stripping.
 [profile.release.build-override]
 strip = "none"
