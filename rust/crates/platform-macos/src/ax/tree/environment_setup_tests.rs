@@ -637,6 +637,7 @@ fn shared_entry_preserves_application_creation_failure() {
 #[test]
 fn final_deadline_sample_is_diagnostic_only() {
     use cua_driver_core::walk_budget::WalkBudget;
+    let evidence = crate::ax::evidence::EvidenceScope::start();
     let budget = WalkBudget::nodes_only(100);
     let ledger = super::SkipLedger::start();
     let (result, sample) = super::finalize_with_deadline_sample(
@@ -654,6 +655,7 @@ fn final_deadline_sample_is_diagnostic_only() {
     assert_eq!(result.walk.stop, None);
     assert!(!result.nodes_skipped);
     assert!(result.tree_markdown.is_empty());
+    assert!(evidence.finish(()).evidence.is_empty());
 }
 
 #[test]

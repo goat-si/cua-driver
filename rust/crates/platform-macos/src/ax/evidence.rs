@@ -54,7 +54,12 @@ pub(crate) fn current_owner() -> Option<usize> {
 
 /// Read the current walk's observations without draining its diagnostic record.
 pub(crate) fn current_evidence() -> Vec<ReadEvidence> {
-    WALK_EVIDENCE.with(|cell| cell.borrow().clone().unwrap_or_default())
+    WALK_EVIDENCE.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .expect("walk evidence scope must remain active")
+            .clone()
+    })
 }
 
 pub(crate) struct EvidenceOwner(Option<usize>);

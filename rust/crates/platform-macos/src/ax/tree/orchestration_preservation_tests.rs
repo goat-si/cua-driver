@@ -513,6 +513,7 @@ fn production_duplicate_and_foreign_menus_keep_legacy_skip() {
 
 #[test]
 fn production_finalizer_samples_deadline_without_enforcing_it() {
+    let evidence = super::super::evidence::EvidenceScope::start();
     let ledger = SkipLedger::start();
     let (result, sampled) = finalize_with_deadline_sample(
         vec![],
@@ -543,6 +544,7 @@ fn production_finalizer_samples_deadline_without_enforcing_it() {
     );
     assert_eq!(result.tree_markdown, "");
     assert!(result.nodes.is_empty());
+    assert!(evidence.finish(()).evidence.is_empty());
 }
 
 #[test]
