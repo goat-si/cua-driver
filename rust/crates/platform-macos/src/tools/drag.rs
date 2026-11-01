@@ -198,8 +198,8 @@ impl DragTool {
             };
             let (from_x, from_y, to_x, to_y) = (input.from_x, input.from_y, input.to_x, input.to_y);
             let converted = [
-                Some(super::desktop_screenshot_point(from_x, from_y)),
-                Some(super::desktop_screenshot_point(to_x, to_y)),
+                super::desktop_screenshot_point(from_x, from_y),
+                super::desktop_screenshot_point(to_x, to_y),
             ];
             return super::dispatch_desktop_points(
                 "drag",

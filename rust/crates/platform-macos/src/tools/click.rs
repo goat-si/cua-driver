@@ -1322,7 +1322,7 @@ impl ClickTool {
             // center-pixel pick warps to the corner (off by the backing scale).
             let converted = match super::desktop_click_point(
                 capture_id.as_deref(),
-                || Some(super::desktop_screenshot_point(sx_shot, sy_shot)),
+                || super::desktop_screenshot_point(sx_shot, sy_shot),
                 |id| {
                     self.state
                         .capture_bindings

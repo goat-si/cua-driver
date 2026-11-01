@@ -48,9 +48,10 @@ async fn inventory_result<F>(inventory: F) -> ToolResult
 where
     F: FnOnce() -> Vec<crate::apps::AppInfo> + Send + 'static,
 {
-    let apps = tokio::task::spawn_blocking(inventory)
-        .await
-        .unwrap_or_default();
+    let apps = match tokio::task::spawn_blocking(inventory).await {
+        Ok(apps) => apps,
+        Err(error) => return ToolResult::error(format!("app inventory task failed: {error}")),
+    };
     let text = crate::apps::format_app_list(&apps);
     let structured = serde_json::json!({
         "apps": apps.iter().map(app_record_json).collect::<Vec<_>>()

@@ -1323,9 +1323,9 @@ pub fn load_driver_config() -> DriverConfig {
 }
 
 /// Convert native pixels from `get_desktop_state` into logical points.
-pub fn desktop_screenshot_point(x: f64, y: f64) -> (f64, f64) {
-    let ratio = get_screen_size::main_screen_size().map_or(1.0, |(_, _, s)| s);
-    (x / ratio, y / ratio)
+pub fn desktop_screenshot_point(x: f64, y: f64) -> Option<(f64, f64)> {
+    let (_, _, ratio) = get_screen_size::main_screen_size()?;
+    Some((x / ratio, y / ratio))
 }
 
 fn desktop_click_point<C, B>(
@@ -1344,8 +1344,8 @@ where
 }
 
 async fn dispatch_desktop_points<const N: usize, F, Fut>(
-    _tool: &str,
-    originals: [(f64, f64); N],
+    tool: &str,
+    _originals: [(f64, f64); N],
     converted: [Option<(f64, f64)>; N],
     dispatch: F,
 ) -> ToolResult
@@ -1353,7 +1353,16 @@ where
     F: FnOnce([(f64, f64); N]) -> Fut,
     Fut: std::future::Future<Output = ToolResult>,
 {
-    let points = std::array::from_fn(|i| converted[i].unwrap_or(originals[i]));
+    let mut points = [(0.0, 0.0); N];
+    for (point, converted) in points.iter_mut().zip(converted) {
+        let Some(converted) = converted else {
+            return pre_dispatch_refusal(
+                "desktop_scale_unavailable",
+                format!("{tool}: desktop backing scale unavailable; no input was sent."),
+            );
+        };
+        *point = converted;
+    }
     dispatch(points).await
 }
 

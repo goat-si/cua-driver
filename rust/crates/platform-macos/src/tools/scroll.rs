@@ -163,7 +163,7 @@ impl ScrollTool {
                 ScrollDirection::Right => (0, -step),
                 ScrollDirection::Left => (0, step),
             };
-            let converted = Some(super::desktop_screenshot_point(x, y));
+            let converted = super::desktop_screenshot_point(x, y);
             return super::dispatch_desktop_points(
                 "scroll",
                 [(x, y)],

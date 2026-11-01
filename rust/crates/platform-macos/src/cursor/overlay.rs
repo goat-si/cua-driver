@@ -681,15 +681,17 @@ unsafe fn run_appkit(_cfg: CursorConfig, rx: std::sync::mpsc::Receiver<OverlayMs
     // Fall back to the CG estimator (current-mode pixels ÷ points) when
     // the AppKit call returns a non-positive value, since downstream paint
     // math divides by this and a 0.0 would zero out the cursor.
-    let mut backing_scale: f64 = msg_send![main_screen, backingScaleFactor];
-    if backing_scale.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
+    let appkit_scale: f64 = msg_send![main_screen, backingScaleFactor];
+    let backing_scale = if appkit_scale.is_finite() && appkit_scale > 0.0 {
+        appkit_scale
+    } else {
         use core_graphics::display::CGMainDisplayID;
         let display_id = CGMainDisplayID();
-        backing_scale = crate::tools::get_screen_size::get_backing_scale(display_id);
-        if backing_scale.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
-            backing_scale = 1.0;
-        }
-    }
+        let Some(scale) = crate::tools::get_screen_size::get_backing_scale(display_id) else {
+            return;
+        };
+        scale
+    };
 
     // ---- NSWindow: single alloc + initWithContentRect:... ----
     let win: *mut AnyObject = {
@@ -1035,7 +1037,7 @@ fn main_display_geometry(applied: Option<SurfaceGeometry>) -> Option<SurfaceGeom
     );
     let scale = match applied {
         Some(applied) if applied.frame == frame => applied.scale,
-        _ => crate::tools::get_screen_size::get_backing_scale(display_id),
+        _ => crate::tools::get_screen_size::get_backing_scale(display_id)?,
     };
     Some(SurfaceGeometry::new(frame, scale))
 }

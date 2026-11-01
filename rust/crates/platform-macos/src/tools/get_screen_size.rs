@@ -47,7 +47,7 @@ impl Tool for GetScreenSizeTool {
                         "width": w, "height": h, "scale_factor": scale,
                     }))
             }
-            None => ToolResult::error("No main display detected."),
+            None => ToolResult::error("Main display or its backing scale is unavailable."),
         }
     }
 }
@@ -73,30 +73,29 @@ pub(crate) fn main_screen_size() -> Option<(i64, i64, f64)> {
         return None;
     }
 
-    let scale = get_backing_scale(display_id);
+    let scale = get_backing_scale(display_id)?;
     Some((w, h, scale))
 }
 
 /// Return the current display mode's backing-pixel to point ratio.
-pub(crate) fn get_backing_scale(display_id: u32) -> f64 {
+pub(crate) fn get_backing_scale(display_id: u32) -> Option<f64> {
     use core_graphics::display::CGDisplay;
 
     let mode = CGDisplay::new(display_id)
         .display_mode()
         .map(|mode| (mode.width(), mode.pixel_width()));
-    backing_scale_from_mode(mode).unwrap_or(1.0)
+    backing_scale_from_mode(mode)
 }
 
 fn backing_scale_from_mode(mode: Option<(u64, u64)>) -> Option<f64> {
-    let Some((point_width, pixel_width)) = mode else {
-        return Some(1.0);
-    };
+    let (point_width, pixel_width) = mode?;
     if point_width == 0 || pixel_width == 0 {
-        return Some(1.0);
+        return None;
     }
     let ratio = pixel_width as f64 / point_width as f64;
     // Round to nearest 0.5 to avoid floating point noise.
-    Some((ratio * 2.0).round() / 2.0)
+    let scale = (ratio * 2.0).round() / 2.0;
+    (scale > 0.0).then_some(scale)
 }
 
 #[cfg(test)]
@@ -124,17 +123,18 @@ mod tests {
         let actual = get_backing_scale(display.id);
 
         assert_eq!(
-            actual, expected,
+            actual,
+            Some(expected),
             "backing scale should use the current mode's pixel and point widths"
         );
     }
 
     #[test]
-    fn display_mode_widths_preserve_rounding_and_fallbacks() {
+    fn display_mode_widths_preserve_rounding_and_unknowns() {
         assert_eq!(backing_scale_from_mode(Some((1920, 3840))), Some(2.0));
         assert_eq!(backing_scale_from_mode(Some((1920, 2880))), Some(1.5));
-        assert_eq!(backing_scale_from_mode(Some((0, 3840))), Some(1.0));
-        assert_eq!(backing_scale_from_mode(Some((1920, 0))), Some(1.0));
+        assert_eq!(backing_scale_from_mode(Some((0, 3840))), None);
+        assert_eq!(backing_scale_from_mode(Some((1920, 0))), None);
     }
 }
 #[cfg(test)]

@@ -83,7 +83,7 @@ impl MoveCursorTool {
                 Err(result) => return result,
             };
             let (x, y) = (input.x, input.y);
-            let converted = Some(super::desktop_screenshot_point(x, y));
+            let converted = super::desktop_screenshot_point(x, y);
             return super::dispatch_desktop_points(
                 "move_cursor",
                 [(x, y)],
