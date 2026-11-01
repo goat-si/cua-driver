@@ -7295,7 +7295,7 @@ impl Tool for ScrollTool {
                 EventKind::MouseScroll,
             );
         }
-        if let Some(idx) = elem_idx {
+        if elem_idx.is_some() {
             let prev_fg_addr = if delivery == DeliveryMode::Background {
                 Some(unsafe {
                     windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow().0 as isize
