@@ -3414,7 +3414,7 @@ pub fn type_into_editable_with_dispatch(
         async {
             let conn = shared_connection().await?;
             // Focused editable known from the event log: write there directly.
-            if let Some(true) = write_into_focused_editable(conn, pid, text).await? {
+            if focused_write_acknowledged(write_into_focused_editable(conn, pid, text).await?)? {
                 return Ok(());
             }
             let Collected {
@@ -3497,7 +3497,7 @@ pub fn insert_text_with_dispatch(
         dispatch,
         async {
             let conn = shared_connection().await?;
-            if let Some(true) = write_into_focused_editable(conn, pid, text).await? {
+            if focused_write_acknowledged(write_into_focused_editable(conn, pid, text).await?)? {
                 return Ok(true);
             }
             let Collected {
@@ -4522,13 +4522,14 @@ pub fn type_into_editable_ref_with_dispatch(
 }
 
 /// Write `text` into the focused widget known from the focus-event log, if it
-/// is editable. `Some(true)` = written, `Some(false)` = focused but not
-/// editable (or write rejected), `None` = no usable focus record.
+/// is editable. Acknowledged and uncertain writes must not fall through to
+/// another target; `None` means no usable focus record.
 async fn write_into_focused_editable(
     conn: &AccessibilityConnection,
     pid: u32,
     text: &str,
-) -> Result<Option<bool>> {
+) -> Result<Option<crate::text_write_policy::TextWriteOutcome>> {
+    use crate::text_write_policy::{Reason, TextWriteOutcome};
     let Some((acc, oref)) = focused_accessible_via_events(conn, pid).await else {
         return Ok(None);
     };
@@ -4537,20 +4538,72 @@ async fn write_into_focused_editable(
     };
     if !ifaces.contains(Interface::EditableText) {
         dlog!("focused object {} is not editable", oref.path);
-        return Ok(Some(false));
+        return Ok(Some(TextWriteOutcome::NothingWritten {
+            reason: Reason::InsertUnavailable,
+        }));
     }
     match write_into_editable_acc(&acc, ifaces.contains(Interface::Component), text).await {
-        Ok(written) => Ok(Some(written)),
-        Err(error)
-            if error.downcast_ref::<WriteUncertain>().is_some()
-                || error.downcast_ref::<WriteDispatchClosed>().is_some() =>
-        {
-            Err(error)
-        }
+        Ok(true) => Ok(Some(TextWriteOutcome::Acknowledged)),
+        Ok(false) => Ok(Some(TextWriteOutcome::NothingWritten {
+            reason: Reason::Refused,
+        })),
         Err(error) => {
+            if let Some(uncertain) = error.downcast_ref::<WriteUncertain>() {
+                return Ok(Some(TextWriteOutcome::Uncertain {
+                    step: uncertain.step,
+                }));
+            }
+            if let Some(partial) = error.downcast_ref::<WritePartial>() {
+                return Ok(Some(TextWriteOutcome::Partial { step: partial.step }));
+            }
+            if error.downcast_ref::<WriteDispatchClosed>().is_some() {
+                return Err(error);
+            }
             dlog!("focused editable write failed: {error:#}");
-            Ok(Some(false))
+            Ok(Some(TextWriteOutcome::NothingWritten {
+                reason: Reason::InsertUnavailable,
+            }))
         }
+    }
+}
+
+fn focused_write_acknowledged(
+    outcome: Option<crate::text_write_policy::TextWriteOutcome>,
+) -> Result<bool> {
+    use crate::text_write_policy::TextWriteOutcome;
+    match outcome {
+        Some(TextWriteOutcome::Acknowledged) => Ok(true),
+        Some(TextWriteOutcome::Uncertain { step }) => Err(WriteUncertain { step }.into()),
+        Some(TextWriteOutcome::Partial { step }) => Err(WritePartial { step }.into()),
+        Some(TextWriteOutcome::NothingWritten { .. }) | None => Ok(false),
+    }
+}
+
+#[cfg(test)]
+mod focused_write_tests {
+    use super::*;
+    use crate::text_write_policy::{Reason, Step, TextWriteOutcome, WriteStep};
+
+    #[test]
+    fn acknowledged_and_uncertain_outcomes_stop_fallback() {
+        assert!(focused_write_acknowledged(Some(TextWriteOutcome::Acknowledged)).unwrap());
+        let step = WriteStep {
+            step: Step::InsertText,
+            bytes: 3,
+            units: Some(3),
+        };
+        let error =
+            focused_write_acknowledged(Some(TextWriteOutcome::Uncertain { step })).unwrap_err();
+        assert!(error.downcast_ref::<WriteUncertain>().is_some());
+        let error =
+            focused_write_acknowledged(Some(TextWriteOutcome::Partial { step })).unwrap_err();
+        assert!(error.downcast_ref::<WritePartial>().is_some());
+        assert!(
+            !focused_write_acknowledged(Some(TextWriteOutcome::NothingWritten {
+                reason: Reason::Refused
+            }))
+            .unwrap()
+        );
     }
 }
 
