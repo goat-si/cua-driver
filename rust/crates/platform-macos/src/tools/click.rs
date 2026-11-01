@@ -3175,26 +3175,61 @@ fn post_press_should_select(err: crate::ax::bindings::AXError) -> bool {
 fn direct_perform_evidence(
     reason: cua_driver_core::mutation::Reason,
     observe: impl FnOnce() -> Option<ClickEvidence>,
-) -> (cua_driver_core::mutation::WriteOutcome, Option<ClickEvidence>) {
-    let evidence = observe().filter(|evidence| *evidence == ClickEvidence::ToggleChanged);
-    (reason.classify_perform_with_observed_effect(evidence.is_some()), evidence)
+) -> (
+    cua_driver_core::mutation::WriteOutcome,
+    Option<ClickEvidence>,
+) {
+    classify_perform_evidence(
+        cua_driver_core::mutation::WriteOutcome::StopUncertain(reason),
+        observe,
+    )
 }
 
 fn ancestor_perform_evidence(
     outcome: cua_driver_core::mutation::WriteOutcome,
     observe: impl FnOnce() -> Option<ClickEvidence>,
-) -> (cua_driver_core::mutation::WriteOutcome, Option<ClickEvidence>) {
-    let evidence = if outcome == cua_driver_core::mutation::WriteOutcome::Delivered {
-        observe()
-    } else {
-        None
-    };
-    (outcome, evidence)
+) -> (
+    cua_driver_core::mutation::WriteOutcome,
+    Option<ClickEvidence>,
+) {
+    classify_perform_evidence(outcome, observe)
+}
+
+/// Resolve only uninformative Perform errors from fresh target-tied evidence.
+fn classify_perform_evidence(
+    outcome: cua_driver_core::mutation::WriteOutcome,
+    observe: impl FnOnce() -> Option<ClickEvidence>,
+) -> (
+    cua_driver_core::mutation::WriteOutcome,
+    Option<ClickEvidence>,
+) {
+    use cua_driver_core::mutation::{Reason, WriteOutcome};
+    match outcome {
+        WriteOutcome::Delivered => (outcome, observe()),
+        WriteOutcome::StopUncertain(reason @ (Reason::AttributeUnsupported | Reason::NoValue)) => {
+            let evidence = observe().filter(|evidence| {
+                matches!(
+                    evidence,
+                    ClickEvidence::Selected
+                        | ClickEvidence::TitleNamesTarget
+                        | ClickEvidence::ToggleChanged
+                )
+            });
+            (
+                reason.classify_perform_with_observed_effect(evidence.is_some()),
+                evidence,
+            )
+        }
+        _ => (outcome, None),
+    }
 }
 
 #[cfg(test)]
 mod u32_fresh_perform_tests {
-    use super::{ancestor_action_kind, ancestor_perform_evidence, direct_perform_evidence, ClickEvidence};
+    use super::{
+        ancestor_action_kind, ancestor_perform_evidence, classify_perform_evidence,
+        direct_perform_evidence, ClickEvidence,
+    };
     use cua_driver_core::mutation::{Reason, WriteOutcome};
 
     macro_rules! fresh_case {
@@ -3213,16 +3248,39 @@ mod u32_fresh_perform_tests {
         direct_perform_evidence(reason, || Some(evidence))
     }
     fn ancestor(reason: Reason, evidence: ClickEvidence) -> (WriteOutcome, Option<ClickEvidence>) {
-        let chain = vec![(Some("AXCell".into()), vec!["AXOpen".into()], false), (Some("AXOutline".into()), vec![], true)];
+        let chain = vec![
+            (Some("AXCell".into()), vec!["AXOpen".into()], false),
+            (Some("AXOutline".into()), vec![], true),
+        ];
         assert_eq!(ancestor_action_kind(&chain, true), Some((0, "AXOpen")));
         ancestor_perform_evidence(WriteOutcome::StopUncertain(reason), || Some(evidence))
     }
-    fresh_case!(direct_unsupported_selected, direct, AttributeUnsupported, Selected);
-    fresh_case!(direct_unsupported_title, direct, AttributeUnsupported, TitleNamesTarget);
+    fresh_case!(
+        direct_unsupported_selected,
+        direct,
+        AttributeUnsupported,
+        Selected
+    );
+    fresh_case!(
+        direct_unsupported_title,
+        direct,
+        AttributeUnsupported,
+        TitleNamesTarget
+    );
     fresh_case!(direct_no_value_selected, direct, NoValue, Selected);
     fresh_case!(direct_no_value_title, direct, NoValue, TitleNamesTarget);
-    fresh_case!(ancestor_unsupported_selected, ancestor, AttributeUnsupported, Selected);
-    fresh_case!(ancestor_unsupported_title, ancestor, AttributeUnsupported, TitleNamesTarget);
+    fresh_case!(
+        ancestor_unsupported_selected,
+        ancestor,
+        AttributeUnsupported,
+        Selected
+    );
+    fresh_case!(
+        ancestor_unsupported_title,
+        ancestor,
+        AttributeUnsupported,
+        TitleNamesTarget
+    );
     fresh_case!(ancestor_no_value_selected, ancestor, NoValue, Selected);
     fresh_case!(ancestor_no_value_title, ancestor, NoValue, TitleNamesTarget);
 
@@ -3232,9 +3290,35 @@ mod u32_fresh_perform_tests {
             for evidence in [None, Some(ClickEvidence::SheetClosed)] {
                 let expected = (WriteOutcome::StopUncertain(reason), None);
                 assert_eq!(direct_perform_evidence(reason, || evidence), expected);
-                assert_eq!(ancestor_perform_evidence(WriteOutcome::StopUncertain(reason), || evidence), expected);
+                assert_eq!(
+                    ancestor_perform_evidence(WriteOutcome::StopUncertain(reason), || evidence),
+                    expected
+                );
             }
         }
+    }
+
+    #[test]
+    fn shared_leaf_classifier_preserves_other_outcomes_and_success_evidence() {
+        for outcome in [
+            WriteOutcome::StopUncertain(Reason::Failure),
+            WriteOutcome::StopNotDelivered(Reason::PermissionDenied),
+            WriteOutcome::FallThrough(Reason::Unsupported),
+        ] {
+            let (classified, evidence) =
+                classify_perform_evidence(outcome, || panic!("must not observe this outcome"));
+            assert_eq!((classified, evidence), (outcome, None));
+        }
+        assert_eq!(
+            classify_perform_evidence(WriteOutcome::Delivered, || Some(ClickEvidence::SheetClosed)),
+            (WriteOutcome::Delivered, Some(ClickEvidence::SheetClosed))
+        );
+        assert_eq!(
+            classify_perform_evidence(WriteOutcome::StopUncertain(Reason::NoValue), || Some(
+                ClickEvidence::Selected
+            )),
+            (WriteOutcome::Delivered, Some(ClickEvidence::Selected))
+        );
     }
 }
 
@@ -4195,9 +4279,7 @@ fn perform_ax_click(
             // A press the app reported as failed never claims the sheet's
             // closing: only a delivered AXPress may.
             let (classified, evidence) = direct_perform_evidence(reason, || probe.observe());
-            if classified
-                == cua_driver_core::mutation::WriteOutcome::Delivered
-            {
+            if classified == cua_driver_core::mutation::WriteOutcome::Delivered {
                 let evidence = evidence.expect("fresh tied effect");
                 let _chain = cua_driver_core::mutation::ChainResult::from_recorded(
                     vec![cua_driver_core::mutation::WriteOutcome::Delivered],
@@ -4550,32 +4632,7 @@ unsafe fn ax_press_with_ancestors(
             &crate::ax::write_outcome::Settable::Unknown(kAXErrorFailure),
             err,
         );
-        if let cua_driver_core::mutation::WriteOutcome::StopUncertain(reason) = outcome {
-            let evidence = if matches!(
-                reason,
-                cua_driver_core::mutation::Reason::AttributeUnsupported
-                    | cua_driver_core::mutation::Reason::NoValue
-            ) {
-                probe
-                    .observe()
-                    .filter(|e| *e == ClickEvidence::ToggleChanged)
-            } else {
-                None
-            };
-            let classified = reason.classify_perform_with_observed_effect(evidence.is_some());
-            let _chain = cua_driver_core::mutation::ChainResult::from_recorded(
-                vec![classified],
-                cua_driver_core::mutation::PriorInput::None,
-            )
-            .expect("one write");
-            return Ok(
-                if classified == cua_driver_core::mutation::WriteOutcome::Delivered {
-                    AxPressOutcome::Delivered(evidence)
-                } else {
-                    AxPressOutcome::Indeterminate
-                },
-            );
-        }
+        let (outcome, evidence) = classify_perform_evidence(outcome, || probe.observe());
         let _chain = cua_driver_core::mutation::ChainResult::from_recorded(
             vec![outcome],
             cua_driver_core::mutation::PriorInput::None,
@@ -4583,14 +4640,14 @@ unsafe fn ax_press_with_ancestors(
         .expect("one write");
         match outcome {
             cua_driver_core::mutation::WriteOutcome::Delivered => {
-                return Ok(AxPressOutcome::Delivered(probe.observe()))
+                return Ok(AxPressOutcome::Delivered(evidence))
             }
             cua_driver_core::mutation::WriteOutcome::FallThrough(_) => {}
             cua_driver_core::mutation::WriteOutcome::StopNotDelivered(_) => {
                 return Ok(AxPressOutcome::NotDelivered(err))
             }
             cua_driver_core::mutation::WriteOutcome::StopUncertain(_) => {
-                unreachable!("handled above")
+                return Ok(AxPressOutcome::Indeterminate)
             }
             cua_driver_core::mutation::WriteOutcome::RetryAfterUncertain(_) => {
                 unreachable!("native classifier does not retry")
@@ -4661,12 +4718,12 @@ unsafe fn ax_press_with_ancestors(
         &crate::ax::write_outcome::Settable::Unknown(kAXErrorFailure),
         err,
     );
+    let (outcome, evidence) = ancestor_perform_evidence(outcome, || probe.observe());
     let _chain = cua_driver_core::mutation::ChainResult::from_recorded(
         vec![outcome],
         cua_driver_core::mutation::PriorInput::None,
     )
     .expect("one write");
-    let (outcome, evidence) = ancestor_perform_evidence(outcome, || probe.observe());
     for (_, _, el, _) in chain {
         CFRelease(el as _);
     }
