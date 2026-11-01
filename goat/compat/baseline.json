@@ -1,7 +1,7 @@
 {
   "comment": "The Cua Driver build GOAT ships today: the archives goat-si/goat packages/shared/src/cuaDriverRelease.ts pins, by name, size and SHA-256. The fork must stay protocol-compatible with it; change this only together with GOAT's pin.",
   "version": "0.38.0-goat.3",
-  "baseUrl": "https://github.com/goat-si/cua-driver/releases/download/cua-driver-rs-v0.38.0-goat.3/",
+  "baseUrl": "https://github.com/goat-si/goat-cu/releases/download/cua-driver-rs-v0.38.0-goat.3/",
   "archives": {
     "darwin-universal": {
       "name": "cua-driver-rs-0.38.0-goat.3-darwin-universal-binary.tar.gz",
