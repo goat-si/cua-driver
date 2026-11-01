@@ -2856,16 +2856,27 @@ fn walk_element<S: AxTreeSource>(
     // it: its items are reachable through invoke_menu or a query, and walking
     // them cost most of a read (94% of a Chrome window read in a VM check)
     // and ate the node budget before the window content.
-    let collapse_here = role == "AXMenuBarItem"
-        && MENUS_COLLAPSED.with(std::cell::Cell::get)
-        && known(
-            super::evidence::observe_read(
-                Some(element_key),
-                super::evidence::ReadSite::MenuSelected,
-                source.boolean(element, "AXSelected"),
-            )
-            .into_walk_legacy(),
-        ) != Some(true);
+    let collapse_here = if role == "AXMenuBarItem" && MENUS_COLLAPSED.with(std::cell::Cell::get) {
+        match super::evidence::observe_read(
+            Some(element_key),
+            super::evidence::ReadSite::MenuSelected,
+            source.boolean(element, "AXSelected"),
+        )
+        .into_walk_legacy()
+        {
+            Read::Known(true) => false,
+            Read::Known(false) => true,
+            Read::Absent | Read::Unknown(_) => {
+                budget.record_skip(IncompleteReason {
+                    kind: IncompleteReasonKind::PolicyOmission,
+                    detail: IncompleteReasonDetail::CollapsedMenu,
+                });
+                true
+            }
+        }
+    } else {
+        false
+    };
     let line = if role == "AXMenuBar" && MENUS_COLLAPSED.with(std::cell::Cell::get) {
         format!("{} {COLLAPSED_MENU_NOTE}", format_node_line(&node))
     } else {

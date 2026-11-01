@@ -571,6 +571,8 @@ fn collapsed_menu_keeps_legacy_skip() {
             kAXErrorCannotComplete,
         )),
     ] {
+        let collapsed_reason = !matches!(&selection, Read::Known(false));
+        let read_failed = matches!(&selection, Read::Unknown(_));
         let source = Fake::new(
             &[(1, 1, 1, &[2]), (2, 2, 2, &[])],
             vec![
@@ -605,6 +607,23 @@ fn collapsed_menu_keeps_legacy_skip() {
         source.assert_lifetimes(&[(1, 1)]);
         assert!(result.nodes_skipped);
         assert!(!result.truncated);
+        let mut payload = serde_json::json!({});
+        result.walk.apply(&mut payload);
+        let reasons = payload["observation_incomplete_reasons"]
+            .as_array()
+            .unwrap();
+        assert_eq!(
+            reasons.contains(
+                &serde_json::json!({"kind":"policy_omission", "detail":"collapsed_menu"})
+            ),
+            collapsed_reason
+        );
+        assert_eq!(
+            reasons.contains(
+                &serde_json::json!({"kind":"provider_failure", "detail":"attribute_read_failed"})
+            ),
+            read_failed
+        );
         assert_eq!(
             result.tree_markdown,
             "- [0] AXMenuBarItem \"File\" [actions=[press]]\n"
