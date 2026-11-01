@@ -860,19 +860,29 @@ jobs:
       # harness (tests/runners/macos-lume/run-all.sh).
       - name: Run platform-macos unit tests
         working-directory: rust
-        env:
-          # The hosted runner's pasteboard is disposable; opt in to the native
-          # clipboard round trip that would clobber a developer's clipboard.
-          CUA_TEST_ALLOW_CLIPBOARD: "1"
         run: cargo test --locked -p platform-macos --lib
-      # Live AppKit tests, one at a time and by exact name, so they never share the
-      # parallel lib run with other tests (goat-si/cua-driver#151).
-      - name: Run the live AppKit unit tests on macOS, one at a time
-        working-directory: rust
+      # Tests that read live AppKit, Window Server, HID or pasteboard state are
+      # #[ignore = "live: ..."]. The live-call probe proves the default lib run makes
+      # no such call it can observe, and the live lane runs each live test alone in
+      # its own process (goat-si/cua-driver#151, #188).
+      - name: Build the live-call probe
+        id: live-probe
         run: |
-          cargo test --locked -p platform-macos --lib cursor::shape::tests::probe_degrades_to_unknown_without_appkit -- --ignored --exact --test-threads=1
-          cargo test --locked -p platform-macos --lib focus_guard::tests::the_next_action_ends_a_detached_hold -- --ignored --exact --test-threads=1
-          cargo test --locked -p platform-macos --lib focus_guard::tests::a_key_hand_back_keeps_the_actions_hold -- --ignored --exact --test-threads=1
+          clang -dynamiclib -o "$RUNNER_TEMP/live.dylib" tools/macos-live-call-probe/live.c \
+            -framework ApplicationServices -lobjc
+          clang -o "$RUNNER_TEMP/live-probe-control" tools/macos-live-call-probe/control.c \
+            -framework ApplicationServices -framework AppKit -lobjc
+          binary=$(cd rust && cargo test --locked -p platform-macos --lib --no-run --message-format=json \
+            | python3 -c 'import json,sys; print(next(m["executable"] for m in map(json.loads, sys.stdin) if m.get("reason") == "compiler-artifact" and m.get("target", {}).get("name") == "platform_macos" and m.get("profile", {}).get("test") and m.get("executable")))')
+          echo "binary=$binary" >> "$GITHUB_OUTPUT"
+      - name: Live-call probe positive control
+        run: python3 tools/macos-live-call-probe/check.py --probe "$RUNNER_TEMP/live.dylib" control "$RUNNER_TEMP/live-probe-control"
+      - name: The default platform-macos lib run makes no observed live call
+        run: python3 tools/macos-live-call-probe/check.py --probe "$RUNNER_TEMP/live.dylib" default "${{ steps.live-probe.outputs.binary }}"
+      - name: Run each live platform-macos test alone
+        # The hosted runner's pasteboard is disposable: run.py opts the native
+        # clipboard round trip in for its own process.
+        run: python3 tools/macos-live-tests/run.py "${{ steps.live-probe.outputs.binary }}"
       - name: Run cua-driver-core unit tests on macOS
         working-directory: rust
         run: cargo test --locked -p cua-driver-core --lib

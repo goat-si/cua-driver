@@ -178,6 +178,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "live: reads NSWorkspace, pasteboard; runs alone in the macOS live lane"]
     fn native_clipboard_round_trips_text_png_and_file_url_when_opted_in() {
         // Overwrites the general pasteboard, so it runs only where a job opts
         // in explicitly. `CI` alone is not enough: developers export it too.

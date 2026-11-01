@@ -179,6 +179,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "live: reads NSRunningApplication; runs alone in the macOS live lane"]
     fn the_current_process_is_not_a_launching_app() {
         // A test binary is not a LaunchServices application, so it must never
         // be waited on.
