@@ -1,5 +1,10 @@
-//! Syntactic inventory of worker creation sites. This is a regression guard,
-//! not proof that an arbitrary native effect runs under an admitted lease.
+//! Regression guard against accidentally adding an unrouted raw thread start
+//! in ordinary code, not a sandbox against deliberately obfuscated code.
+//! Items that can shadow the `std`, `core`, `alloc`, or `tokio` path roots and
+//! code-hiding `include!` or Rust-source `include_str!` are banned rather than
+//! resolved; nonliteral `include_str!` is also banned when its target is
+//! unknown. Associated items such as methods and fields cannot shadow those
+//! path roots and are not banned. Ambiguous inclusion scans all source files.
 
 use proc_macro2::{TokenStream, TokenTree};
 use quote::ToTokens;
@@ -244,6 +249,113 @@ fn has_glob(tree: &UseTree) -> bool {
         UseTree::Group(group) => group.items.iter().any(has_glob),
         _ => false,
     }
+}
+
+fn reserved_path_root(name: &syn::Ident) -> Option<String> {
+    let spelling = name.to_string();
+    let spelling = spelling.strip_prefix("r#").unwrap_or(&spelling);
+    matches!(spelling, "std" | "core" | "alloc" | "tokio").then(|| spelling.to_owned())
+}
+
+fn use_path_roots(tree: &UseTree, prefix: &mut Vec<syn::Ident>, out: &mut Vec<(String, usize)>) {
+    match tree {
+        UseTree::Path(path) => {
+            prefix.push(path.ident.clone());
+            use_path_roots(&path.tree, prefix, out);
+            prefix.pop();
+        }
+        UseTree::Name(name) => {
+            let binding = if name.ident == "self" {
+                prefix.last()
+            } else {
+                Some(&name.ident)
+            };
+            if let Some(binding) = binding {
+                if let Some(root) = reserved_path_root(binding) {
+                    out.push((root, binding.span().start().line));
+                }
+            }
+        }
+        UseTree::Rename(rename) => {
+            if let Some(root) = reserved_path_root(&rename.rename) {
+                out.push((root, rename.rename.span().start().line));
+            }
+        }
+        UseTree::Group(group) => {
+            for item in &group.items {
+                use_path_roots(item, prefix, out);
+            }
+        }
+        UseTree::Glob(_) => {}
+    }
+}
+
+fn item_path_roots(item: &syn::Item) -> Vec<(String, usize)> {
+    let name = match item {
+        syn::Item::Const(item) => Some(&item.ident),
+        syn::Item::Enum(item) => Some(&item.ident),
+        syn::Item::ExternCrate(item) => {
+            Some(item.rename.as_ref().map_or(&item.ident, |(_, name)| name))
+        }
+        syn::Item::Fn(item) => Some(&item.sig.ident),
+        syn::Item::Macro(item) => item.ident.as_ref(),
+        syn::Item::Mod(item) => Some(&item.ident),
+        syn::Item::Static(item) => Some(&item.ident),
+        syn::Item::Struct(item) => Some(&item.ident),
+        syn::Item::Trait(item) => Some(&item.ident),
+        syn::Item::TraitAlias(item) => Some(&item.ident),
+        syn::Item::Type(item) => Some(&item.ident),
+        syn::Item::Union(item) => Some(&item.ident),
+        _ => None,
+    };
+    let mut result = Vec::new();
+    if let Some(name) = name {
+        if let Some(root) = reserved_path_root(name) {
+            result.push((root, name.span().start().line));
+        }
+    }
+    if let syn::Item::Use(item) = item {
+        use_path_roots(&item.tree, &mut Vec::new(), &mut result);
+    }
+    result
+}
+
+fn forbidden_include(name: &str, tokens: TokenStream) -> bool {
+    match name {
+        "include" => true,
+        "include_str" => match syn::parse2::<syn::LitStr>(tokens) {
+            Ok(path) => Path::new(&path.value())
+                .extension()
+                .is_some_and(|ext| ext == "rs"),
+            Err(_) => true,
+        },
+        _ => false,
+    }
+}
+
+fn contains_forbidden_include(tokens: TokenStream) -> bool {
+    let tokens: Vec<_> = tokens.into_iter().collect();
+    for index in 0..tokens.len() {
+        if let TokenTree::Group(group) = &tokens[index] {
+            if contains_forbidden_include(group.stream()) {
+                return true;
+            }
+        }
+        if let (
+            Some(TokenTree::Ident(name)),
+            Some(TokenTree::Punct(bang)),
+            Some(TokenTree::Group(args)),
+        ) = (
+            tokens.get(index),
+            tokens.get(index + 1),
+            tokens.get(index + 2),
+        ) {
+            if bang.as_char() == '!' && forbidden_include(&name.to_string(), args.stream()) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 // These are scanner guard false greens, not production bypasses: the current
@@ -671,6 +783,13 @@ impl<'ast> Visit<'ast> for Scanner {
     }
     fn visit_item(&mut self, i: &'ast syn::Item) {
         if !test_only(item_attrs(i)) {
+            for (root, line) in item_path_roots(i) {
+                self.record(
+                    format!("forbidden-path-root:{root}"),
+                    i.to_token_stream(),
+                    line,
+                );
+            }
             if let syn::Item::Verbatim(tokens) = i {
                 self.record("unparsed-item".into(), tokens.clone(), 0);
                 return;
@@ -698,6 +817,21 @@ impl<'ast> Visit<'ast> for Scanner {
     }
     fn visit_foreign_item(&mut self, i: &'ast syn::ForeignItem) {
         if !test_only(foreign_item_attrs(i)) {
+            let name = match i {
+                syn::ForeignItem::Fn(item) => Some(&item.sig.ident),
+                syn::ForeignItem::Static(item) => Some(&item.ident),
+                syn::ForeignItem::Type(item) => Some(&item.ident),
+                _ => None,
+            };
+            if let Some(name) = name {
+                if let Some(root) = reserved_path_root(name) {
+                    self.record(
+                        format!("forbidden-path-root:{root}"),
+                        i.to_token_stream(),
+                        name.span().start().line,
+                    );
+                }
+            }
             if let syn::ForeignItem::Verbatim(tokens) = i {
                 self.record("unparsed-foreign-item".into(), tokens.clone(), 0);
                 return;
@@ -958,6 +1092,22 @@ impl<'ast> Visit<'ast> for Scanner {
         visit::visit_expr_method_call(self, i);
     }
     fn visit_macro(&mut self, m: &'ast syn::Macro) {
+        let name = m
+            .path
+            .segments
+            .last()
+            .expect("macro path")
+            .ident
+            .to_string();
+        if forbidden_include(&name, m.tokens.clone())
+            || contains_forbidden_include(m.tokens.clone())
+        {
+            self.record(
+                "forbidden-include".into(),
+                m.to_token_stream(),
+                m.path.segments.last().unwrap().ident.span().start().line,
+            );
+        }
         // Token trees inside macros are opaque to syn's expression visitor.
         // Any spawn-like identifier in one is reviewed as its own site.
         fn has_spawn(scanner: &Scanner, stream: TokenStream) -> bool {
@@ -1023,6 +1173,99 @@ pub(super) fn scan(file: &str, source: &str) -> Result<Vec<Site>, syn::Error> {
 
 /// Find external files reached only through a test-only module declaration.
 pub(super) fn test_only_files(root: &Path, files: &[PathBuf]) -> Result<BTreeSet<PathBuf>, String> {
+    fn normalize(root: &Path, file: &Path) -> Result<PathBuf, String> {
+        let canonical_root = root
+            .canonicalize()
+            .map_err(|e| format!("{}: {e}", root.display()))?;
+        let absolute = root
+            .join(file)
+            .canonicalize()
+            .map_err(|e| format!("{}: {e}", file.display()))?;
+        absolute
+            .strip_prefix(&canonical_root)
+            .map(Path::to_path_buf)
+            .map_err(|_| format!("module path escapes source root: {}", file.display()))
+    }
+
+    #[derive(Default)]
+    struct ReachabilityRisk {
+        block_depth: usize,
+        uncertain: bool,
+    }
+    impl<'ast> Visit<'ast> for ReachabilityRisk {
+        fn visit_item(&mut self, item: &'ast syn::Item) {
+            if !test_only(item_attrs(item)) {
+                visit::visit_item(self, item);
+            }
+        }
+        fn visit_expr(&mut self, expr: &'ast Expr) {
+            if !test_only(expr_attrs(expr)) {
+                visit::visit_expr(self, expr);
+            }
+        }
+        fn visit_local(&mut self, local: &'ast syn::Local) {
+            if !test_only(&local.attrs) {
+                visit::visit_local(self, local);
+            }
+        }
+        fn visit_trait_item(&mut self, item: &'ast syn::TraitItem) {
+            if !test_only(trait_item_attrs(item)) {
+                visit::visit_trait_item(self, item);
+            }
+        }
+        fn visit_impl_item(&mut self, item: &'ast syn::ImplItem) {
+            if !test_only(impl_item_attrs(item)) {
+                visit::visit_impl_item(self, item);
+            }
+        }
+        fn visit_foreign_item(&mut self, item: &'ast syn::ForeignItem) {
+            if !test_only(foreign_item_attrs(item)) {
+                visit::visit_foreign_item(self, item);
+            }
+        }
+        fn visit_stmt_macro(&mut self, item: &'ast syn::StmtMacro) {
+            if !test_only(&item.attrs) {
+                visit::visit_stmt_macro(self, item);
+            }
+        }
+        fn visit_block(&mut self, block: &'ast syn::Block) {
+            self.block_depth += 1;
+            visit::visit_block(self, block);
+            self.block_depth -= 1;
+        }
+        fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+            if test_only(&item.attrs) {
+                return;
+            }
+            if item.content.is_none() && self.block_depth > 0 {
+                self.uncertain = true;
+            }
+            if item.attrs.iter().any(|attr| {
+                attr.path().is_ident("cfg_attr")
+                    && attr
+                        .to_token_stream()
+                        .to_string()
+                        .split_whitespace()
+                        .any(|token| token == "path")
+            }) {
+                self.uncertain = true;
+            }
+            visit::visit_item_mod(self, item);
+        }
+        fn visit_macro(&mut self, m: &'ast syn::Macro) {
+            fn nested_mod(tokens: TokenStream) -> bool {
+                let tokens: Vec<_> = tokens.into_iter().collect();
+                (0..tokens.len()).any(|index| {
+                    matches!(tokens.get(index), Some(TokenTree::Ident(ident)) if ident == "mod")
+                        && matches!(tokens.get(index + 1), Some(TokenTree::Ident(_)))
+                        && matches!(tokens.get(index + 2), Some(TokenTree::Punct(punct)) if punct.as_char() == ';')
+                        || matches!(tokens.get(index), Some(TokenTree::Group(group)) if nested_mod(group.stream()))
+                })
+            }
+            self.uncertain |= nested_mod(m.tokens.clone());
+        }
+    }
+
     fn descend(
         root: &Path,
         file: &Path,
@@ -1031,7 +1274,7 @@ pub(super) fn test_only_files(root: &Path, files: &[PathBuf]) -> Result<BTreeSet
         test: &mut BTreeSet<PathBuf>,
         production: &mut BTreeSet<PathBuf>,
     ) -> Result<(), String> {
-        let file = file.to_owned();
+        let file = normalize(root, file)?;
         if !seen.insert((file.clone(), inherited_test)) {
             return Ok(());
         }
@@ -1143,6 +1386,23 @@ pub(super) fn test_only_files(root: &Path, files: &[PathBuf]) -> Result<BTreeSet
     for file in files {
         if !test.contains(file) && !production.contains(file) {
             descend(root, file, false, &mut seen, &mut test, &mut production)?;
+        }
+    }
+    for file in &production {
+        let text = std::fs::read_to_string(root.join(file))
+            .map_err(|e| format!("{}: {e}", file.display()))?;
+        let sites =
+            scan(&file.to_string_lossy(), &text).map_err(|e| format!("{}: {e}", file.display()))?;
+        let syntax = syn::parse_file(&text).map_err(|e| format!("{}: {e}", file.display()))?;
+        let mut risk = ReachabilityRisk::default();
+        risk.visit_file(&syntax);
+        if risk.uncertain
+            || sites
+                .iter()
+                .any(|site| site.primitive == "forbidden-include")
+        {
+            // We cannot safely prove which sources are test-only.
+            return Ok(BTreeSet::new());
         }
     }
     test.retain(|p| !production.contains(p));

@@ -109,6 +109,22 @@ fn all_in_scope_mutating_spawns_propagate_worker_context() {
         "production raw-primitive import sites: {} {raw_imports:#?}",
         raw_imports.len()
     );
+    let roots: Vec<_> = sites
+        .iter()
+        .filter(|site| site.primitive.starts_with("forbidden-path-root:"))
+        .collect();
+    let includes: Vec<_> = sites
+        .iter()
+        .filter(|site| site.primitive == "forbidden-include")
+        .collect();
+    println!(
+        "production forbidden path-root items: {} {roots:#?}",
+        roots.len()
+    );
+    println!(
+        "production forbidden includes: {} {includes:#?}",
+        includes.len()
+    );
     let unclassified = unclassified(&sites, ENTRIES);
     let entries: Vec<_> = ENTRIES.iter().collect();
     let errors = entry_errors(&entries, &sites);
@@ -121,7 +137,11 @@ fn all_in_scope_mutating_spawns_propagate_worker_context() {
 fn unclassified<'a>(sites: &'a [Site], entries: &[Entry]) -> Vec<&'a Site> {
     sites
         .iter()
-        .filter(|site| !entries.iter().any(|entry| entry.matches(site)))
+        .filter(|site| {
+            site.primitive.starts_with("forbidden-path-root:")
+                || site.primitive == "forbidden-include"
+                || !entries.iter().any(|entry| entry.matches(site))
+        })
         .collect()
 }
 
@@ -553,6 +573,183 @@ fn shadowed_roots_and_production_includes_fail_closed() {
                 .any(|site| site.primitive == "forbidden-include")
             && !tests.contains(&PathBuf::from("shared.rs")),
         "guard holes: shadow={shadow:#?}; include={includes:#?}; test_only={tests:#?}"
+    );
+
+    for name in ["std", "core", "alloc", "tokio"] {
+        for declaration in [
+            format!("mod {name} {{}}"),
+            format!("type {name} = ();"),
+            format!("use other::item as {name};"),
+            format!("extern crate other as {name};"),
+            format!("struct {name};"),
+            format!("enum {name} {{ A }}"),
+            format!("trait {name} {{}}"),
+            format!("fn {name}() {{}}"),
+            format!("const {name}: () = ();"),
+            format!("static {name}: () = ();"),
+            format!("macro_rules! {name} {{ () => {{}} }}"),
+            format!("unsafe extern \"C\" {{ fn {name}(); }}"),
+        ] {
+            let sites = scan(
+                "item.rs",
+                &format!("mod outer {{ fn f() {{ {declaration} }} }}"),
+            )
+            .unwrap();
+            assert!(
+                sites
+                    .iter()
+                    .any(|site| site.primitive == format!("forbidden-path-root:{name}")),
+                "missed {declaration}: {sites:#?}"
+            );
+        }
+    }
+    let grouped = scan("use.rs", "mod m { pub use other::{x as std, y as tokio}; }").unwrap();
+    assert!(grouped
+        .iter()
+        .any(|site| site.primitive == "forbidden-path-root:std"));
+    assert!(grouped
+        .iter()
+        .any(|site| site.primitive == "forbidden-path-root:tokio"));
+    let raw_ident = scan("raw.rs", "mod r#std {}").unwrap();
+    assert!(raw_ident
+        .iter()
+        .any(|site| site.primitive == "forbidden-path-root:std"));
+    let associated = scan("associated.rs", "struct S { core: u8 } impl S { fn core(&self) {} const tokio: u8 = 0; } trait T { fn core(&self); }").unwrap();
+    assert!(
+        !associated
+            .iter()
+            .any(|site| site.primitive.starts_with("forbidden-path-root:")),
+        "associated items do not shadow a path root: {associated:#?}"
+    );
+    let hidden = scan(
+        "test.rs",
+        "#[cfg(test)] mod std {} #[cfg(test)] include!(\"hidden.rs\");",
+    )
+    .unwrap();
+    assert!(
+        hidden.is_empty(),
+        "test-only items were scanned: {hidden:#?}"
+    );
+    for source in [
+        "include!(\"data.txt\");",
+        "include_str!(\"source.rs\");",
+        "include_str!(concat!(\"source\", \".rs\"));",
+        "outer! { include!(\"shared.rs\") }",
+    ] {
+        let sites = scan("include.rs", source).unwrap();
+        assert!(
+            sites
+                .iter()
+                .any(|site| site.primitive == "forbidden-include"),
+            "missed {source}: {sites:#?}"
+        );
+    }
+    let text_only = scan("text.rs", "include_str!(\"notes.txt\");").unwrap();
+    assert!(!text_only
+        .iter()
+        .any(|site| site.primitive == "forbidden-include"));
+
+    let site = shadow
+        .iter()
+        .find(|site| site.primitive == "forbidden-path-root:std")
+        .unwrap();
+    let fake = Entry {
+        file: "shadow.rs",
+        item: "<file>",
+        primitive: "forbidden-path-root:std",
+        fingerprint: site.fingerprint,
+        occurrence: site.occurrence,
+        category: Category::Read,
+        reason: "must not exempt",
+    };
+    assert_eq!(
+        unclassified(std::slice::from_ref(site), &[fake]).len(),
+        1,
+        "banned item must not be exempted"
+    );
+    let include_site = includes
+        .iter()
+        .find(|site| site.primitive == "forbidden-include")
+        .unwrap();
+    let fake_include = Entry {
+        file: "lib.rs",
+        item: "<file>",
+        primitive: "forbidden-include",
+        fingerprint: include_site.fingerprint,
+        occurrence: include_site.occurrence,
+        category: Category::Read,
+        reason: "must not exempt",
+    };
+    assert_eq!(
+        unclassified(std::slice::from_ref(include_site), &[fake_include]).len(),
+        1,
+        "banned include must not be exempted"
+    );
+
+    let paths = tempfile::tempdir().unwrap();
+    fs::create_dir(paths.path().join("nested")).unwrap();
+    fs::write(
+        paths.path().join("lib.rs"),
+        "#[cfg(test)] #[path = \"shared.rs\"] mod t; #[path = \"nested/../shared.rs\"] mod p;",
+    )
+    .unwrap();
+    fs::write(paths.path().join("shared.rs"), "fn f() {} ").unwrap();
+    let classified = test_only_files(paths.path(), &rust_sources(paths.path()).unwrap()).unwrap();
+    assert!(
+        !classified.contains(&PathBuf::from("shared.rs")),
+        "production module path must override a test-only path"
+    );
+
+    fs::write(
+        paths.path().join("lib.rs"),
+        "#[cfg(test)] #[path = \"shared.rs\"] mod t; fn f() { #[path = \"shared.rs\"] mod p; }",
+    )
+    .unwrap();
+    let classified = test_only_files(paths.path(), &rust_sources(paths.path()).unwrap()).unwrap();
+    assert!(
+        !classified.contains(&PathBuf::from("shared.rs")),
+        "nested production module must not be skipped"
+    );
+
+    fs::write(paths.path().join("alt.rs"), "fn alternate() {} ").unwrap();
+    fs::write(paths.path().join("lib.rs"), "#[cfg(test)] #[path = \"shared.rs\"] mod t; #[cfg_attr(feature = \"x\", path = \"shared.rs\")] mod alt;").unwrap();
+    let classified = test_only_files(paths.path(), &rust_sources(paths.path()).unwrap()).unwrap();
+    assert!(
+        !classified.contains(&PathBuf::from("shared.rs")),
+        "conditional path must fail closed"
+    );
+
+    fs::write(
+        paths.path().join("lib.rs"),
+        "#[cfg(test)] #[path = \"shared.rs\"] mod t; macro_call! { mod production; }",
+    )
+    .unwrap();
+    let classified = test_only_files(paths.path(), &rust_sources(paths.path()).unwrap()).unwrap();
+    assert!(
+        !classified.contains(&PathBuf::from("shared.rs")),
+        "opaque nested module must fail closed"
+    );
+
+    fs::write(
+        paths.path().join("lib.rs"),
+        "#[cfg(test)] #[path = \"shared.rs\"] mod t; include_str!(\"shared.rs\");",
+    )
+    .unwrap();
+    let classified = test_only_files(paths.path(), &rust_sources(paths.path()).unwrap()).unwrap();
+    assert!(
+        !classified.contains(&PathBuf::from("shared.rs")),
+        "production source include must fail closed"
+    );
+
+    fs::write(
+        paths.path().join("lib.rs"),
+        "#[cfg(test)] #[path = \"shared.rs\"] mod t; #[cfg(test)] include!(\"shared.rs\");",
+    )
+    .unwrap();
+    let classified = test_only_files(paths.path(), &rust_sources(paths.path()).unwrap()).unwrap();
+    assert!(
+        classified.contains(&PathBuf::from("shared.rs")),
+        "test-only include must not change production reachability"
     );
 }
 
