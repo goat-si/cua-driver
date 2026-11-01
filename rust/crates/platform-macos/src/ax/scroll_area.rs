@@ -81,6 +81,30 @@ pub unsafe fn bar_position(area: AXUIElementRef, direction: &str) -> Option<f64>
     value.filter(|value| value.is_finite())
 }
 
+pub(crate) fn bar_position_with<S: super::tree_source::AxTreeSource>(
+    source: &S,
+    area: &S::Element,
+    direction: &str,
+) -> Option<f64> {
+    use super::tree_source::Read;
+    let bar = match source.element_attribute(area, bar_attribute(direction)) {
+        Read::Known(bar) => bar,
+        Read::Absent | Read::Unknown(_) => return None,
+    };
+    let value = scrollbar_value(
+        || match source.text(&bar, "AXRole") {
+            Read::Known(value) => Some(value),
+            Read::Absent | Read::Unknown(_) => None,
+        },
+        || match source.number(&bar, "AXValue") {
+            Read::Known(value) => Some(value),
+            Read::Absent | Read::Unknown(_) => None,
+        },
+    );
+    drop(bar);
+    value.filter(|value| value.is_finite())
+}
+
 pub(super) fn scrollbar_value(
     role: impl FnOnce() -> Option<String>,
     value: impl FnOnce() -> Option<f64>,

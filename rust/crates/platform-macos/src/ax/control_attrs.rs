@@ -165,19 +165,7 @@ fn read_within_deadline<T, B>(
 /// A frame read for planning, outside the walk's per-node accounting: one
 /// batched call, with the two single reads only when the batch fails. `None`
 /// when a read would start, or ended, past the deadline.
-///
-/// # Safety
-/// `element` must be a live AX element.
-pub(crate) unsafe fn frame_batched(
-    element: AXUIElementRef,
-    budget: &WalkBudget,
-) -> Option<Option<[f64; 4]>> {
-    super::tree_source::native::with_borrowed(element, |source, element| {
-        frame_batched_with(source, element, budget)
-    })
-}
-
-fn frame_batched_with<S: AxTreeSource>(
+pub(crate) fn frame_batched_with<S: AxTreeSource>(
     source: &S,
     element: &S::Element,
     budget: &WalkBudget,
@@ -192,20 +180,7 @@ fn frame_batched_with<S: AxTreeSource>(
 }
 
 /// The control state and frame of an element that may be indexed.
-///
-/// # Safety
-/// `element` must be a live AX element.
-pub(crate) unsafe fn read_control_attrs(
-    element: AXUIElementRef,
-    budget: &mut WalkBudget,
-    batching_disabled: &mut bool,
-) -> Option<ControlAttrs> {
-    super::tree_source::native::with_borrowed(element, |source, element| {
-        read_control_attrs_with(source, element, budget, batching_disabled)
-    })
-}
-
-fn read_control_attrs_with<S: AxTreeSource>(
+pub(crate) fn read_control_attrs_with<S: AxTreeSource>(
     source: &S,
     element: &S::Element,
     budget: &mut WalkBudget,
@@ -221,20 +196,7 @@ fn read_control_attrs_with<S: AxTreeSource>(
 }
 
 /// The frame of an element as `element_screen_rect` reads it.
-///
-/// # Safety
-/// `element` must be a live AX element.
-pub(crate) unsafe fn read_frame(
-    element: AXUIElementRef,
-    budget: &mut WalkBudget,
-    batching_disabled: &mut bool,
-) -> Option<Option<[f64; 4]>> {
-    super::tree_source::native::with_borrowed(element, |source, element| {
-        read_frame_with(source, element, budget, batching_disabled)
-    })
-}
-
-fn read_frame_with<S: AxTreeSource>(
+pub(crate) fn read_frame_with<S: AxTreeSource>(
     source: &S,
     element: &S::Element,
     budget: &mut WalkBudget,

@@ -13,12 +13,14 @@
 //!   are spliced back and element indices renumbered to document order.
 
 use super::bindings::*;
-use super::content_attrs::{read_content_attrs, ContentAttrs};
+use super::content_attrs::ContentAttrs;
 use super::dense_rows::{
     self, rows_windowed, with_dense_rows_windowed, ChildPlan, Chunk, DeferredRow,
 };
 use super::launch::{is_still_launching, LaunchStep, LaunchWait};
+#[cfg(test)]
 use super::snapshot::RetainedElement;
+use super::tree_source::{AxTreeSource, Read};
 use super::window_scope::{
     decide_window_scope, is_window_like_role, ScopeDecision, TopLevelCandidate, WindowScope,
 };
@@ -659,7 +661,7 @@ fn walk_tree_with_web_content(
     let mut lines: Vec<(usize, String)> = Vec::new(); // (depth, line)
     let mut index_counter = 0usize;
     let mut deferred = Vec::new();
-    let mut offscreen_rows = Vec::new();
+    let offscreen_rows;
     let mut batching_disabled = false;
     let mut window_scope: Option<WindowScope> = None;
 
@@ -755,25 +757,29 @@ fn walk_tree_with_web_content(
         // a large container needs it, bounds what is on screen for children
         // whose app does not list the visible ones.
         for child in walk_these {
-            let surface = rows_windowed().then_some(child as usize);
-            dense_rows::with_visible_clip(surface, || {
-                walk_element(
-                    child,
-                    0,
-                    None,
-                    None,
-                    LabelPath::Inactive,
-                    false,
-                    &mut nodes,
-                    &mut lines,
-                    &mut index_counter,
-                    &mut budget,
-                    &mut batching_disabled,
-                    max_depth,
-                    include_web_content,
-                    &mut deferred,
-                    &mut label_claims,
-                )
+            super::tree_source::native::with_borrowed(child, |source, child| {
+                let surface = rows_windowed().then_some(source.key(child));
+                dense_rows::with_visible_clip(surface, || {
+                    walk_element(
+                        source,
+                        child,
+                        child,
+                        0,
+                        None,
+                        None,
+                        LabelPath::Inactive,
+                        false,
+                        &mut nodes,
+                        &mut lines,
+                        &mut index_counter,
+                        &mut budget,
+                        &mut batching_disabled,
+                        max_depth,
+                        include_web_content,
+                        &mut deferred,
+                        &mut label_claims,
+                    )
+                });
             });
         }
 
@@ -839,68 +845,46 @@ fn walk_tree_with_web_content(
                     }
                 }
                 walked_menus.extend(menu_frame);
-                walk_element(
-                    menu,
-                    0,
-                    None,
-                    None,
-                    LabelPath::Inactive,
-                    false,
-                    &mut nodes,
-                    &mut lines,
-                    &mut index_counter,
-                    &mut budget,
-                    &mut batching_disabled,
-                    max_depth,
-                    include_web_content,
-                    &mut deferred,
-                    &mut label_claims,
-                );
+                super::tree_source::native::with_borrowed(menu, |source, menu| {
+                    walk_element(
+                        source,
+                        menu,
+                        menu,
+                        0,
+                        None,
+                        None,
+                        LabelPath::Inactive,
+                        false,
+                        &mut nodes,
+                        &mut lines,
+                        &mut index_counter,
+                        &mut budget,
+                        &mut batching_disabled,
+                        max_depth,
+                        include_web_content,
+                        &mut deferred,
+                        &mut label_claims,
+                    )
+                });
             }
             if incomplete {
                 budget.stop_for_timeout();
             }
         }
 
-        if !deferred.is_empty() {
-            let search_offscreen = query.is_some_and(|q| !q.trim().is_empty());
-            let skipped = with_dense_rows_windowed(false, || {
-                dense_rows::walk_deferred(&mut deferred, search_offscreen, |row| {
-                    let mut chunk = Chunk {
-                        lines: Vec::new(),
-                        nodes: Vec::new(),
-                    };
-                    walk_element(
-                        row.element.as_ptr() as AXUIElementRef,
-                        row.depth,
-                        row.parent_index,
-                        Some(&row.parent_role),
-                        row.label_path,
-                        row.in_web_content,
-                        &mut chunk.nodes,
-                        &mut chunk.lines,
-                        &mut index_counter,
-                        &mut budget,
-                        &mut batching_disabled,
-                        max_depth,
-                        include_web_content,
-                        &mut Vec::new(),
-                        &mut label_claims,
-                    );
-                    chunk
-                })
-            });
-            if skipped {
-                note_skipped();
-            }
-            let (spliced_lines, spliced_nodes, runs) =
-                dense_rows::splice_and_renumber(lines, nodes, deferred);
-            lines = spliced_lines;
-            nodes = spliced_nodes;
-            offscreen_rows = runs;
-        }
-
-        apply_owned_label_claims(&mut nodes, label_claims);
+        (lines, nodes, offscreen_rows) = finish_deferred(
+            &super::tree_source::native::NativeSource,
+            lines,
+            nodes,
+            deferred,
+            query,
+            &mut index_counter,
+            &mut budget,
+            &mut batching_disabled,
+            max_depth,
+            include_web_content,
+            label_claims,
+        );
 
         // Release all top-level elements (copy_children / copy_ax_windows both retain).
         release_all(top_level);
@@ -910,6 +894,85 @@ fn walk_tree_with_web_content(
 
     let walk = budget.outcome();
     let nodes_skipped = ledger.finish();
+    finalize_walk(
+        lines,
+        nodes,
+        offscreen_rows,
+        query,
+        walk,
+        nodes_skipped,
+        window_scope,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_deferred<S: AxTreeSource>(
+    source: &S,
+    mut lines: Vec<(usize, String)>,
+    mut nodes: Vec<AXNode>,
+    mut deferred: Vec<DeferredRow<S::Element>>,
+    query: Option<&str>,
+    counter: &mut usize,
+    budget: &mut WalkBudget,
+    batching_disabled: &mut bool,
+    max_depth: usize,
+    include_web_content: bool,
+    mut label_claims: Vec<(usize, String)>,
+) -> (
+    Vec<(usize, String)>,
+    Vec<AXNode>,
+    Vec<dense_rows::OffscreenRows>,
+) {
+    let mut offscreen_rows = Vec::new();
+    if !deferred.is_empty() {
+        let search_offscreen = query.is_some_and(|q| !q.trim().is_empty());
+        let skipped = with_dense_rows_windowed(false, || {
+            dense_rows::walk_deferred(&mut deferred, search_offscreen, |row| {
+                let mut chunk = Chunk {
+                    lines: Vec::new(),
+                    nodes: Vec::new(),
+                };
+                walk_element(
+                    source,
+                    &row.element,
+                    &row.element,
+                    row.depth,
+                    row.parent_index,
+                    Some(&row.parent_role),
+                    row.label_path,
+                    row.in_web_content,
+                    &mut chunk.nodes,
+                    &mut chunk.lines,
+                    counter,
+                    budget,
+                    batching_disabled,
+                    max_depth,
+                    include_web_content,
+                    &mut Vec::new(),
+                    &mut label_claims,
+                );
+                chunk
+            })
+        });
+        if skipped {
+            note_skipped();
+        }
+        (lines, nodes, offscreen_rows) = dense_rows::splice_and_renumber(lines, nodes, deferred);
+    }
+    apply_owned_label_claims(&mut nodes, label_claims);
+    (lines, nodes, offscreen_rows)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finalize_walk(
+    mut lines: Vec<(usize, String)>,
+    mut nodes: Vec<AXNode>,
+    offscreen_rows: Vec<dense_rows::OffscreenRows>,
+    query: Option<&str>,
+    walk: WalkOutcome,
+    nodes_skipped: bool,
+    window_scope: Option<WindowScope>,
+) -> TreeWalkResult {
     // Folding merges text rows into their parent; an exhaustive walk keeps
     // every row it visited.
     if !exhaustive_nodes() {
@@ -1152,9 +1215,18 @@ unsafe fn release_all(elements: Vec<AXUIElementRef>) {
     }
 }
 
+fn known<T>(read: Read<T>) -> Option<T> {
+    match read {
+        Read::Known(value) => Some(value),
+        Read::Absent | Read::Unknown(_) => None,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-unsafe fn walk_element(
-    element: AXUIElementRef,
+fn walk_element<S: AxTreeSource>(
+    source: &S,
+    element: &S::Element,
+    surface: &S::Element,
     depth: usize,
     parent_index: Option<usize>,
     parent_role: Option<&str>,
@@ -1167,7 +1239,7 @@ unsafe fn walk_element(
     batching_disabled: &mut bool,
     max_depth: usize,
     include_web_content: bool,
-    deferred: &mut Vec<DeferredRow>,
+    deferred: &mut Vec<DeferredRow<S::Element>>,
     label_claims: &mut Vec<(usize, String)>,
 ) {
     if depth > max_depth {
@@ -1182,16 +1254,16 @@ unsafe fn walk_element(
 
     // Messaging timeouts are per AX object, not inherited from the application
     // element, so every descendant must be bounded before any attribute read.
-    set_messaging_timeout(element);
+    source.set_messaging_timeout(element);
 
-    let role = copy_string_attr(element, "AXRole").unwrap_or_else(|| {
+    let role = known(source.text(element, "AXRole")).unwrap_or_else(|| {
         // A selector on the role cannot be answered for this node.
         note_skipped();
         "AXUnknown".into()
     });
 
     let label_path = next_label_path(parent_path, parent_role, Some(&role));
-    let child_label_path = child_label_path(label_path, &role, parent_role, element as usize);
+    let child_label_path = child_label_path(label_path, &role, parent_role, source.key(element));
     let in_web_content = in_web_content || is_web_content_role(&role);
     if in_web_content && !include_web_content {
         note_skipped();
@@ -1203,10 +1275,16 @@ unsafe fn walk_element(
     // a scroll moved anything. One that cannot scroll is layout only.
     let mut scroll_attrs = None;
     if role == "AXScrollArea" && !in_web_content {
-        let Some(attrs) = read_content_attrs(element, &role, budget, batching_disabled) else {
+        let Some(attrs) = super::content_attrs::read_content_attrs_with(
+            source,
+            element,
+            &role,
+            budget,
+            batching_disabled,
+        ) else {
             push_timed_out_row(
                 role,
-                element,
+                source.key(element),
                 depth,
                 parent_index,
                 in_web_content,
@@ -1218,12 +1296,12 @@ unsafe fn walk_element(
         if attrs.read_failed {
             note_skipped();
         }
-        let vertical = super::scroll_area::bar_position(element, "down");
-        let horizontal = super::scroll_area::bar_position(element, "right");
+        let vertical = super::scroll_area::bar_position_with(source, element, "down");
+        let horizontal = super::scroll_area::bar_position_with(source, element, "right");
         if let Some(label) = super::scroll_area::position_label(vertical, horizontal) {
             let idx = *counter;
             *counter += 1;
-            CFRetain(element as CFTypeRef);
+            let snapshot_key = source.retain_for_snapshot(element);
             // An exhaustive walk keeps the area's own labels, read with their
             // failures, so a selector naming it is answered; the bar
             // position stays the row's value.
@@ -1235,9 +1313,9 @@ unsafe fn walk_element(
                 (
                     (
                         None,
-                        trimmed_label(copy_string_attr(element, "AXDescription")),
+                        trimmed_label(known(source.text(element, "AXDescription"))),
                         None,
-                        copy_string_attr(element, "AXIdentifier"),
+                        known(source.text(element, "AXIdentifier")),
                     ),
                     false,
                 )
@@ -1262,11 +1340,11 @@ unsafe fn walk_element(
                 description,
                 identifier,
                 help: None,
-                actions: copy_action_names(element),
-                element_ptr: element as usize,
+                actions: known(source.action_names(element)).unwrap_or_default(),
+                element_ptr: snapshot_key,
                 depth,
                 parent_element_index: parent_index,
-                frame: element_screen_rect(element),
+                frame: known(source.frame(element)),
                 value_state: if secure {
                     Some("[redacted]".into())
                 } else if value_unknown {
@@ -1284,7 +1362,9 @@ unsafe fn walk_element(
             lines.push((depth, format_node_line(&node)));
             nodes.push(node);
             walk_children(
+                source,
                 element,
+                surface,
                 &role,
                 depth + 1,
                 Some(idx),
@@ -1312,20 +1392,33 @@ unsafe fn walk_element(
         if exhaustive_nodes() {
             let attrs = match scroll_attrs.take() {
                 Some(attrs) => Some(attrs),
-                None => read_content_attrs(element, &role, budget, batching_disabled),
+                None => super::content_attrs::read_content_attrs_with(
+                    source,
+                    element,
+                    &role,
+                    budget,
+                    batching_disabled,
+                ),
             };
             let node = match attrs {
                 Some(attrs) => {
                     if attrs.read_failed {
                         note_skipped();
                     }
-                    display_node(&role, attrs, element, depth, parent_index, in_web_content)
+                    display_node(
+                        &role,
+                        attrs,
+                        source.key(element),
+                        depth,
+                        parent_index,
+                        in_web_content,
+                    )
                 }
                 None => {
                     note_skipped();
                     role_only_node(
                         role.clone(),
-                        element as usize,
+                        source.key(element),
                         depth,
                         parent_index,
                         in_web_content,
@@ -1339,7 +1432,9 @@ unsafe fn walk_element(
         // collapse, so children inherit the parent's depth AND the same
         // parent_index (no actionable node was emitted here).
         walk_children(
+            source,
             element,
+            surface,
             &role,
             depth,
             parent_index,
@@ -1375,11 +1470,23 @@ unsafe fn walk_element(
         read_failed,
         secure,
         value_unknown,
-    }) = read_content_attrs(element, &role, budget, batching_disabled)
+    }) = super::content_attrs::read_content_attrs_with(
+        source,
+        element,
+        &role,
+        budget,
+        batching_disabled,
+    )
     else {
         // Only the role is known: a selector on its label cannot be answered.
         note_skipped();
-        let node = role_only_node(role, element as usize, depth, parent_index, in_web_content);
+        let node = role_only_node(
+            role,
+            source.key(element),
+            depth,
+            parent_index,
+            in_web_content,
+        );
         lines.push((depth, format_node_line(&node)));
         nodes.push(node);
         return;
@@ -1388,7 +1495,7 @@ unsafe fn walk_element(
         // A label read failed: a selector on it cannot be answered.
         note_skipped();
     }
-    let actions = copy_action_names(element);
+    let actions = known(source.action_names(element)).unwrap_or_default();
     let visible_title = title.as_deref().unwrap_or("").trim().to_owned();
     let visible_description = description.as_deref().unwrap_or("").trim().to_owned();
     let visible_value = value.as_deref().unwrap_or("").trim().to_owned();
@@ -1416,7 +1523,7 @@ unsafe fn walk_element(
     // extra AX round trip.
     let value_settable = actions.is_empty()
         && role_supports_value_addressing(&role)
-        && is_attribute_settable(element, "AXValue");
+        && source.value_settable(element);
     // A closed submenu can keep its descendants in AXChildren while reporting
     // those controls disabled. Never assign such a row a live element index:
     // the same native state also causes dispatch to refuse it, and exposing an
@@ -1429,7 +1536,7 @@ unsafe fn walk_element(
         || {
             selected_probe_before_deadline(
                 budget.expired(),
-                || super::write_outcome::query_settable(element, "AXSelected"),
+                || source.selected_settable(element),
                 note_skipped,
             )
         },
@@ -1442,12 +1549,17 @@ unsafe fn walk_element(
     // read that timed out, the row keeps only its role, without an index or
     // its children.
     let control = if !actions.is_empty() || value_settable || actionless_control {
-        match super::control_attrs::read_control_attrs(element, budget, batching_disabled) {
+        match super::control_attrs::read_control_attrs_with(
+            source,
+            element,
+            budget,
+            batching_disabled,
+        ) {
             Some(control) => Some(control),
             None => {
                 push_timed_out_row(
                     role,
-                    element,
+                    source.key(element),
                     depth,
                     parent_index,
                     in_web_content,
@@ -1475,7 +1587,7 @@ unsafe fn walk_element(
                 help: help.clone(),
                 ..role_only_node(
                     role.clone(),
-                    element as usize,
+                    source.key(element),
                     depth,
                     parent_index,
                     in_web_content,
@@ -1486,7 +1598,9 @@ unsafe fn walk_element(
             nodes.push(node);
         }
         walk_children(
+            source,
             element,
+            surface,
             &role,
             depth + 1,
             parent_index,
@@ -1505,24 +1619,27 @@ unsafe fn walk_element(
         return;
     }
 
-    let element_ptr = element as usize;
+    let element_ptr = source.key(element);
     let frame = match &control {
         Some(control) => control.frame,
-        None => match super::control_attrs::read_frame(element, budget, batching_disabled) {
-            Some(frame) => frame,
-            None => {
-                push_timed_out_row(
-                    role,
-                    element,
-                    depth,
-                    parent_index,
-                    in_web_content,
-                    nodes,
-                    lines,
-                );
-                return;
+        None => {
+            match super::control_attrs::read_frame_with(source, element, budget, batching_disabled)
+            {
+                Some(frame) => frame,
+                None => {
+                    push_timed_out_row(
+                        role,
+                        source.key(element),
+                        depth,
+                        parent_index,
+                        in_web_content,
+                        nodes,
+                        lines,
+                    );
+                    return;
+                }
             }
-        },
+        }
     };
     // Structured `elements` only contains actionable nodes. Keep all new AX
     // round-trips behind that same gate so display-only rows pay no cost.
@@ -1563,7 +1680,7 @@ unsafe fn walk_element(
         *counter += 1;
         // Retain so the element stays alive in the cache after `copy_children`
         // releases the per-child ref at the end of the caller's loop.
-        CFRetain(element as CFTypeRef);
+        let element_ptr = source.retain_for_snapshot(element);
         AXNode {
             owned_row_label: None,
             element_index: Some(idx),
@@ -1639,7 +1756,7 @@ unsafe fn walk_element(
     // and ate the node budget before the window content.
     let collapse_here = role == "AXMenuBarItem"
         && MENUS_COLLAPSED.with(std::cell::Cell::get)
-        && copy_bool_attr(element, "AXSelected") != Some(true);
+        && known(source.boolean(element, "AXSelected")) != Some(true);
     let line = if role == "AXMenuBar" && MENUS_COLLAPSED.with(std::cell::Cell::get) {
         format!("{} {COLLAPSED_MENU_NOTE}", format_node_line(&node))
     } else {
@@ -1653,7 +1770,9 @@ unsafe fn walk_element(
     }
 
     walk_children(
+        source,
         element,
+        surface,
         &role,
         depth + 1,
         next_parent,
@@ -1672,8 +1791,10 @@ unsafe fn walk_element(
 }
 
 #[allow(clippy::too_many_arguments)]
-unsafe fn walk_children(
-    element: AXUIElementRef,
+fn walk_children<S: AxTreeSource>(
+    source: &S,
+    element: &S::Element,
+    surface: &S::Element,
     role: &str,
     depth: usize,
     parent_index: Option<usize>,
@@ -1686,27 +1807,29 @@ unsafe fn walk_children(
     batching_disabled: &mut bool,
     max_depth: usize,
     include_web_content: bool,
-    deferred: &mut Vec<DeferredRow>,
+    deferred: &mut Vec<DeferredRow<S::Element>>,
     label_claims: &mut Vec<(usize, String)>,
 ) {
     if depth > max_depth {
         // A tree that ends exactly at the cap is still complete.
-        match copy_children_checked(element) {
-            Some(below) if below.is_empty() => {}
-            Some(below) => {
-                note_skipped();
-                release_all(below);
-            }
-            None => note_skipped(),
+        match source.children(element) {
+            Read::Absent => {}
+            Read::Known(below) if below.is_empty() => {}
+            Read::Known(_below) => note_skipped(),
+            Read::Unknown(_) => note_skipped(),
         }
         return;
     }
-    let Some(children) = copy_children_checked(element) else {
-        note_skipped();
-        return;
+    let children = match source.children(element) {
+        Read::Known(children) => children,
+        Read::Absent => Vec::new(),
+        Read::Unknown(_) => {
+            note_skipped();
+            return;
+        }
     };
     let tab_plan = if !in_web_content && children.len() >= TAB_STRIP_COMPACTION_THRESHOLD {
-        plan_macos_tab_strip(element, role, &children, budget, batching_disabled)
+        plan_macos_tab_strip(source, element, role, &children, budget, batching_disabled)
     } else {
         None
     };
@@ -1714,7 +1837,7 @@ unsafe fn walk_children(
         && dense_rows::windows_children(rows_windowed(), in_web_content, role, children.len())
     {
         Some(dense_rows::plan_collection_children(
-            element, role, &children, budget,
+            source, element, surface, role, &children, budget,
         ))
     } else {
         None
@@ -1733,7 +1856,6 @@ unsafe fn walk_children(
             }
             if !tp.keep[index] {
                 note_skipped();
-                CFRelease(child as CFTypeRef);
                 continue;
             }
         }
@@ -1743,8 +1865,8 @@ unsafe fn walk_children(
                 anchor: nodes.len(),
                 seq: deferred.len(),
                 position: index,
-                collection: element as usize,
-                element: RetainedElement::retain(child as usize),
+                collection: source.key(element),
+                element: child.clone(),
                 depth,
                 parent_index,
                 parent_role: role.to_owned(),
@@ -1754,7 +1876,9 @@ unsafe fn walk_children(
                 walked: None,
             }),
             ChildPlan::WalkNow => walk_element(
-                child,
+                source,
+                &child,
+                surface,
                 depth,
                 parent_index,
                 Some(role),
@@ -1771,14 +1895,14 @@ unsafe fn walk_children(
                 label_claims,
             ),
         }
-        CFRelease(child as CFTypeRef);
     }
 }
 
-unsafe fn plan_macos_tab_strip(
-    parent: AXUIElementRef,
+fn plan_macos_tab_strip<S: AxTreeSource>(
+    source: &S,
+    parent: &S::Element,
     parent_role: &str,
-    children: &[AXUIElementRef],
+    children: &[S::Element],
     budget: &mut WalkBudget,
     batching_disabled: &mut bool,
 ) -> Option<TabStripCompaction> {
@@ -1788,9 +1912,9 @@ unsafe fn plan_macos_tab_strip(
     ) {
         return None;
     }
-    let parent_title = copy_string_attr(parent, "AXTitle");
-    let parent_desc = copy_string_attr(parent, "AXDescription");
-    let parent_role_desc = copy_string_attr(parent, "AXRoleDescription");
+    let parent_title = known(source.text(parent, "AXTitle"));
+    let parent_desc = known(source.text(parent, "AXDescription"));
+    let parent_role_desc = known(source.text(parent, "AXRoleDescription"));
 
     let mut child_roles = Vec::with_capacity(children.len());
     let mut child_role_descs = Vec::with_capacity(children.len());
@@ -1798,19 +1922,25 @@ unsafe fn plan_macos_tab_strip(
     let mut child_values = Vec::with_capacity(children.len());
     let mut tab_like_count = 0usize;
 
-    for &child in children {
-        set_messaging_timeout(child);
-        let r = copy_string_attr(child, "AXRole").unwrap_or_default();
+    for child in children {
+        source.set_messaging_timeout(child);
+        let r = known(source.text(child, "AXRole")).unwrap_or_default();
         let rd = if r == "AXTab" || r == "AXRadioButton" {
             None
         } else {
-            copy_string_attr(child, "AXRoleDescription")
+            known(source.text(child, "AXRoleDescription"))
         };
         if cua_driver_core::snapshot_compaction::is_tab_like_child(parent_role, &r, rd.as_deref()) {
             tab_like_count += 1;
-            child_selected.push(copy_bool_attr(child, "AXSelected"));
+            child_selected.push(known(source.boolean(child, "AXSelected")));
             let role = if r.is_empty() { "AXUnknown" } else { &r };
-            let attrs = read_content_attrs(child, role, budget, batching_disabled)?;
+            let attrs = super::content_attrs::read_content_attrs_with(
+                source,
+                child,
+                role,
+                budget,
+                batching_disabled,
+            )?;
             let (value, incomplete) = tab_child_value(attrs);
             if incomplete {
                 note_skipped();
@@ -1973,7 +2103,7 @@ mod secure_value_tests {
     fn fake_node(role: AttrStatus, subrole: Option<&str>) -> (AXNode, Vec<&'static str>) {
         let mut reader = Fake::new(subrole);
         let attrs = reader.read(role);
-        let mut node = display_node("AXTextField", attrs, std::ptr::null_mut(), 0, None, false);
+        let mut node = display_node("AXTextField", attrs, 0, 0, None, false);
         node.element_index = Some(0);
         node.value_state = node.value.clone();
         (node, reader.trace)
@@ -2067,7 +2197,7 @@ mod secure_value_tests {
 /// with no index and no children, as for a content read that timed out.
 fn push_timed_out_row(
     role: String,
-    element: AXUIElementRef,
+    element: usize,
     depth: usize,
     parent_index: Option<usize>,
     in_web_content: bool,
@@ -2075,7 +2205,7 @@ fn push_timed_out_row(
     lines: &mut Vec<(usize, String)>,
 ) {
     note_skipped();
-    let node = role_only_node(role, element as usize, depth, parent_index, in_web_content);
+    let node = role_only_node(role, element, depth, parent_index, in_web_content);
     lines.push((depth, format_node_line(&node)));
     nodes.push(node);
 }
@@ -2143,7 +2273,7 @@ fn role_only_node(
 fn display_node(
     role: &str,
     attrs: ContentAttrs,
-    element: AXUIElementRef,
+    element: usize,
     depth: usize,
     parent_element_index: Option<usize>,
     in_web_content: bool,
@@ -2173,7 +2303,7 @@ fn display_node(
         help: attrs.help,
         ..role_only_node(
             role.to_owned(),
-            element as usize,
+            element,
             depth,
             parent_element_index,
             in_web_content,
@@ -2640,7 +2770,7 @@ mod tests {
         let (mut nodes, mut lines) = (Vec::new(), Vec::new());
         push_timed_out_row(
             "AXMenuItem".into(),
-            std::ptr::null_mut(),
+            0,
             2,
             Some(4),
             false,
@@ -3220,7 +3350,7 @@ mod lean_row_tests {
             secure: false,
             value_unknown: false,
         };
-        let node = super::display_node("AXGroup", attrs, std::ptr::null_mut(), 1, None, false);
+        let node = super::display_node("AXGroup", attrs, 0, 1, None, false);
         assert_eq!(node.value.as_deref(), Some("Saved"));
         assert_eq!(node.element_index, None);
     }
@@ -3672,3 +3802,6 @@ mod selectable_row_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod walker_seam_tests;
