@@ -1119,6 +1119,45 @@ fn dense_row_sets_preserve_unknown_and_absent() {
 }
 
 #[test]
+fn dense_child_role_preserves_unknown_and_absent() {
+    for case in CASES {
+        let mut steps = vec![
+            step("set 1 AXRows", Reply::Set(Read::Absent)),
+            step("set 1 AXVisibleRows", Reply::Set(Read::Known(vec![2]))),
+            step("timeout 2", Reply::Unit),
+            step("text 2 AXRole", Reply::Text(case.read("AXRow".into()))),
+        ];
+        if matches!(case, Case::Known) {
+            steps.push(step("contains 2 [2]", Reply::Unit));
+        }
+        let fake = Fake::new(&[(1, 1, 1, &[2]), (2, 2, 2, &[])], steps);
+        let root = fake.handle(1);
+        let child = fake.handle(2);
+        let observed = dense_rows::plan_collection_children_observed(
+            &fake,
+            &root,
+            &root,
+            "AXTable",
+            std::slice::from_ref(&child),
+            &WalkBudget::nodes_only(10),
+        );
+        assert_eq!(
+            observed.legacy,
+            [if matches!(case, Case::Known) {
+                ChildPlan::Defer { visible: true }
+            } else {
+                ChildPlan::WalkNow
+            }]
+        );
+        fake.assert_consumed();
+        drop(child);
+        drop(root);
+        fake.assert_lifetimes(&[]);
+        assert_evidence(&observed.evidence, ReadSite::Dense("AXRole"), case.status());
+    }
+}
+
+#[test]
 fn malformed_children_preserve_valid_items_and_decode_evidence() {
     let observed =
         crate::ax::tree_source::native::decode_child_members([Some(11), None, Some(33)], |item| {
