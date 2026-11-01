@@ -14,6 +14,8 @@ mod get_window_state;
 #[cfg(test)]
 pub(crate) use get_window_state::build_elements_array_with_token as test_build_elements_array;
 #[cfg(test)]
+pub(crate) use get_window_state::build_observation_elements_array as test_build_observation_array;
+#[cfg(test)]
 pub(crate) use get_window_state::element_entry as test_element_entry;
 mod hotkey;
 mod invoke_menu;

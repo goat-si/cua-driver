@@ -2806,7 +2806,8 @@ mod tests {
 
     #[test]
     fn wave_400b_rows_inherit_the_first_descendant_text_without_crossing_rows() {
-        let row = node(Some(0), "AXRow", None, 1, None, None, vec![]);
+        let mut row = node(Some(0), "AXRow", None, 1, None, None, vec![]);
+        row.owned_row_label = Some(Some("Sender".into()));
         let mut text = node(None, "AXStaticText", None, 2, Some(0), None, vec![]);
         text.value = Some("Sender".into());
         let next = node(Some(1), "AXRow", Some("Next row"), 1, None, None, vec![]);
@@ -2824,7 +2825,8 @@ mod tests {
 
     #[test]
     fn wave_400b_actionless_rows_stay_out_of_the_public_action_array() {
-        let row = node(None, "AXCell", None, 1, None, None, vec![]);
+        let mut row = node(None, "AXCell", None, 1, None, None, vec![]);
+        row.owned_row_label = Some(Some("Cell value".into()));
         let mut text = node(None, "AXTextField", None, 2, None, None, vec![]);
         text.description = Some("Cell value".into());
         let nodes = vec![row, text];
@@ -2835,7 +2837,8 @@ mod tests {
 
     #[test]
     fn wave_400b_outline_rows_inherit_a_text_field_title() {
-        let row = node(Some(0), "AXOutlineRow", None, 1, None, None, vec![]);
+        let mut row = node(Some(0), "AXOutlineRow", None, 1, None, None, vec![]);
+        row.owned_row_label = Some(Some("Outline value".into()));
         let text = node(
             None,
             "AXTextField",

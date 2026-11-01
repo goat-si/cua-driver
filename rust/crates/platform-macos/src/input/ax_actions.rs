@@ -28,7 +28,7 @@ pub(crate) trait SelectionOps {
     fn role(&mut self, element: &Self::Element) -> Option<String>;
     fn parent(&mut self, element: &Self::Element) -> Option<Self::Element>;
     fn selected(&mut self, element: &Self::Element) -> Option<bool>;
-    fn select(&mut self, element: &Self::Element) -> bool;
+    fn select(&mut self, element: &Self::Element) -> Result<(), AXError>;
     fn center(&mut self, element: &Self::Element) -> Option<(f64, f64)>;
 }
 
@@ -67,8 +67,13 @@ impl SelectionOps for LiveSelectionOps {
     fn selected(&mut self, element: &Self::Element) -> Option<bool> {
         unsafe { copy_bool_attr(element.0, "AXSelected") }
     }
-    fn select(&mut self, element: &Self::Element) -> bool {
-        unsafe { set_bool_attr_true(element.0, "AXSelected") == kAXErrorSuccess }
+    fn select(&mut self, element: &Self::Element) -> Result<(), AXError> {
+        let result = unsafe { set_bool_attr_true(element.0, "AXSelected") };
+        if result == kAXErrorSuccess {
+            Ok(())
+        } else {
+            Err(result)
+        }
     }
     fn center(&mut self, element: &Self::Element) -> Option<(f64, f64)> {
         unsafe { element_screen_rect(element.0) }
@@ -127,7 +132,7 @@ pub(crate) fn select_with<B: SelectionOps>(ops: &mut B, start: B::Element) -> Se
         if selectable(role) && ops.selected(item).is_some() {
             let role = role.unwrap().to_owned();
             let sent = ops.select(item);
-            let result = if sent && ops.selected(item) == Some(true) {
+            let result = if sent.is_ok() && ops.selected(item) == Some(true) {
                 SelectAttempt::Confirmed(role)
             } else {
                 SelectAttempt::WriteSentUnconfirmed(role)
@@ -1018,6 +1023,189 @@ mod tests {
 }
 
 #[cfg(test)]
+mod selection_boundary_tests {
+    use super::*;
+
+    struct Fake {
+        roles: Vec<Option<&'static str>>,
+        selected: Vec<Option<bool>>,
+        reads: Vec<usize>,
+        parents: Vec<usize>,
+        writes: Vec<usize>,
+        fail_after_write: bool,
+        fail_readback: bool,
+    }
+    impl SelectionOps for Fake {
+        type Element = usize;
+        fn role(&mut self, n: &usize) -> Option<String> {
+            self.roles[*n].map(str::to_owned)
+        }
+        fn parent(&mut self, n: &usize) -> Option<usize> {
+            self.parents.push(*n);
+            (*n + 1 < self.roles.len()).then_some(*n + 1)
+        }
+        fn selected(&mut self, n: &usize) -> Option<bool> {
+            self.reads.push(*n);
+            if self.fail_readback && self.writes.contains(n) {
+                None
+            } else {
+                self.selected[*n]
+            }
+        }
+        fn select(&mut self, n: &usize) -> Result<(), AXError> {
+            self.writes.push(*n);
+            self.selected[*n] = Some(true);
+            if self.fail_after_write {
+                Err(kAXErrorIllegalArgument)
+            } else {
+                Ok(())
+            }
+        }
+        fn center(&mut self, n: &usize) -> Option<(f64, f64)> {
+            Some((*n as f64, 0.0))
+        }
+    }
+    fn fake(roles: &[Option<&'static str>], selected: &[Option<bool>]) -> Fake {
+        Fake {
+            roles: roles.to_vec(),
+            selected: selected.to_vec(),
+            reads: vec![],
+            parents: vec![],
+            writes: vec![],
+            fail_after_write: false,
+            fail_readback: false,
+        }
+    }
+
+    #[test]
+    fn a_label_child_never_climbs_past_its_first_item() {
+        for boundary in [
+            Some("AXRow"),
+            Some("AXListItem"),
+            Some("AXImage"),
+            Some("AXOutlineRow"),
+            None,
+            Some("AXUnknown"),
+        ] {
+            let roles = [Some("AXStaticText"), boundary, Some("AXRow")];
+            let selected = [None, None, Some(false)];
+            let mut ops = fake(&roles, &selected);
+            assert_eq!(select_with(&mut ops, 0), SelectAttempt::NotAttempted);
+            assert!(ops.writes.is_empty());
+            assert!(!ops.parents.contains(&1));
+            let mut ops = fake(&roles, &selected);
+            assert_eq!(selection_state_with(&mut ops, 0), None);
+            assert!(!ops.reads.contains(&2));
+            let mut ops = fake(&roles, &selected);
+            assert!(selection_target_with(&mut ops, 0).is_none());
+            assert!(!ops.reads.contains(&2));
+            let mut ops = fake(&roles, &selected);
+            assert_eq!(selection_center_with(&mut ops, 0), None);
+            assert!(!ops.reads.contains(&2));
+            let mut ops = fake(&roles, &selected);
+            let (snapshot, _) = selection_snapshot_with(&mut ops, 0);
+            ops.selected[2] = Some(true);
+            assert!(!snapshot
+                .iter()
+                .any(|(n, before)| !before && ops.selected[*n] == Some(true)));
+            assert!(!ops.reads.contains(&2));
+        }
+    }
+
+    #[test]
+    fn illegal_argument_after_state_change_sends_nothing_more() {
+        let mut ops = fake(
+            &[Some("AXStaticText"), Some("AXCell"), Some("AXRow")],
+            &[None, Some(false), Some(false)],
+        );
+        ops.fail_after_write = true;
+        assert_eq!(
+            select_with(&mut ops, 0),
+            SelectAttempt::WriteSentUnconfirmed("AXCell".into())
+        );
+        assert_eq!(ops.selected[1], Some(true));
+        assert_eq!(ops.writes, [1]);
+        assert!(!ops.parents.contains(&1));
+    }
+
+    #[test]
+    fn failed_confirmation_stops_before_any_other_write() {
+        let mut ops = fake(
+            &[Some("AXStaticText"), Some("AXCell"), Some("AXRow")],
+            &[None, Some(false), Some(false)],
+        );
+        ops.fail_readback = true;
+        assert_eq!(
+            select_with(&mut ops, 0),
+            SelectAttempt::WriteSentUnconfirmed("AXCell".into())
+        );
+        assert_eq!(ops.writes, [1]);
+        assert!(!ops.parents.contains(&1));
+    }
+
+    #[test]
+    fn a_cell_does_not_cross_a_non_row_parent() {
+        let mut ops = fake(
+            &[
+                Some("AXStaticText"),
+                Some("AXCell"),
+                Some("AXGroup"),
+                Some("AXRow"),
+            ],
+            &[None, None, None, Some(false)],
+        );
+        assert_eq!(select_with(&mut ops, 0), SelectAttempt::NotAttempted);
+        assert!(ops.writes.is_empty());
+        assert!(!ops.parents.contains(&2));
+    }
+
+    #[test]
+    fn icon_view_image_and_list_item_select_as_before() {
+        for role in ["AXImage", "AXListItem"] {
+            let mut ops = fake(&[Some(role)], &[Some(false)]);
+            assert_eq!(
+                select_with(&mut ops, 0),
+                SelectAttempt::Confirmed(role.into())
+            );
+        }
+    }
+
+    #[test]
+    fn label_child_climbs_to_its_row() {
+        let mut ops = fake(&[Some("AXStaticText"), Some("AXRow")], &[None, Some(false)]);
+        assert_eq!(
+            select_with(&mut ops, 0),
+            SelectAttempt::Confirmed("AXRow".into())
+        );
+    }
+
+    #[test]
+    fn a_cell_label_child_reaches_its_row() {
+        let mut ops = fake(
+            &[
+                Some("AXStaticText"),
+                Some("AXCell"),
+                Some("AXRow"),
+                Some("AXRow"),
+            ],
+            &[None, None, Some(false), Some(false)],
+        );
+        assert_eq!(
+            select_with(&mut ops, 0),
+            SelectAttempt::Confirmed("AXRow".into())
+        );
+        assert_eq!(ops.writes, [2]);
+    }
+
+    #[test]
+    fn eight_level_cap_kept() {
+        let mut ops = fake(&[Some("AXGroup"); 9], &[None; 9]);
+        assert_eq!(selection_state_with(&mut ops, 0), None);
+        assert_eq!(ops.parents, [0, 1, 2, 3, 4, 5, 6]);
+    }
+}
+
+#[cfg(test)]
 mod climb_limit_tests {
     use super::*;
 
@@ -1044,9 +1232,13 @@ mod climb_limit_tests {
             self.reads.push(*n);
             self.selected[*n]
         }
-        fn select(&mut self, n: &usize) -> bool {
+        fn select(&mut self, n: &usize) -> Result<(), AXError> {
             self.writes.push(*n);
-            self.write_succeeds
+            if self.write_succeeds {
+                Ok(())
+            } else {
+                Err(kAXErrorCannotComplete)
+            }
         }
         fn center(&mut self, n: &usize) -> Option<(f64, f64)> {
             self.centers.push(*n);
