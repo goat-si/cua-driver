@@ -461,6 +461,36 @@ fn selected_probe_before_deadline(
     }
 }
 
+fn selected_probe_observed(
+    owner: Option<usize>,
+    expired: bool,
+    probe: impl FnOnce() -> super::write_outcome::Settable,
+    skipped: impl FnOnce(),
+) -> super::evidence::Observed<super::write_outcome::Settable> {
+    use super::evidence::{EvidenceStatus, Observed, ReadEvidence, ReadSite};
+    use super::tree_source::ReadFailure;
+    use super::write_outcome::Settable;
+    let legacy = selected_probe_before_deadline(expired, probe, skipped);
+    let status = if expired {
+        EvidenceStatus::DeadlineExpired
+    } else {
+        match legacy {
+            Settable::Yes | Settable::No => EvidenceStatus::Known,
+            Settable::Unknown(error) => EvidenceStatus::Unknown(ReadFailure::Ax(error)),
+        }
+    };
+    Observed {
+        legacy,
+        evidence: vec![ReadEvidence {
+            owner,
+            site: ReadSite::SelectedSettable,
+            status,
+            attempt: 0,
+            listing: None,
+        }],
+    }
+}
+
 pub(super) fn apply_owned_label_claims(nodes: &mut [AXNode], claims: Vec<(usize, String)>) {
     for (owner, label) in claims {
         if let Some(node) = nodes
@@ -678,6 +708,45 @@ pub fn walk_tree_budgeted(
 }
 
 fn walk_tree_with_web_content(
+    pid: i32,
+    window_id: Option<u32>,
+    query: Option<&str>,
+    max_depth: usize,
+    budget: WalkBudget,
+    include_web_content: bool,
+) -> TreeWalkResult {
+    walk_tree_with_web_content_observed(
+        pid,
+        window_id,
+        query,
+        max_depth,
+        budget,
+        include_web_content,
+    )
+    .legacy
+}
+
+pub(crate) fn walk_tree_with_web_content_observed(
+    pid: i32,
+    window_id: Option<u32>,
+    query: Option<&str>,
+    max_depth: usize,
+    budget: WalkBudget,
+    include_web_content: bool,
+) -> super::evidence::Observed<TreeWalkResult> {
+    let scope = super::evidence::EvidenceScope::start();
+    let result = walk_tree_with_web_content_inner(
+        pid,
+        window_id,
+        query,
+        max_depth,
+        budget,
+        include_web_content,
+    );
+    scope.finish(result)
+}
+
+fn walk_tree_with_web_content_inner(
     pid: i32,
     window_id: Option<u32>,
     query: Option<&str>,
@@ -1285,7 +1354,9 @@ fn walk_element<S: AxTreeSource>(
     // element, so every descendant must be bounded before any attribute read.
     source.set_messaging_timeout(element);
 
-    let role_observed = known(source.text(element, "AXRole"));
+    let role_observation = source.text(element, "AXRole");
+    let role_status = super::evidence::read_status(&role_observation);
+    let role_observed = known(role_observation);
     let role_read = role_observed.is_some();
     let role = role_observed.unwrap_or_else(|| {
         // A selector on the role cannot be answered for this node.
@@ -1294,7 +1365,14 @@ fn walk_element<S: AxTreeSource>(
     });
 
     let label_path = next_label_path(parent_path, parent_role, Some(&role));
-    let child_label_path = child_label_path(label_path, &role, parent_role, source.key(element));
+    let element_key = source.key(element);
+    let _evidence_owner = super::evidence::EvidenceOwner::start(element_key);
+    super::evidence::record_status(
+        Some(element_key),
+        super::evidence::ReadSite::Role,
+        role_status,
+    );
+    let child_label_path = child_label_path(label_path, &role, parent_role, element_key);
     let in_web_content = in_web_content || is_web_content_role(&role);
     if in_web_content && !include_web_content {
         note_skipped();
@@ -1354,9 +1432,23 @@ fn walk_element<S: AxTreeSource>(
                 (
                     (
                         None,
-                        trimmed_label(known(source.text(element, "AXDescription"))),
+                        trimmed_label(known(
+                            super::evidence::observe_read(
+                                Some(element_key),
+                                super::evidence::ReadSite::Scrollbar("AXDescription"),
+                                source.text(element, "AXDescription"),
+                            )
+                            .into_walk_legacy(),
+                        )),
                         None,
-                        known(source.text(element, "AXIdentifier")),
+                        known(
+                            super::evidence::observe_read(
+                                Some(element_key),
+                                super::evidence::ReadSite::Scrollbar("AXIdentifier"),
+                                source.text(element, "AXIdentifier"),
+                            )
+                            .into_walk_legacy(),
+                        ),
                     ),
                     false,
                 )
@@ -1382,11 +1474,26 @@ fn walk_element<S: AxTreeSource>(
                 description,
                 identifier,
                 help: None,
-                actions: known(source.action_names(element)).unwrap_or_default(),
+                actions: known(
+                    super::evidence::observe_read(
+                        Some(element_key),
+                        super::evidence::ReadSite::ActionNames,
+                        source.action_names(element),
+                    )
+                    .into_walk_legacy(),
+                )
+                .unwrap_or_default(),
                 element_ptr: snapshot_key,
                 depth,
                 parent_element_index: parent_index,
-                frame: known(source.frame(element)),
+                frame: known(
+                    super::evidence::observe_read(
+                        Some(element_key),
+                        super::evidence::ReadSite::Frame("scroll"),
+                        source.frame(element),
+                    )
+                    .into_walk_legacy(),
+                ),
                 value_state: if secure {
                     Some("[redacted]".into())
                 } else if value_unknown {
@@ -1541,7 +1648,15 @@ fn walk_element<S: AxTreeSource>(
         // A label read failed: a selector on it cannot be answered.
         note_skipped();
     }
-    let actions = known(source.action_names(element)).unwrap_or_default();
+    let actions = known(
+        super::evidence::observe_read(
+            Some(element_key),
+            super::evidence::ReadSite::ActionNames,
+            source.action_names(element),
+        )
+        .into_walk_legacy(),
+    )
+    .unwrap_or_default();
     let visible_title = title.as_deref().unwrap_or("").trim().to_owned();
     let visible_description = description.as_deref().unwrap_or("").trim().to_owned();
     let visible_value = value.as_deref().unwrap_or("").trim().to_owned();
@@ -1574,6 +1689,21 @@ fn walk_element<S: AxTreeSource>(
     };
     let value_settable_observed_at = value_settable_read.map(|_| std::time::Instant::now());
     let value_settable_in_time = !budget.expired();
+    if let Some(value) = value_settable_read {
+        let read = match value {
+            super::write_outcome::Settable::Yes => Read::Known(true),
+            super::write_outcome::Settable::No => Read::Known(false),
+            super::write_outcome::Settable::Unknown(error) => {
+                Read::Unknown(super::tree_source::ReadFailure::Ax(error))
+            }
+        };
+        super::evidence::observe_read(
+            Some(element_key),
+            super::evidence::ReadSite::ValueSettable,
+            read,
+        )
+        .into_walk_legacy();
+    }
     let value_settable = matches!(
         value_settable_read,
         Some(super::write_outcome::Settable::Yes)
@@ -1588,11 +1718,13 @@ fn walk_element<S: AxTreeSource>(
         actions.is_empty(),
         value_settable,
         || {
-            selected_probe_before_deadline(
+            selected_probe_observed(
+                Some(element_key),
                 budget.expired(),
                 || source.selected_settable(element),
                 note_skipped,
             )
+            .into_walk_legacy()
         },
     );
     let actionless_control = selectable_row
@@ -1845,7 +1977,14 @@ fn walk_element<S: AxTreeSource>(
     // and ate the node budget before the window content.
     let collapse_here = role == "AXMenuBarItem"
         && MENUS_COLLAPSED.with(std::cell::Cell::get)
-        && known(source.boolean(element, "AXSelected")) != Some(true);
+        && known(
+            super::evidence::observe_read(
+                Some(element_key),
+                super::evidence::ReadSite::MenuSelected,
+                source.boolean(element, "AXSelected"),
+            )
+            .into_walk_legacy(),
+        ) != Some(true);
     let line = if role == "AXMenuBar" && MENUS_COLLAPSED.with(std::cell::Cell::get) {
         format!("{} {COLLAPSED_MENU_NOTE}", format_node_line(&node))
     } else {
@@ -1901,7 +2040,7 @@ fn walk_children<S: AxTreeSource>(
 ) {
     if depth > max_depth {
         // A tree that ends exactly at the cap is still complete.
-        match source.children(element) {
+        match source.observed_children(element).into_walk_legacy() {
             Read::Absent => {}
             Read::Known(below) if below.is_empty() => {}
             Read::Known(_below) => note_skipped(),
@@ -1909,7 +2048,7 @@ fn walk_children<S: AxTreeSource>(
         }
         return;
     }
-    let children = match source.children(element) {
+    let children = match source.observed_children(element).into_walk_legacy() {
         Read::Known(children) => children,
         Read::Absent => Vec::new(),
         Read::Unknown(_) => {
@@ -1918,7 +2057,8 @@ fn walk_children<S: AxTreeSource>(
         }
     };
     let tab_plan = if !in_web_content && children.len() >= TAB_STRIP_COMPACTION_THRESHOLD {
-        plan_macos_tab_strip(source, element, role, &children, budget, batching_disabled)
+        plan_macos_tab_strip_observed(source, element, role, &children, budget, batching_disabled)
+            .into_walk_legacy()
     } else {
         None
     };
@@ -2012,6 +2152,7 @@ fn plan_macos_tab_strip<S: AxTreeSource>(
     let mut tab_like_count = 0usize;
 
     for child in children {
+        let _evidence_owner = super::evidence::EvidenceOwner::start(source.key(child));
         source.set_messaging_timeout(child);
         let r = known(source.text(child, "AXRole")).unwrap_or_default();
         let rd = if r == "AXTab" || r == "AXRadioButton" {
@@ -2062,6 +2203,30 @@ fn plan_macos_tab_strip<S: AxTreeSource>(
         parent_role_desc.as_deref(),
         &metas,
     )
+}
+
+fn plan_macos_tab_strip_observed<S: AxTreeSource>(
+    source: &S,
+    parent: &S::Element,
+    parent_role: &str,
+    children: &[S::Element],
+    budget: &mut WalkBudget,
+    batching_disabled: &mut bool,
+) -> super::evidence::Observed<Option<TabStripCompaction>> {
+    let source = super::evidence_source::EvidenceSource::new(
+        source,
+        super::evidence_source::Domain::Tab,
+        None,
+    );
+    let result = plan_macos_tab_strip(
+        &source,
+        parent,
+        parent_role,
+        children,
+        budget,
+        batching_disabled,
+    );
+    source.finish(result)
 }
 
 fn tab_child_value(attrs: ContentAttrs) -> (Option<String>, bool) {
@@ -3917,6 +4082,8 @@ mod selectable_row_tests {
 }
 
 #[cfg(test)]
+mod evidence_preservation_tests;
+#[cfg(test)]
 mod walker_seam_tests;
 
 #[cfg(test)]
@@ -4040,3 +4207,5 @@ mod canonical_evidence_tests {
         walker_seam_tests::scroll_area_preserves_position_labels_and_read_order();
     }
 }
+#[cfg(test)]
+mod walker_test_support;

@@ -21,6 +21,7 @@ pub(crate) enum Read<T> {
     Unknown(ReadFailure),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ReadFailure {
     Ax(AXError),
     WrongType,
@@ -86,8 +87,20 @@ pub(crate) trait AxTreeSource {
     fn position(&self, element: &Self::Element) -> Read<(f64, f64)>;
     fn size(&self, element: &Self::Element) -> Read<(f64, f64)>;
     fn value(&self, element: &Self::Element) -> Result<Option<StringishAttrValue>, AXError>;
+    fn observed_value(
+        &self,
+        element: &Self::Element,
+    ) -> super::evidence::Observed<Result<Option<StringishAttrValue>, AXError>> {
+        super::evidence::Observed::legacy_only(self.value(element))
+    }
     fn batch(&self, element: &Self::Element, names: &[&str]) -> Result<Self::Batch, BatchFailure>;
     fn children(&self, element: &Self::Element) -> Read<Vec<Self::Element>>;
+    fn observed_children(
+        &self,
+        element: &Self::Element,
+    ) -> super::evidence::Observed<Read<Vec<Self::Element>>> {
+        super::evidence::Observed::legacy_only(self.children(element))
+    }
     fn element_attribute(&self, element: &Self::Element, name: &str) -> Read<Self::Element>;
     fn element_set(&self, element: &Self::Element, name: &str) -> Read<Self::ElementSet>;
     fn set_contains(&self, set: &Self::ElementSet, element: &Self::Element) -> bool;

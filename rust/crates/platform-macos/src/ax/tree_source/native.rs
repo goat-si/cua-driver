@@ -18,6 +18,83 @@ pub(crate) struct NativeElementSet {
     buckets: HashMap<usize, Vec<CFTypeRef>>,
 }
 
+/// Decode members without changing their order or discarding usable elements
+/// when another member has the wrong type.
+pub(crate) fn decode_child_members<I, T>(
+    items: I,
+    mut decode: impl FnMut(I::Item) -> Option<T>,
+) -> crate::ax::evidence::Observed<Vec<T>>
+where
+    I: IntoIterator,
+{
+    use crate::ax::evidence::{EvidenceStatus, Observed, ReadEvidence, ReadSite};
+    let mut legacy = Vec::new();
+    let mut evidence = Vec::new();
+    for item in items {
+        match decode(item) {
+            Some(item) => legacy.push(item),
+            None => evidence.push(ReadEvidence {
+                owner: None,
+                site: ReadSite::Children,
+                status: EvidenceStatus::Unknown(ReadFailure::WrongType),
+                attempt: 0,
+                listing: None,
+            }),
+        }
+    }
+    Observed { legacy, evidence }
+}
+
+pub(crate) fn decode_element_set_members<I, T>(
+    items: I,
+    owner: Option<usize>,
+    name: &'static str,
+    decode: impl FnMut(I::Item) -> Option<T>,
+) -> crate::ax::evidence::Observed<Vec<T>>
+where
+    I: IntoIterator,
+{
+    let mut observed = decode_child_members(items, decode);
+    for entry in &mut observed.evidence {
+        entry.owner = owner;
+        entry.site = crate::ax::evidence::ReadSite::ElementSet(name);
+    }
+    observed
+}
+
+pub(crate) fn scalar_outcome<T>(
+    error: AXError,
+    is_null: bool,
+    decode: impl FnOnce() -> Option<T>,
+) -> Read<T> {
+    if error != kAXErrorSuccess {
+        return if [kAXErrorNoValue, kAXErrorAttributeUnsupported].contains(&error) {
+            Read::Absent
+        } else {
+            Read::Unknown(ReadFailure::Ax(error))
+        };
+    }
+    if is_null {
+        return Read::Absent;
+    }
+    decode().map_or(Read::Unknown(ReadFailure::WrongType), Read::Known)
+}
+
+pub(crate) fn observed_children_read<T>(
+    owner: usize,
+    legacy: Read<Vec<T>>,
+) -> crate::ax::evidence::Observed<Read<Vec<T>>> {
+    use crate::ax::evidence::{read_status, Observed, ReadEvidence, ReadSite};
+    let evidence = vec![ReadEvidence {
+        owner: Some(owner),
+        site: ReadSite::Children,
+        status: read_status(&legacy),
+        attempt: 0,
+        listing: None,
+    }];
+    Observed { legacy, evidence }
+}
+
 impl NativeElement {
     fn raw(&self) -> AXUIElementRef {
         self.0.as_ptr()
@@ -33,19 +110,11 @@ unsafe fn scalar<T>(
     let attr = CFString::new(name);
     let mut value = std::ptr::null();
     let error = AXUIElementCopyAttributeValue(element, attr.as_concrete_TypeRef(), &mut value);
-    if error != kAXErrorSuccess {
-        return if [kAXErrorNoValue, kAXErrorAttributeUnsupported].contains(&error) {
-            Read::Absent
-        } else {
-            Read::Unknown(ReadFailure::Ax(error))
-        };
+    let result = scalar_outcome(error, value.is_null(), || decode(value));
+    if error == kAXErrorSuccess && !value.is_null() {
+        CFRelease(value);
     }
-    if value.is_null() {
-        return Read::Absent;
-    }
-    let decoded = decode(value);
-    CFRelease(value);
-    decoded.map_or(Read::Unknown(ReadFailure::WrongType), Read::Known)
+    result
 }
 
 impl AxTreeSource for NativeSource {
@@ -83,10 +152,19 @@ impl AxTreeSource for NativeSource {
         unsafe { scalar(element.raw(), "AXSize", size_from_cf) }
     }
     fn value(&self, element: &NativeElement) -> Result<Option<StringishAttrValue>, AXError> {
+        self.observed_value(element).legacy
+    }
+    fn observed_value(
+        &self,
+        element: &NativeElement,
+    ) -> crate::ax::evidence::Observed<Result<Option<StringishAttrValue>, AXError>> {
         unsafe {
-            crate::ax::content_attrs::single_read(element.raw(), "AXValue", |value| {
-                stringish_from_cf(value)
-            })
+            crate::ax::content_attrs::single_read(
+                element.raw(),
+                "AXValue",
+                |value| stringish_from_cf(value),
+                Some(self.key(element)),
+            )
         }
     }
     fn batch(&self, element: &NativeElement, names: &[&str]) -> Result<NativeBatch, BatchFailure> {
@@ -96,6 +174,12 @@ impl AxTreeSource for NativeSource {
         }
     }
     fn children(&self, element: &NativeElement) -> Read<Vec<NativeElement>> {
+        self.observed_children(element).into_walk_legacy()
+    }
+    fn observed_children(
+        &self,
+        element: &NativeElement,
+    ) -> crate::ax::evidence::Observed<Read<Vec<NativeElement>>> {
         unsafe {
             let attr = CFString::new("AXChildren");
             let mut value = std::ptr::null();
@@ -105,28 +189,38 @@ impl AxTreeSource for NativeSource {
                 &mut value,
             );
             if !children_read_succeeded(error) {
-                return Read::Unknown(ReadFailure::Ax(error));
+                return observed_children_read(
+                    self.key(element),
+                    Read::Unknown(ReadFailure::Ax(error)),
+                );
             }
             if error != kAXErrorSuccess || value.is_null() {
-                return Read::Absent;
+                return observed_children_read(self.key(element), Read::Absent);
             }
             if CFGetTypeID(value) != CFArray::<CFTypeRef>::type_id() {
                 CFRelease(value);
-                return Read::Unknown(ReadFailure::WrongType);
+                return observed_children_read(
+                    self.key(element),
+                    Read::Unknown(ReadFailure::WrongType),
+                );
             }
             let array = CFArray::<CFTypeRef>::wrap_under_create_rule(value as _);
             let ax_type = AXUIElementGetTypeID();
-            let children = (0..array.len())
-                .filter_map(|i| {
-                    let item = *array.get(i)?;
-                    if CFGetTypeID(item) != ax_type {
-                        return None;
-                    }
-                    CFRetain(item);
-                    Some(NativeElement::from_owned(item as AXUIElementRef))
-                })
-                .collect();
-            Read::Known(children)
+            let mut children = decode_child_members(0..array.len(), |i| {
+                let item = *array.get(i)?;
+                if CFGetTypeID(item) != ax_type {
+                    return None;
+                }
+                CFRetain(item);
+                Some(NativeElement::from_owned(item as AXUIElementRef))
+            });
+            for entry in &mut children.evidence {
+                entry.owner = Some(self.key(element));
+            }
+            let mut observed =
+                observed_children_read(self.key(element), Read::Known(children.legacy));
+            observed.evidence.extend(children.evidence);
+            observed
         }
     }
     fn element_attribute(&self, element: &NativeElement, name: &str) -> Read<NativeElement> {
@@ -179,11 +273,22 @@ impl AxTreeSource for NativeSource {
                 return Read::Unknown(ReadFailure::WrongType);
             }
             let array = CFArray::<CFTypeRef>::wrap_under_create_rule(value as _);
+            let site = match name {
+                "AXRows" => "AXRows",
+                "AXVisibleRows" => "AXVisibleRows",
+                "AXVisibleChildren" => "AXVisibleChildren",
+                _ => "other",
+            };
+            let members = decode_element_set_members(
+                array.iter().map(|item| *item),
+                Some(self.key(element)),
+                site,
+                |item| (CFGetTypeID(item) == AXUIElementGetTypeID()).then_some(item),
+            )
+            .into_walk_legacy();
             let mut buckets: HashMap<usize, Vec<CFTypeRef>> = HashMap::new();
-            for item in array.iter() {
-                if CFGetTypeID(*item) == AXUIElementGetTypeID() {
-                    buckets.entry(CFHash(*item)).or_default().push(*item);
-                }
+            for item in members {
+                buckets.entry(CFHash(item)).or_default().push(item);
             }
             if buckets.is_empty() {
                 Read::Absent

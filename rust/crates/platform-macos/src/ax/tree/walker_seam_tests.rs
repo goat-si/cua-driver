@@ -1,13 +1,13 @@
+use super::walker_test_support::{Batch, Slot};
 use super::*;
 use crate::ax::batch_attrs::BatchFailure;
 use crate::ax::content_attrs::AttrStatus;
-use crate::ax::tree_source::TreeBatch;
 use crate::ax::write_outcome::Settable;
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 
-struct Fake {
+pub(super) struct Fake {
     state: Rc<RefCell<State>>,
 }
 
@@ -20,7 +20,7 @@ struct State {
     snapshot_credits: HashMap<usize, usize>,
 }
 
-struct Handle {
+pub(super) struct Handle {
     id: usize,
     state: Rc<RefCell<State>>,
 }
@@ -47,60 +47,8 @@ impl Drop for Handle {
     }
 }
 
-#[derive(Clone)]
-enum Slot {
-    Text(AttrStatus),
-    MixedText(String),
-    Bool(Option<bool>),
-    Number(Option<f64>),
-    Point(Option<(f64, f64)>),
-    Size(Option<(f64, f64)>),
-}
-struct Batch(Vec<Slot>);
-impl TreeBatch for Batch {
-    fn text(&self, i: usize) -> AttrStatus {
-        match &self.0[i] {
-            Slot::Text(v) => v.clone(),
-            Slot::MixedText(v) => AttrStatus::Known(v.clone()),
-            _ => panic!("wrong text slot"),
-        }
-    }
-    fn boolean(&self, i: usize) -> Read<bool> {
-        match self.0[i] {
-            Slot::Bool(v) => read(v),
-            Slot::MixedText(_) => Read::Unknown(super::super::tree_source::ReadFailure::WrongType),
-            _ => panic!("wrong bool slot"),
-        }
-    }
-    fn number(&self, i: usize) -> Read<f64> {
-        match self.0[i] {
-            Slot::Number(v) => read(v),
-            Slot::Bool(None) => Read::Absent,
-            Slot::Bool(Some(_)) | Slot::MixedText(_) => {
-                Read::Unknown(super::super::tree_source::ReadFailure::WrongType)
-            }
-            _ => panic!("wrong number slot"),
-        }
-    }
-    fn position(&self, i: usize) -> Read<(f64, f64)> {
-        match self.0[i] {
-            Slot::Point(v) => read(v),
-            _ => panic!("wrong position slot"),
-        }
-    }
-    fn size(&self, i: usize) -> Read<(f64, f64)> {
-        match self.0[i] {
-            Slot::Size(v) => read(v),
-            _ => panic!("wrong size slot"),
-        }
-    }
-}
-fn read<T>(value: Option<T>) -> Read<T> {
-    value.map_or(Read::Absent, Read::Known)
-}
-
 // Every target read must be explicitly scripted; scripts are in global order.
-enum Reply {
+pub(super) enum Reply {
     Unit,
     Nested(Box<dyn FnOnce()>),
     Text(Read<String>),
@@ -115,9 +63,10 @@ enum Reply {
     Set(Read<Vec<usize>>),
     Actions(Read<Vec<String>>),
     Writable(bool),
+    WritableFailure(AXError),
     Selected(Settable),
 }
-struct Step {
+pub(super) struct Step {
     operation: String,
     reply: Reply,
 }
@@ -142,7 +91,7 @@ impl Fake {
             }
         }
     }
-    fn handle(&self, id: usize) -> Handle {
+    pub(super) fn handle(&self, id: usize) -> Handle {
         assert_ne!(id, 0);
         let mut state = self.state.borrow_mut();
         assert!(state.identities.contains_key(&id), "unknown fake id {id}");
@@ -154,7 +103,7 @@ impl Fake {
             state: self.state.clone(),
         }
     }
-    fn assert_consumed(&self) {
+    pub(super) fn assert_consumed(&self) {
         assert!(
             self.state.borrow().scripts.is_empty(),
             "unconsumed required operations"
@@ -287,6 +236,7 @@ impl AxTreeSource for Fake {
                     Settable::No
                 }
             }
+            Reply::WritableFailure(error) => Settable::Unknown(error),
             _ => panic!("wrong reply"),
         }
     }
@@ -327,7 +277,7 @@ impl AxTreeSource for Fake {
 }
 
 impl Fake {
-    fn new(nodes: &[(usize, usize, usize, &[usize])], steps: Vec<Step>) -> Self {
+    pub(super) fn new(nodes: &[(usize, usize, usize, &[usize])], steps: Vec<Step>) -> Self {
         let mut identities = HashMap::new();
         let mut children = HashMap::new();
         for &(id, hash, identity, descendants) in nodes {
@@ -351,10 +301,10 @@ impl Fake {
             })),
         }
     }
-    fn trace(&self) -> Vec<String> {
+    pub(super) fn trace(&self) -> Vec<String> {
         self.state.borrow().trace.clone()
     }
-    fn assert_lifetimes(&self, snapshot_credits: &[(usize, usize)]) {
+    pub(super) fn assert_lifetimes(&self, snapshot_credits: &[(usize, usize)]) {
         let state = self.state.borrow();
         assert!(
             state.handles.values().all(|count| *count == 0),
@@ -368,6 +318,30 @@ impl Fake {
 }
 
 fn run_fake(
+    source: &Fake,
+    root: &Handle,
+    query: Option<&str>,
+    max_depth: usize,
+    budget: WalkBudget,
+    include_web_content: bool,
+) -> TreeWalkResult {
+    run_fake_observed(source, root, query, max_depth, budget, include_web_content).legacy
+}
+
+pub(super) fn run_fake_observed(
+    source: &Fake,
+    root: &Handle,
+    query: Option<&str>,
+    max_depth: usize,
+    budget: WalkBudget,
+    include_web_content: bool,
+) -> super::super::evidence::Observed<TreeWalkResult> {
+    let scope = super::super::evidence::EvidenceScope::start();
+    let result = run_fake_inner(source, root, query, max_depth, budget, include_web_content);
+    scope.finish(result)
+}
+
+fn run_fake_inner(
     source: &Fake,
     root: &Handle,
     query: Option<&str>,
@@ -428,7 +402,7 @@ fn run_fake(
     )
 }
 
-fn step(operation: &str, reply: Reply) -> Step {
+pub(super) fn step(operation: &str, reply: Reply) -> Step {
     Step {
         operation: operation.to_owned(),
         reply,
