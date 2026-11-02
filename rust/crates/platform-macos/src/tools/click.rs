@@ -1818,6 +1818,67 @@ impl ClickTool {
                 self.state.cursor_registry.note_press(&cursor_key, cx, cy);
             }
 
+            // The unadvertised-press selection route discovers without writing;
+            // a retained candidate is gated before any selection worker runs.
+            if resolved_action == "AXPress" && modifiers.is_empty() {
+                let held = _mutation_lease.take();
+                let leaf = element_guard.clone();
+                let foreground = delivery_mode.is_foreground();
+                let prepared = latency::spawn_action_blocking(move || {
+                    let run = || prepare_first_selection(&leaf, idx, read_back, foreground);
+                    (run(), held)
+                })
+                .await;
+                let (route, held) = match prepared {
+                    Ok(value) => value,
+                    Err(error) => {
+                        return super::pre_dispatch_refusal(
+                            "action_unavailable",
+                            format!("selection discovery failed: {error}"),
+                        )
+                    }
+                };
+                _mutation_lease = held;
+                match route {
+                    FirstSelectionRoute::Next => {}
+                    FirstSelectionRoute::Stop(reason) => {
+                        return super::pre_dispatch_refusal(
+                            "action_unavailable",
+                            format!("selection target is unknown: {reason}"),
+                        )
+                    }
+                    FirstSelectionRoute::Select((candidate, history)) => {
+                        let prior_front = apps::frontmost_pid();
+                        let snapshot = if foreground {
+                            WindowChangeDetector::snapshot_without_suppression(prior_front)
+                        } else {
+                            WindowChangeDetector::snapshot(prior_front)
+                        };
+                        let (held, result) = run_live_selection_candidate(
+                            SelectionSite::First,
+                            _mutation_lease.take(),
+                            candidate,
+                            history,
+                            pid,
+                            wid,
+                            foreground,
+                        )
+                        .await;
+                        _mutation_lease = held;
+                        let changes = snapshot.detect_sampled_async().await;
+                        return match result {
+                            Ok((outcome, fronted)) => finish_ax_click(
+                                outcome,
+                                fronted,
+                                foreground,
+                                &changes.result_suffix(),
+                            ),
+                            Err(refusal) => refusal,
+                        };
+                    }
+                }
+            }
+
             // Finder icon/list items can expose a readable AXSelected state
             // while refusing both AXSelected writes and AXPress. Resolve a
             // verified coordinate frame only for those collection-like
@@ -1891,6 +1952,7 @@ impl ClickTool {
             // action (and a text input's key hand-back) still runs.
             let action_lease = _mutation_lease.take();
             let probe_target = element_guard.clone();
+            let selection_leaf = element_guard.clone();
             let clock = super::actionability::semantic_clock();
             let use_battery = matches!(
                 click_semantic_intent(&resolved_action),
@@ -1911,7 +1973,7 @@ impl ClickTool {
                         latency::spawn_action_blocking(move || {
                             let held = action_lease;
                             let element_ptr = element_guard.as_ptr();
-                            let run = || -> anyhow::Result<(AxClickOutcome, bool)> {
+                            let run = || -> anyhow::Result<(AxClickStep, bool)> {
                                 if foreground {
                                     let mut outcome = None;
                                     let focus_generation = crate::input::skylight::focus_generation();
@@ -1949,9 +2011,17 @@ impl ClickTool {
                                             action,
                                         )?
                                     };
-                                    let outcome = outcome.ok_or_else(|| {
+                                    let mut outcome = outcome.ok_or_else(|| {
                                         anyhow::anyhow!("foreground AX click did not execute")
                                     })?;
+                                    if fronted || crate::input::skylight::focus_generation() != focus_generation {
+                                        if let AxClickStep::NeedSelection(history) = &mut outcome {
+                                            history.prior = cua_driver_core::mutation::PriorInput::MayHaveDelivered;
+                                            history.press = Some(cua_driver_core::mutation::ChainResult::from_recorded(
+                                                history.press.as_ref().expect("post-press history").outcomes().to_vec(), history.prior,
+                                            ).expect("recorded press"));
+                                        }
+                                    }
                                     Ok((outcome, fronted))
                                 } else {
                                     perform_ax_click(
@@ -2019,43 +2089,43 @@ impl ClickTool {
                 outcome
             });
 
+            let result = match result {
+                Ok(Ok((AxClickStep::Done(outcome), fronted))) => Ok(Ok((outcome, fronted))),
+                Ok(Ok((AxClickStep::NeedSelection(history), fronted))) => {
+                    let (held, selected) = run_live_post_press_selection(
+                        _mutation_lease.take(),
+                        selection_leaf,
+                        history,
+                        pid,
+                        wid,
+                        foreground,
+                    )
+                    .await;
+                    _mutation_lease = held;
+                    match selected {
+                        Ok((outcome, selection_fronted)) => {
+                            Ok(Ok(post_press_delivery(outcome, fronted, selection_fronted)))
+                        }
+                        Err(refusal) => {
+                            let _ = snapshot.detect_sampled_async().await;
+                            return refusal;
+                        }
+                    }
+                }
+                Ok(Err(error)) => Ok(Err(error)),
+                Err(error) => Err(error),
+            };
+
             // Drop the wildcard lease + detect window/foreground side-effects.
             let changes = snapshot.detect_sampled_async().await;
 
             match result {
-                Ok(Ok(((mut msg, suspected_noop, evidence, selection_via_pixel), fronted))) => {
-                    msg.push_str(&changes.result_suffix());
-                    let result = ToolResult::text(msg).with_structured(ax_click_structured(
-                        selection_via_pixel,
-                        fronted,
-                        evidence,
-                        suspected_noop,
-                    ));
-                    match evidence {
-                        Some(evidence) => {
-                            use cua_driver_core::action_record::{
-                                ActionTransport, ActualDelivery, RequestedDelivery,
-                            };
-                            let transport = match (selection_via_pixel, fronted) {
-                                (false, _) => ActionTransport::MacosAxAction,
-                                (true, false) => ActionTransport::MacosCgEventPid,
-                                (true, true) => ActionTransport::MacosCgEventHid,
-                            };
-                            let requested = if delivery_mode.is_foreground() {
-                                RequestedDelivery::Foreground
-                            } else {
-                                RequestedDelivery::Background
-                            };
-                            let actual = if fronted {
-                                ActualDelivery::Foreground
-                            } else {
-                                ActualDelivery::Background
-                            };
-                            result.with_action_record(evidence.record(transport, requested, actual))
-                        }
-                        None => result,
-                    }
-                }
+                Ok(Ok((outcome, fronted))) => finish_ax_click(
+                    outcome,
+                    fronted,
+                    delivery_mode.is_foreground(),
+                    &changes.result_suffix(),
+                ),
                 Ok(Err(e)) => element_click_failure(&e),
                 Err(e) => click_task_failure(format!(
                     "The accessibility click task failed ({e}); the action may have run. Read \
@@ -3057,6 +3127,982 @@ fn ax_click_structured(
 /// selection_verified, selection_via_pixel)`.
 type AxClickOutcome = (String, bool, Option<ClickEvidence>, bool);
 
+#[derive(Clone, Copy)]
+enum SelectionSite {
+    First,
+    PostPress,
+}
+
+async fn dispatch_post_press_selection<C, P, A, F, T>(
+    _site: SelectionSite,
+    clock: &(impl cua_driver_core::actionability::Clock + Sync),
+    budget: std::time::Duration,
+    prior: cua_driver_core::mutation::PriorInput,
+    candidate: C,
+    mut probe: P,
+    write: A,
+) -> Result<T, cua_driver_core::actionability::ActionabilityReport>
+where
+    C: Sync,
+    P: for<'a> FnMut(
+            &'a C,
+            std::time::Duration,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = cua_driver_core::actionability::ActionabilityReport,
+                    > + Send
+                    + 'a,
+            >,
+        > + Send,
+    A: FnOnce(C) -> F,
+    F: std::future::Future<Output = T>,
+{
+    let report = super::actionability::wait(
+        clock,
+        budget,
+        prior == cua_driver_core::mutation::PriorInput::MayHaveDelivered,
+        |remaining| probe(&candidate, remaining),
+    )
+    .await;
+    match report.verdict {
+        cua_driver_core::actionability::Verdict::Pass => Ok(write(candidate).await),
+        cua_driver_core::actionability::Verdict::Terminal { .. } => Err(report),
+        cua_driver_core::actionability::Verdict::Transient { .. } => {
+            unreachable!("wait returns a terminal verdict")
+        }
+    }
+}
+
+enum SelectionStageError<E> {
+    Discovery(E),
+    Refused(Box<cua_driver_core::actionability::ActionabilityReport>),
+}
+
+async fn run_selection_candidate<C, P, A, F, T>(
+    site: SelectionSite,
+    clock: &(impl cua_driver_core::actionability::Clock + Sync),
+    budget: std::time::Duration,
+    prior: cua_driver_core::mutation::PriorInput,
+    context: C,
+    probe: P,
+    write: A,
+) -> Result<T, cua_driver_core::actionability::ActionabilityReport>
+where
+    C: Sync,
+    P: for<'a> FnMut(
+            &'a C,
+            std::time::Duration,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = cua_driver_core::actionability::ActionabilityReport,
+                    > + Send
+                    + 'a,
+            >,
+        > + Send,
+    A: FnOnce(C) -> F,
+    F: std::future::Future<Output = T>,
+{
+    dispatch_post_press_selection(site, clock, budget, prior, context, probe, write).await
+}
+
+async fn run_post_press_selection<C, D, E, P, A, F, T>(
+    clock: &(impl cua_driver_core::actionability::Clock + Sync),
+    budget: std::time::Duration,
+    prior: cua_driver_core::mutation::PriorInput,
+    discovery: D,
+    probe: P,
+    write: A,
+) -> Result<T, SelectionStageError<E>>
+where
+    C: Sync,
+    D: std::future::Future<Output = Result<C, E>>,
+    P: for<'a> FnMut(
+            &'a C,
+            std::time::Duration,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = cua_driver_core::actionability::ActionabilityReport,
+                    > + Send
+                    + 'a,
+            >,
+        > + Send,
+    A: FnOnce(C) -> F,
+    F: std::future::Future<Output = T>,
+{
+    let context = discovery.await.map_err(SelectionStageError::Discovery)?;
+    run_selection_candidate(
+        SelectionSite::PostPress,
+        clock,
+        budget,
+        prior,
+        context,
+        probe,
+        write,
+    )
+    .await
+    .map_err(|report| SelectionStageError::Refused(Box::new(report)))
+}
+
+#[derive(Clone)]
+struct ClickHistory {
+    prior: cua_driver_core::mutation::PriorInput,
+    press: Option<cua_driver_core::mutation::ChainResult>,
+    press_error: Option<crate::ax::bindings::AXError>,
+    idx: usize,
+    role: String,
+    title: String,
+    read_back: bool,
+}
+
+enum AxClickStep {
+    Done(AxClickOutcome),
+    NeedSelection(ClickHistory),
+}
+
+struct SelectionCandidate {
+    target: crate::ax::snapshot::RetainedElement,
+    role: String,
+}
+
+enum FirstSelectionRoute<T> {
+    Select(T),
+    Next,
+    Stop(String),
+}
+
+fn first_selection_route<T>(
+    discovery: crate::input::ax_actions::SelectionDiscovery<T>,
+) -> FirstSelectionRoute<T> {
+    use crate::input::ax_actions::SelectionDiscovery;
+    match discovery {
+        SelectionDiscovery::Ready(target) => FirstSelectionRoute::Select(target),
+        SelectionDiscovery::Absent => FirstSelectionRoute::Next,
+        SelectionDiscovery::Unknown(reason) => FirstSelectionRoute::Stop(reason),
+    }
+}
+
+fn prepare_first_selection(
+    leaf: &crate::ax::snapshot::RetainedElement,
+    idx: usize,
+    read_back: bool,
+    foreground: bool,
+) -> FirstSelectionRoute<(SelectionCandidate, ClickHistory)> {
+    use crate::input::ax_actions::{discover_selection, SelectionElement};
+    use cua_driver_core::actionability::Evidence;
+    let ptr = leaf.as_ptr() as AXUIElementRef;
+    match super::actionability::action_advertised(ptr, "AXPress") {
+        Evidence::Known(true) => return FirstSelectionRoute::Next,
+        Evidence::Known(false) => {}
+        Evidence::Absent | Evidence::Unknown(_) => {
+            return FirstSelectionRoute::Stop("AXPress capability is unknown".into())
+        }
+    }
+    if let Err(error) =
+        crate::input::ax_actions::ensure_ax_action_enabled(leaf.as_ptr(), "AXPress", foreground)
+    {
+        return FirstSelectionRoute::Stop(error.to_string());
+    }
+    let start = unsafe { SelectionElement::retain(ptr) };
+    match first_selection_route(discover_selection(start)) {
+        FirstSelectionRoute::Select((selected_role, item)) => {
+            let role = unsafe { copy_string_attr(ptr, "AXRole") }.unwrap_or_default();
+            let title = ["AXTitle", "AXDescription", "AXHelp", "AXIdentifier"]
+                .iter()
+                .find_map(|attr| {
+                    unsafe { copy_string_attr(ptr, attr) }.filter(|text| !text.trim().is_empty())
+                })
+                .unwrap_or_default();
+            FirstSelectionRoute::Select((
+                SelectionCandidate {
+                    target: unsafe {
+                        crate::ax::snapshot::RetainedElement::retain(item.as_ptr() as usize)
+                    },
+                    role: selected_role,
+                },
+                ClickHistory {
+                    prior: cua_driver_core::mutation::PriorInput::None,
+                    press: None,
+                    press_error: None,
+                    idx,
+                    role,
+                    title,
+                    read_back,
+                },
+            ))
+        }
+        FirstSelectionRoute::Next => FirstSelectionRoute::Next,
+        FirstSelectionRoute::Stop(reason) => FirstSelectionRoute::Stop(reason),
+    }
+}
+
+impl ClickHistory {
+    fn no_input(&self) -> bool {
+        self.prior == cua_driver_core::mutation::PriorInput::None
+            && self.press.as_ref().is_none_or(|press| press.no_input())
+    }
+}
+
+fn project_gate_refusal(
+    report: cua_driver_core::actionability::ActionabilityReport,
+    history: &ClickHistory,
+) -> ToolResult {
+    let mut result = report.refusal_result().expect("terminal report");
+    if !history.no_input() {
+        let reason = match &report.verdict {
+            cua_driver_core::actionability::Verdict::Terminal { reason, .. } => reason,
+            _ => unreachable!(),
+        };
+        result.content = ToolResult::error(format!(
+            "{}; prior input may have been delivered; selection was not sent: {reason}",
+            history.press_error.map_or_else(
+                || "AXPress was not sent".into(),
+                |error| format!("AXPress returned {error}")
+            )
+        ))
+        .content;
+        if let Some(value) = result.structured_content.as_mut() {
+            value["effect"] = serde_json::json!("unverifiable");
+            if let Some(object) = value.as_object_mut() {
+                object.remove("dispatched");
+            }
+        }
+        result.disposition = Some(cua_driver_contract::ErrorDisposition::SUSPECTED_NOOP);
+    }
+    result
+}
+
+fn post_press_failure(history: &ClickHistory, detail: &str) -> ToolResult {
+    let disposition = history
+        .press
+        .as_ref()
+        .and_then(|press| {
+            press.error_disposition(
+                cua_driver_core::mutation::Postcondition::Indeterminate,
+                false,
+            )
+        })
+        .unwrap_or(if history.no_input() {
+            cua_driver_contract::ErrorDisposition::NOT_DELIVERED
+        } else {
+            cua_driver_contract::ErrorDisposition::SUSPECTED_NOOP
+        });
+    let failure = ClickWriteFailure {
+        message: format!(
+            "{}; selection was not sent: {detail}",
+            history.press_error.map_or_else(
+                || "AXPress was not sent".into(),
+                |error| format!("AXPress returned {error}")
+            )
+        ),
+        disposition,
+    };
+    let mut result = element_click_failure(&failure.into());
+    if !history.no_input() {
+        result = result.with_structured(serde_json::json!({"effect": "unverifiable"}));
+    }
+    result
+}
+
+fn recheck_selection_then_write<T>(
+    recheck: impl FnOnce() -> bool,
+    write: impl FnOnce() -> T,
+) -> Option<T> {
+    recheck().then(write)
+}
+
+async fn run_live_post_press_selection(
+    lease: Option<super::BackgroundMutationLease>,
+    leaf: crate::ax::snapshot::RetainedElement,
+    history: ClickHistory,
+    pid: i32,
+    window_id: u32,
+    foreground: bool,
+) -> (
+    Option<super::BackgroundMutationLease>,
+    Result<(AxClickOutcome, bool), ToolResult>,
+) {
+    let discovery_history = history.clone();
+    let discovery = async move {
+        let result = latency::spawn_action_blocking(move || {
+            let held = lease;
+            let run = || {
+                use crate::input::ax_actions::{
+                    discover_selection, SelectionDiscovery, SelectionElement,
+                };
+                let start = unsafe { SelectionElement::retain(leaf.as_ptr() as AXUIElementRef) };
+                match discover_selection(start) {
+                    SelectionDiscovery::Ready((role, item)) => {
+                        SelectionDiscovery::Ready(SelectionCandidate {
+                            target: unsafe {
+                                crate::ax::snapshot::RetainedElement::retain(item.as_ptr() as usize)
+                            },
+                            role,
+                        })
+                    }
+                    SelectionDiscovery::Absent => SelectionDiscovery::Absent,
+                    SelectionDiscovery::Unknown(reason) => SelectionDiscovery::Unknown(reason),
+                }
+            };
+            (run(), held)
+        })
+        .await;
+        match result {
+            Ok((crate::input::ax_actions::SelectionDiscovery::Ready(candidate), lease)) => {
+                Ok((lease, candidate))
+            }
+            Ok((crate::input::ax_actions::SelectionDiscovery::Absent, lease)) => Err((
+                lease,
+                post_press_failure(&discovery_history, "selection target is unknown"),
+            )),
+            Ok((crate::input::ax_actions::SelectionDiscovery::Unknown(reason), lease)) => Err((
+                lease,
+                post_press_failure(
+                    &discovery_history,
+                    &format!("selection target is unknown: {reason}"),
+                ),
+            )),
+            Err(error) => Err((
+                None,
+                post_press_failure(
+                    &discovery_history,
+                    &format!("discovery worker failed: {error}"),
+                ),
+            )),
+        }
+    };
+    let clock = super::actionability::semantic_clock();
+    let history_for_write = history.clone();
+    let result = run_post_press_selection(
+        &clock,
+        cua_driver_core::actionability::DEFAULT_BUDGET,
+        history.prior,
+        discovery,
+        |(lease, candidate), _| {
+            super::actionability::semantic_probe(
+                lease.as_ref(),
+                candidate.target.clone(),
+                pid,
+                window_id,
+                super::actionability::semantic::SemanticIntent::Select,
+            )
+        },
+        |(lease, candidate)| {
+            run_live_selection_write(
+                SelectionSite::PostPress,
+                lease,
+                candidate,
+                history_for_write,
+                pid,
+                window_id,
+                foreground,
+            )
+        },
+    )
+    .await;
+    match result {
+        Ok(written) => project_live_selection_result(Ok(written), history),
+        Err(SelectionStageError::Refused(report)) => {
+            project_live_selection_result(Err(*report), history)
+        }
+        Err(SelectionStageError::Discovery((lease, failure))) => (lease, Err(failure)),
+    }
+}
+
+fn post_press_delivery(
+    outcome: AxClickOutcome,
+    _press_fronted: bool,
+    selection_fronted: bool,
+) -> (AxClickOutcome, bool) {
+    (outcome, selection_fronted)
+}
+
+async fn run_live_selection_candidate(
+    site: SelectionSite,
+    lease: Option<super::BackgroundMutationLease>,
+    candidate: SelectionCandidate,
+    history: ClickHistory,
+    pid: i32,
+    window_id: u32,
+    foreground: bool,
+) -> (
+    Option<super::BackgroundMutationLease>,
+    Result<(AxClickOutcome, bool), ToolResult>,
+) {
+    let clock = super::actionability::semantic_clock();
+    let prior = history.prior;
+    let history_for_write = history.clone();
+    let result = run_selection_candidate(
+        site,
+        &clock,
+        cua_driver_core::actionability::DEFAULT_BUDGET,
+        prior,
+        (lease, candidate),
+        |(lease, candidate), _| {
+            super::actionability::semantic_probe(
+                lease.as_ref(),
+                candidate.target.clone(),
+                pid,
+                window_id,
+                super::actionability::semantic::SemanticIntent::Select,
+            )
+        },
+        |(lease, candidate)| {
+            run_live_selection_write(
+                site,
+                lease,
+                candidate,
+                history_for_write,
+                pid,
+                window_id,
+                foreground,
+            )
+        },
+    )
+    .await;
+    project_live_selection_result(result, history)
+}
+
+fn project_live_selection_result(
+    result: Result<
+        Result<LiveSelectionOutput, tokio::task::JoinError>,
+        cua_driver_core::actionability::ActionabilityReport,
+    >,
+    history: ClickHistory,
+) -> (
+    Option<super::BackgroundMutationLease>,
+    Result<(AxClickOutcome, bool), ToolResult>,
+) {
+    match result {
+        Err(report) => (None, Err(project_gate_refusal(report, &history))),
+        Ok(Err(error)) => (
+            None,
+            Err(post_press_failure(
+                &history,
+                &format!("selection worker failed; selection may have run: {error}"),
+            )
+            .with_structured(serde_json::json!({"effect": "unverifiable"}))
+            .with_disposition(cua_driver_contract::ErrorDisposition::SUSPECTED_NOOP)),
+        ),
+        Ok(Ok((output, lease, effective_prior, fronted))) => {
+            let mut history = history;
+            history.prior = effective_prior;
+            if let Some(press) = history.press.as_mut() {
+                *press = cua_driver_core::mutation::ChainResult::from_recorded(
+                    press.outcomes().to_vec(),
+                    effective_prior,
+                )
+                .expect("recorded press");
+            }
+            match (output, fronted) {
+                (Some(None), _) => (
+                    lease,
+                    Err(post_press_failure(
+                        &history,
+                        "selection target changed or became unavailable",
+                    )),
+                ),
+                (Some(Some(Err(error))), _) => (lease, Err(element_click_failure(&error))),
+                (Some(Some(Ok(None))), _) => (
+                    lease,
+                    Err(post_press_failure(&history, "selection was not attempted")),
+                ),
+                (Some(Some(Ok(Some(outcome)))), Ok(fronted)) => (lease, Ok((outcome, fronted))),
+                (_, Err(error)) => (
+                    lease,
+                    Err(post_press_failure(
+                        &history,
+                        &format!("foreground assist failed: {error}"),
+                    )),
+                ),
+                (None, Ok(_)) => (
+                    lease,
+                    Err(post_press_failure(&history, "selection worker did not run")),
+                ),
+            }
+        }
+    }
+}
+
+type LiveSelectionOutput = (
+    Option<Option<anyhow::Result<Option<AxClickOutcome>>>>,
+    Option<super::BackgroundMutationLease>,
+    cua_driver_core::mutation::PriorInput,
+    anyhow::Result<bool>,
+);
+
+async fn run_live_selection_write(
+    site: SelectionSite,
+    lease: Option<super::BackgroundMutationLease>,
+    candidate: SelectionCandidate,
+    history_for_write: ClickHistory,
+    pid: i32,
+    window_id: u32,
+    foreground: bool,
+) -> Result<LiveSelectionOutput, tokio::task::JoinError> {
+    focus_guard::with_focus_suppressed(
+                if foreground { None } else { Some(pid) },
+                apps::frontmost_pid(),
+                "click.AXSelected",
+                || async move { latency::spawn_action_blocking(move || {
+                let held = lease;
+                let run = |effective_prior| {
+                    use crate::ax::actionability::{NativeReader, Reader};
+                    use crate::input::ax_actions::{select_target_with, LiveSelectionOps, SelectionElement};
+                    use cua_driver_core::actionability::Evidence;
+                    let target_ptr = candidate.target.as_ptr() as AXUIElementRef;
+                    let valid = || {
+                        matches!(super::actionability::semantic::bind_exact_with(
+                            &mut super::actionability::semantic::NativeWindowReader,
+                            candidate.target.clone(), pid, window_id,
+                        ), Evidence::Known(_))
+                        && matches!(NativeReader.string(target_ptr, "AXRole"), Evidence::Known(role) if role == candidate.role)
+                        && matches!(NativeReader.boolean(target_ptr, "AXSelected"), Evidence::Known(_))
+                        && matches!(NativeReader.settable(target_ptr, "AXSelected"), Evidence::Known(true))
+                    };
+                    recheck_selection_then_write(valid, || {
+                        let idle_before = super::physical_input_idle_ms();
+                        let started = std::time::Instant::now();
+                        let snapshot = history_for_write.read_back.then(|| unsafe { SelectionSnapshot::capture(target_ptr) });
+                        let item = unsafe { SelectionElement::retain(target_ptr) };
+                        let attempt = select_target_with(&mut LiveSelectionOps, &item, candidate.role.clone());
+                        selection_attempt_outcome(attempt, (history_for_write.idx, &history_for_write.role, &history_for_write.title),
+                            history_for_write.press_error, effective_prior, || {
+                                snapshot.as_ref().is_some_and(|snapshot| snapshot.transitioned_target(target_ptr))
+                                    && input_quiet(idle_before, super::physical_input_idle_ms(), elapsed_ms(started))
+                            })
+                    })
+                };
+                let before = crate::input::skylight::focus_generation();
+                let mut effective_prior = history_for_write.prior;
+                let mut output = None;
+                let mut action = || {
+                    if crate::input::skylight::focus_generation() != before {
+                        effective_prior = cua_driver_core::mutation::PriorInput::MayHaveDelivered;
+                    }
+                    output = Some(run(effective_prior));
+                    Ok(())
+                };
+                let fronted = if foreground && matches!(site, SelectionSite::First) {
+                    crate::input::skylight::with_foreground_assist(pid as libc::pid_t, window_id, action)
+                } else {
+                    action().map(|()| false)
+                };
+                if crate::input::skylight::focus_generation() != before {
+                    effective_prior = cua_driver_core::mutation::PriorInput::MayHaveDelivered;
+                }
+                (output, held, effective_prior, fronted)
+                }).await },
+            ).await
+}
+
+#[cfg(test)]
+mod u32_stage_tests {
+    use super::*;
+    use cua_driver_core::actionability::{ActionabilityReport, Clock, Verdict};
+    use cua_driver_core::mutation::PriorInput;
+    use std::{
+        future::Future,
+        pin::Pin,
+        sync::atomic::{AtomicUsize, Ordering},
+        time::Duration,
+    };
+
+    struct FakeClock;
+    impl Clock for FakeClock {
+        fn now(&self) -> Duration {
+            Duration::ZERO
+        }
+        fn sleep(&self, _: Duration) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    #[test]
+    fn post_press_selection_uses_selection_delivery_not_press_delivery() {
+        use cua_driver_core::action_record::ActualDelivery;
+        let outcome = (
+            "selected".into(),
+            false,
+            Some(ClickEvidence::Selected),
+            false,
+        );
+        let (outcome, actual_fronted) = post_press_delivery(outcome, true, false);
+        let result = finish_ax_click(outcome, actual_fronted, true, "");
+        assert_eq!(result.structured_content.as_ref().unwrap()["path"], "ax");
+        assert_eq!(
+            result.action_record.unwrap().actual_delivery,
+            Some(ActualDelivery::Background)
+        );
+    }
+
+    struct FakeSelectionReader {
+        role: &'static str,
+        selected: cua_driver_core::actionability::Evidence<bool>,
+    }
+    impl crate::input::ax_actions::SelectionEvidenceReader for FakeSelectionReader {
+        type Element = u32;
+        fn role(&mut self, _: &u32) -> cua_driver_core::actionability::Evidence<String> {
+            cua_driver_core::actionability::Evidence::Known(self.role.into())
+        }
+        fn parent(&mut self, _: &u32) -> cua_driver_core::actionability::Evidence<u32> {
+            panic!("row boundary must not be crossed")
+        }
+        fn selected(&mut self, _: &u32) -> cua_driver_core::actionability::Evidence<bool> {
+            self.selected.clone()
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn post_press_selection_gate_refusal_blocks_write() {
+        let writes = AtomicUsize::new(0);
+        let write_count = &writes;
+        let result = dispatch_post_press_selection(
+            SelectionSite::PostPress,
+            &FakeClock,
+            Duration::ZERO,
+            PriorInput::None,
+            73_u32,
+            |candidate, _| {
+                Box::pin(async move {
+                    assert_eq!(*candidate, 73);
+                    ActionabilityReport {
+                        verdict: Verdict::Terminal {
+                            code: "disabled",
+                            reason: "disabled".into(),
+                        },
+                        checks: vec![],
+                        waited_ms: 0,
+                        samples: 0,
+                        last_facts: None,
+                        disposition: None,
+                    }
+                })
+            },
+            |candidate| async move {
+                assert_eq!(candidate, 73);
+                write_count.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+        .await;
+        assert_eq!(
+            writes.load(Ordering::SeqCst),
+            0,
+            "refusal must prevent AXSelected"
+        );
+        assert!(result.is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn post_press_changed_target_after_gate_never_writes() {
+        let writes = AtomicUsize::new(0);
+        let current_target = std::sync::Arc::new(AtomicUsize::new(73));
+        let write_count = &writes;
+        let probe_binding = current_target.clone();
+        let write_binding = current_target.clone();
+        let result = dispatch_post_press_selection(
+            SelectionSite::PostPress,
+            &FakeClock,
+            Duration::ZERO,
+            PriorInput::None,
+            73_u32,
+            move |candidate, _| {
+                let binding = probe_binding.clone();
+                Box::pin(async move {
+                    assert_eq!(*candidate, 73);
+                    binding.store(74, Ordering::SeqCst);
+                    ActionabilityReport {
+                        verdict: Verdict::Pass,
+                        checks: vec![],
+                        waited_ms: 0,
+                        samples: 0,
+                        last_facts: None,
+                        disposition: None,
+                    }
+                })
+            },
+            |candidate| async move {
+                recheck_selection_then_write(
+                    || candidate as usize == write_binding.load(Ordering::SeqCst),
+                    || write_count.fetch_add(1, Ordering::SeqCst),
+                )
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(result, None);
+        assert_eq!(writes.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn post_press_refusal_preserves_prior_input() {
+        use cua_driver_core::mutation::{ChainResult, Reason, WriteOutcome};
+        let history = ClickHistory {
+            prior: PriorInput::MayHaveDelivered,
+            press: Some(
+                ChainResult::from_recorded(
+                    vec![WriteOutcome::FallThrough(Reason::Unsupported)],
+                    PriorInput::MayHaveDelivered,
+                )
+                .unwrap(),
+            ),
+            press_error: Some(-25205),
+            idx: 1,
+            role: "AXRow".into(),
+            title: String::new(),
+            read_back: false,
+        };
+        let report = ActionabilityReport {
+            verdict: Verdict::Terminal {
+                code: "disabled",
+                reason: "disabled".into(),
+            },
+            checks: vec![],
+            waited_ms: 0,
+            samples: 1,
+            last_facts: None,
+            disposition: None,
+        };
+        let result = project_gate_refusal(report, &history);
+        assert_eq!(
+            result.disposition,
+            Some(cua_driver_contract::ErrorDisposition::SUSPECTED_NOOP)
+        );
+        let structured = result.structured_content.unwrap();
+        assert_eq!(structured["effect"], "unverifiable");
+        assert!(structured.get("dispatched").is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn post_press_gate_wait_receives_prior_input() {
+        use cua_driver_core::actionability::DispositionIntent;
+        for (prior, expected) in [
+            (PriorInput::None, Some(DispositionIntent::NotDeliveredSafe)),
+            (PriorInput::MayHaveDelivered, None),
+        ] {
+            let report = dispatch_post_press_selection(
+                SelectionSite::PostPress,
+                &FakeClock,
+                Duration::ZERO,
+                prior,
+                73_u32,
+                |_, _| {
+                    Box::pin(async {
+                        ActionabilityReport {
+                            verdict: Verdict::Terminal {
+                                code: "disabled",
+                                reason: "disabled".into(),
+                            },
+                            checks: vec![],
+                            waited_ms: 0,
+                            samples: 0,
+                            last_facts: None,
+                            disposition: None,
+                        }
+                    })
+                },
+                |_| async { panic!("refused selection must not write") },
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(report.disposition, expected);
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn selection_gate_refusal_blocks_both_selection_sites() {
+        let writes = [AtomicUsize::new(0), AtomicUsize::new(0)];
+        let discoveries = AtomicUsize::new(0);
+        let discovery_queue = std::sync::Mutex::new(std::collections::VecDeque::from([73_u32]));
+        let counter = &writes[0];
+        let first = run_selection_candidate(
+            SelectionSite::First,
+            &FakeClock,
+            Duration::ZERO,
+            PriorInput::None,
+            73_u32,
+            |candidate, _| {
+                Box::pin(async move {
+                    assert_eq!(*candidate, 73);
+                    ActionabilityReport {
+                        verdict: Verdict::Terminal {
+                            code: "disabled",
+                            reason: "disabled".into(),
+                        },
+                        checks: vec![],
+                        waited_ms: 0,
+                        samples: 0,
+                        last_facts: None,
+                        disposition: None,
+                    }
+                })
+            },
+            |candidate| async move {
+                assert_eq!(candidate, 73);
+                counter.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+        .await;
+        let counter = &writes[1];
+        let post = run_post_press_selection(
+            &FakeClock,
+            Duration::ZERO,
+            PriorInput::None,
+            async {
+                discoveries.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, ()>(discovery_queue.lock().unwrap().pop_front().unwrap())
+            },
+            |candidate, _| {
+                Box::pin(async move {
+                    assert_eq!(*candidate, 73);
+                    ActionabilityReport {
+                        verdict: Verdict::Terminal {
+                            code: "disabled",
+                            reason: "disabled".into(),
+                        },
+                        checks: vec![],
+                        waited_ms: 0,
+                        samples: 0,
+                        last_facts: None,
+                        disposition: None,
+                    }
+                })
+            },
+            |candidate| async move {
+                assert_eq!(candidate, 73);
+                counter.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+        .await;
+        assert_eq!(
+            [
+                writes[0].load(Ordering::SeqCst),
+                writes[1].load(Ordering::SeqCst)
+            ],
+            [0, 0],
+            "both refusals must prevent AXSelected"
+        );
+        assert_eq!(discoveries.load(Ordering::SeqCst), 1);
+        assert!(discovery_queue.lock().unwrap().is_empty());
+        assert!(first.is_err());
+        assert!(matches!(post, Err(SelectionStageError::Refused(_))));
+    }
+
+    #[test]
+    fn first_selection_unknown_discovery_never_presses_or_writes() {
+        let presses = AtomicUsize::new(0);
+        let writes = AtomicUsize::new(0);
+        let discovery = crate::input::ax_actions::discover_selection_with(
+            FakeSelectionReader {
+                role: "AXRow",
+                selected: cua_driver_core::actionability::Evidence::Unknown("read failed".into()),
+            },
+            73,
+        );
+        match first_selection_route(discovery) {
+            FirstSelectionRoute::Next => {
+                presses.fetch_add(1, Ordering::SeqCst);
+            }
+            FirstSelectionRoute::Select(_) => {
+                writes.fetch_add(1, Ordering::SeqCst);
+            }
+            FirstSelectionRoute::Stop(_) => {}
+        }
+        assert_eq!(
+            (
+                presses.load(Ordering::SeqCst),
+                writes.load(Ordering::SeqCst)
+            ),
+            (0, 0)
+        );
+    }
+
+    #[test]
+    fn first_selection_confirmed_absent_keeps_next_route() {
+        let presses = AtomicUsize::new(0);
+        let writes = AtomicUsize::new(0);
+        let discovery = crate::input::ax_actions::discover_selection_with(
+            FakeSelectionReader {
+                role: "AXRow",
+                selected: cua_driver_core::actionability::Evidence::Absent,
+            },
+            73,
+        );
+        match first_selection_route(discovery) {
+            FirstSelectionRoute::Next => {
+                presses.fetch_add(1, Ordering::SeqCst);
+            }
+            FirstSelectionRoute::Select(_) => {
+                writes.fetch_add(1, Ordering::SeqCst);
+            }
+            FirstSelectionRoute::Stop(_) => {}
+        }
+        assert_eq!(
+            (
+                presses.load(Ordering::SeqCst),
+                writes.load(Ordering::SeqCst)
+            ),
+            (1, 0)
+        );
+    }
+
+    #[test]
+    fn first_selection_unchecked_cell_parent_is_unknown() {
+        let discovery = crate::input::ax_actions::discover_selection_with(
+            FakeSelectionReader {
+                role: "AXCell",
+                selected: cua_driver_core::actionability::Evidence::Absent,
+            },
+            73,
+        );
+        assert!(matches!(
+            first_selection_route(discovery),
+            FirstSelectionRoute::Stop(_)
+        ));
+    }
+}
+
+fn finish_ax_click(
+    (mut msg, suspected_noop, evidence, selection_via_pixel): AxClickOutcome,
+    fronted: bool,
+    foreground: bool,
+    suffix: &str,
+) -> ToolResult {
+    msg.push_str(suffix);
+    let result = ToolResult::text(msg).with_structured(ax_click_structured(
+        selection_via_pixel,
+        fronted,
+        evidence,
+        suspected_noop,
+    ));
+    match evidence {
+        Some(evidence) => {
+            use cua_driver_core::action_record::{
+                ActionTransport, ActualDelivery, RequestedDelivery,
+            };
+            let transport = match (selection_via_pixel, fronted) {
+                (false, _) => ActionTransport::MacosAxAction,
+                (true, false) => ActionTransport::MacosCgEventPid,
+                (true, true) => ActionTransport::MacosCgEventHid,
+            };
+            let requested = if foreground {
+                RequestedDelivery::Foreground
+            } else {
+                RequestedDelivery::Background
+            };
+            let actual = if fronted {
+                ActualDelivery::Foreground
+            } else {
+                ActualDelivery::Background
+            };
+            result.with_action_record(evidence.record(transport, requested, actual))
+        }
+        None => result,
+    }
+}
+
 fn elapsed_ms(started: std::time::Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
@@ -3897,7 +4943,7 @@ fn perform_ax_click(
     foreground: bool,
     read_back: bool,
     mut prior: cua_driver_core::mutation::PriorInput,
-) -> anyhow::Result<AxClickOutcome> {
+) -> anyhow::Result<AxClickStep> {
     let (element_ptr, idx) = element;
     let (pid, window_id) = window;
     let element = element_ptr as AXUIElementRef;
@@ -3928,31 +4974,6 @@ fn perform_ax_click(
     // read-back-verified AXSelected write over dispatching a known hollow press
     // or forcing the caller onto a less stable pixel coordinate.
     if ax_action == "AXPress" && !advertised.iter().any(|action| action == ax_action) {
-        if modifiers.is_empty() {
-            let idle_before = super::physical_input_idle_ms();
-            let started = std::time::Instant::now();
-            let snapshot = reads
-                .selection
-                .then(|| unsafe { SelectionSnapshot::capture(element) });
-            let (attempt, target) =
-                crate::input::ax_actions::select_nearest_container_attempt_with_target(element_ptr);
-            if let Some(outcome) =
-                selection_attempt_outcome(attempt, (idx, &role, &title), None, prior, || {
-                    snapshot.as_ref().is_some_and(|snapshot| {
-                        target
-                            .as_ref()
-                            .is_some_and(|target| snapshot.transitioned_target(target.as_ptr()))
-                    }) && input_quiet(
-                        idle_before,
-                        super::physical_input_idle_ms(),
-                        elapsed_ms(started),
-                    )
-                })?
-            {
-                return Ok(outcome);
-            }
-        }
-
         // The input clock starts before the selection baseline (the selected
         // peers included) is read.
         let selection_idle_before = super::physical_input_idle_ms();
@@ -3990,12 +5011,12 @@ fn perform_ax_click(
                 )?;
             }
             if !reads.selection {
-                return Ok(unconfirmed_selection_click(
+                return Ok(AxClickStep::Done(unconfirmed_selection_click(
                     &selected_role,
                     (idx, &role, &title),
                     !modifiers.is_empty(),
                     "no read-back was requested",
-                ));
+                )));
             }
             // Poll the selection from delivery and return on the sample that
             // shows the expected state, held on an immediate second read; a
@@ -4028,7 +5049,7 @@ fn perform_ax_click(
                     elapsed_ms(input_from),
                 )
             }) {
-                return Ok((
+                return Ok(AxClickStep::Done((
                     format!(
                         "✅ Selected nearest {selected_role} for [{idx}] {role} \
                          \"{title}\"; AX selection write was unavailable, so a \
@@ -4038,15 +5059,15 @@ fn perform_ax_click(
                     false,
                     Some(evidence),
                     true,
-                ));
+                )));
             }
             let last_observation = last_observation.get();
-            return Ok(unconfirmed_selection_click(
+            return Ok(AxClickStep::Done(unconfirmed_selection_click(
                 &selected_role,
                 (idx, &role, &title),
                 !modifiers.is_empty(),
                 &format!("before_selected={before}, last_readback={last_observation:?}"),
-            ));
+            )));
         }
     }
 
@@ -4194,14 +5215,14 @@ fn perform_ax_click(
         };
         if !focused {
             if in_web_area {
-                return Ok((
+                return Ok(AxClickStep::Done((
                     format!(
                         "⚠️ Sent a window-local pointer focus to [{idx}] {role} \"{title}\", but focus could not be confirmed."
                     ),
                     false,
                     None,
                     true,
-                ));
+                )));
             }
             return Err(ClickWriteFailure {
                 message: format!("text input [{idx}] did not become the application's focused element; AXPress was not sent.{}", hand_back.map(|text| format!(" {text}")).unwrap_or_default()),
@@ -4224,7 +5245,7 @@ fn perform_ax_click(
                  before the click or input arrived meanwhile, so nothing confirms the click."
             )
         };
-        return Ok((
+        return Ok(AxClickStep::Done((
             format!(
                 "{summary}{}",
                 hand_back.map(|text| format!(" {text}")).unwrap_or_default()
@@ -4232,7 +5253,7 @@ fn perform_ax_click(
             false,
             evidence,
             in_web_area,
-        ));
+        )));
     }
     // What the action may change (a selection, a toggle, the window title of
     // a navigation such as Finder's sidebar, a sheet or window it opens),
@@ -4246,17 +5267,7 @@ fn perform_ax_click(
         // confirmed click: they run when the caller asks for the read-back.
         probe = unsafe { probe.watching_sheet_for_press(element, ax_action) };
     }
-    let fallback_selection = (ax_action == "AXPress" && modifiers.is_empty()).then(|| {
-        let idle_before = super::physical_input_idle_ms();
-        let started = std::time::Instant::now();
-        (
-            reads
-                .selection
-                .then(|| unsafe { SelectionSnapshot::capture(element) }),
-            idle_before,
-            started,
-        )
-    });
+    let fallback_selection = ax_action == "AXPress" && modifiers.is_empty();
     let err = latency::section(latency::Stage::AxPerform, || unsafe {
         crate::ax::bindings::perform_action(element, ax_action)
     });
@@ -4286,7 +5297,7 @@ fn perform_ax_click(
                     prior,
                 )
                 .expect("one write");
-                return Ok((
+                return Ok(AxClickStep::Done((
                     format!(
                         "✅ Performed {ax_action} on [{idx}] {role} \"{title}\"; {}, although \
                          the app returned AX error {err}.",
@@ -4295,7 +5306,7 @@ fn perform_ax_click(
                     false,
                     Some(evidence),
                     false,
-                ));
+                )));
             }
         }
         let chain = cua_driver_core::mutation::ChainResult::from_recorded(vec![outcome], prior)
@@ -4315,33 +5326,17 @@ fn perform_ax_click(
             }
             .into());
         }
-        // Only a proven fall-through permits the selection fallback.
-        if post_press_should_select(err) {
-            if let Some((snapshot, idle_before, started)) = fallback_selection {
-                let (attempt, target) =
-                    crate::input::ax_actions::select_nearest_container_attempt_with_target(
-                        element_ptr,
-                    );
-                if let Some(outcome) = selection_attempt_outcome(
-                    attempt,
-                    (idx, &role, &title),
-                    Some(err),
-                    prior,
-                    || {
-                        snapshot.as_ref().is_some_and(|snapshot| {
-                            target
-                                .as_ref()
-                                .is_some_and(|target| snapshot.transitioned_target(target.as_ptr()))
-                        }) && input_quiet(
-                            idle_before,
-                            super::physical_input_idle_ms(),
-                            elapsed_ms(started),
-                        )
-                    },
-                )? {
-                    return Ok(outcome);
-                }
-            }
+        // Only the classified fall-through may hand control to the caller.
+        if fallback_selection && post_press_should_select(err) {
+            return Ok(AxClickStep::NeedSelection(ClickHistory {
+                prior,
+                press: Some(chain),
+                press_error: Some(err),
+                idx,
+                role,
+                title,
+                read_back,
+            }));
         }
         if matches!(
             outcome,
@@ -4353,15 +5348,15 @@ fn perform_ax_click(
             }.into());
         }
         if perform_error_proves_nothing_was_sent(err) {
-            return Ok((format!("⚠️ Sent {ax_action} to [{idx}] {role} \"{title}\", but the app returned AX error {err}; it may have acted. Read the window before repeating it."), false, None, false));
+            return Ok(AxClickStep::Done((format!("⚠️ Sent {ax_action} to [{idx}] {role} \"{title}\", but the app returned AX error {err}; it may have acted. Read the window before repeating it."), false, None, false)));
         }
-        return unresolved_perform_error(ax_action, err, (idx, &role, &title));
+        return unresolved_perform_error(ax_action, err, (idx, &role, &title))
+            .map(AxClickStep::Done);
     }
 
     let _chain = cua_driver_core::mutation::ChainResult::from_recorded(vec![outcome], prior)
         .expect("one write");
     let mut summary = format!("✅ Performed {ax_action} on [{idx}] {role} \"{title}\".");
-    drop(fallback_selection);
     let evidence = probe.observe();
     if let Some(evidence) = evidence {
         summary.push_str(&format!(" Read back: {}.", evidence.detail()));
@@ -4448,7 +5443,12 @@ fn perform_ax_click(
     let _ = pid;
     let _ = window_id; // used by caller context
 
-    Ok((summary, suspected_noop, evidence, false))
+    Ok(AxClickStep::Done((
+        summary,
+        suspected_noop,
+        evidence,
+        false,
+    )))
 }
 
 fn background_pixel_ax_eligible(

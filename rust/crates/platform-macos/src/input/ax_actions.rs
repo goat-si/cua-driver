@@ -189,6 +189,169 @@ pub(crate) fn selection_target_with<B: SelectionOps>(
     })
 }
 
+/// Selection traversal whose absence is distinguished from an incomplete AX read.
+pub(crate) enum SelectionDiscovery<T> {
+    Ready(T),
+    Absent,
+    Unknown(String),
+}
+
+pub(crate) trait SelectionEvidenceReader {
+    type Element: Clone;
+    fn role(&mut self, element: &Self::Element)
+        -> cua_driver_core::actionability::Evidence<String>;
+    fn parent(
+        &mut self,
+        element: &Self::Element,
+    ) -> cua_driver_core::actionability::Evidence<Self::Element>;
+    fn selected(
+        &mut self,
+        element: &Self::Element,
+    ) -> cua_driver_core::actionability::Evidence<bool>;
+}
+
+struct NativeSelectionEvidence;
+impl SelectionEvidenceReader for NativeSelectionEvidence {
+    type Element = SelectionElement;
+    fn role(
+        &mut self,
+        element: &Self::Element,
+    ) -> cua_driver_core::actionability::Evidence<String> {
+        use crate::ax::actionability::{NativeReader, Reader};
+        NativeReader.string(element.as_ptr(), "AXRole")
+    }
+    fn parent(
+        &mut self,
+        element: &Self::Element,
+    ) -> cua_driver_core::actionability::Evidence<Self::Element> {
+        use core_foundation::{
+            base::{CFGetTypeID, TCFType},
+            string::CFString,
+        };
+        let attr = CFString::new("AXParent");
+        let mut value: CFTypeRef = std::ptr::null();
+        let code = unsafe {
+            AXUIElementCopyAttributeValue(element.as_ptr(), attr.as_concrete_TypeRef(), &mut value)
+        };
+        let valid = !value.is_null() && unsafe { CFGetTypeID(value) == AXUIElementGetTypeID() };
+        let evidence = crate::ax::actionability::classify_attribute(
+            code,
+            !value.is_null(),
+            valid.then(|| unsafe { SelectionElement::retain(value as AXUIElementRef) }),
+            "AXParent",
+        );
+        if !value.is_null() {
+            unsafe { CFRelease(value) };
+        }
+        evidence
+    }
+    fn selected(
+        &mut self,
+        element: &Self::Element,
+    ) -> cua_driver_core::actionability::Evidence<bool> {
+        use crate::ax::actionability::{NativeReader, Reader};
+        NativeReader.boolean(element.as_ptr(), "AXSelected")
+    }
+}
+
+struct EvidenceSelectionOps<R> {
+    reader: R,
+    unknown: Option<String>,
+    roles_read: usize,
+    last_role: Option<String>,
+    parent_read: bool,
+}
+impl<R> EvidenceSelectionOps<R> {
+    fn record<T>(
+        &mut self,
+        evidence: cua_driver_core::actionability::Evidence<T>,
+        name: &str,
+    ) -> Option<T> {
+        use cua_driver_core::actionability::Evidence;
+        match evidence {
+            Evidence::Known(value) => Some(value),
+            Evidence::Absent => None,
+            Evidence::Unknown(reason) => {
+                self.unknown
+                    .get_or_insert_with(|| format!("{name}: {reason}"));
+                None
+            }
+        }
+    }
+}
+impl<R: SelectionEvidenceReader> SelectionOps for EvidenceSelectionOps<R> {
+    type Element = R::Element;
+    fn role(&mut self, element: &Self::Element) -> Option<String> {
+        let evidence = self.reader.role(element);
+        let role = self.record(evidence, "AXRole");
+        self.roles_read += 1;
+        self.last_role = role.clone();
+        self.parent_read = false;
+        if role
+            .as_deref()
+            .is_none_or(|role| role.is_empty() || role == "AXUnknown")
+        {
+            self.unknown
+                .get_or_insert_with(|| "AXRole unavailable".into());
+        }
+        role
+    }
+    fn parent(&mut self, element: &Self::Element) -> Option<Self::Element> {
+        self.parent_read = true;
+        let evidence = self.reader.parent(element);
+        self.record(evidence, "AXParent")
+    }
+    fn selected(&mut self, element: &Self::Element) -> Option<bool> {
+        let evidence = self.reader.selected(element);
+        self.record(evidence, "AXSelected")
+    }
+    fn select(&mut self, _: &Self::Element) -> Result<(), AXError> {
+        unreachable!("discovery does not write")
+    }
+    fn center(&mut self, _: &Self::Element) -> Option<(f64, f64)> {
+        None
+    }
+}
+
+pub(crate) fn discover_selection_with<R: SelectionEvidenceReader>(
+    reader: R,
+    element: R::Element,
+) -> SelectionDiscovery<(String, R::Element)> {
+    let mut ops = EvidenceSelectionOps {
+        reader,
+        unknown: None,
+        roles_read: 0,
+        last_role: None,
+        parent_read: false,
+    };
+    let target = selection_target_with(&mut ops, element);
+    if target.is_none() && ops.last_role.as_deref() == Some("AXCell") && !ops.parent_read {
+        ops.unknown
+            .get_or_insert_with(|| "selection parent was not checked".into());
+    }
+    if target.is_none()
+        && ops.roles_read >= MAX_SELECTION_ANCESTORS
+        && ops
+            .last_role
+            .as_deref()
+            .is_none_or(|role| !is_item_boundary_role(role) || role == "AXCell")
+    {
+        ops.unknown
+            .get_or_insert_with(|| "selection ancestor limit reached".into());
+    }
+    match (ops.unknown, target) {
+        (Some(reason), _) => SelectionDiscovery::Unknown(reason),
+        (None, Some(target)) => SelectionDiscovery::Ready(target),
+        (None, None) => SelectionDiscovery::Absent,
+    }
+}
+
+pub(crate) fn discover_selection(
+    element: SelectionElement,
+) -> SelectionDiscovery<(String, SelectionElement)> {
+    discover_selection_with(NativeSelectionEvidence, element)
+}
+
 pub(crate) fn selection_center_with<B: SelectionOps>(
     ops: &mut B,
     start: B::Element,
@@ -241,21 +404,6 @@ pub(crate) fn selection_snapshot_with<B: SelectionOps>(
 pub(crate) fn select_nearest_container_attempt(element_ptr: usize) -> SelectAttempt {
     let start = unsafe { SelectionElement::retain(element_ptr as AXUIElementRef) };
     select_with(&mut LiveSelectionOps, start)
-}
-
-/// Keep the written target alive for same-worker attribution of read-back.
-pub(crate) fn select_nearest_container_attempt_with_target(
-    element_ptr: usize,
-) -> (SelectAttempt, Option<SelectionElement>) {
-    let start = unsafe { SelectionElement::retain(element_ptr as AXUIElementRef) };
-    let mut ops = LiveSelectionOps;
-    match selection_target_with(&mut ops, start) {
-        Some((role, item)) => {
-            let attempt = select_target_with(&mut ops, &item, role);
-            (attempt, Some(item))
-        }
-        None => (SelectAttempt::NotAttempted, None),
-    }
 }
 
 /// Legacy result form. `None` does not prove that no write was sent; callers

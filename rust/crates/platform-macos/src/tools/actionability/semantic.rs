@@ -34,7 +34,7 @@ pub(in crate::tools) trait WindowReader {
     fn window_id(&mut self, window: &Self::Element) -> Evidence<u32>;
 }
 
-struct NativeWindowReader;
+pub(in crate::tools) struct NativeWindowReader;
 impl WindowReader for NativeWindowReader {
     type Element = RetainedElement;
     fn pid(&mut self, target: &Self::Element) -> Evidence<i32> {
