@@ -2103,7 +2103,9 @@ impl ClickTool {
                     .await;
                     _mutation_lease = held;
                     match selected {
-                        Ok((outcome, selection_fronted)) => Ok(Ok(post_press_delivery(outcome, fronted, selection_fronted))),
+                        Ok((outcome, selection_fronted)) => {
+                            Ok(Ok(post_press_delivery(outcome, fronted, selection_fronted)))
+                        }
                         Err(refusal) => {
                             let _ = snapshot.detect_sampled_async().await;
                             return refusal;
@@ -3188,13 +3190,21 @@ async fn run_selection_candidate<C, P, A, F, T>(
 ) -> Result<T, cua_driver_core::actionability::ActionabilityReport>
 where
     C: Sync,
-    P: for<'a> FnMut(&'a C, std::time::Duration) -> std::pin::Pin<Box<dyn std::future::Future<Output = cua_driver_core::actionability::ActionabilityReport> + Send + 'a>> + Send,
+    P: for<'a> FnMut(
+            &'a C,
+            std::time::Duration,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = cua_driver_core::actionability::ActionabilityReport,
+                    > + Send
+                    + 'a,
+            >,
+        > + Send,
     A: FnOnce(C) -> F,
     F: std::future::Future<Output = T>,
 {
-    // Temporary wiring revert for the RED test: bypass the gate at this site.
-    let _ = (site, clock, budget, prior, probe);
-    Ok(write(context).await)
+    dispatch_post_press_selection(site, clock, budget, prior, context, probe, write).await
 }
 
 async fn run_post_press_selection<C, D, E, P, A, F, T>(
@@ -3208,13 +3218,32 @@ async fn run_post_press_selection<C, D, E, P, A, F, T>(
 where
     C: Sync,
     D: std::future::Future<Output = Result<C, E>>,
-    P: for<'a> FnMut(&'a C, std::time::Duration) -> std::pin::Pin<Box<dyn std::future::Future<Output = cua_driver_core::actionability::ActionabilityReport> + Send + 'a>> + Send,
+    P: for<'a> FnMut(
+            &'a C,
+            std::time::Duration,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = cua_driver_core::actionability::ActionabilityReport,
+                    > + Send
+                    + 'a,
+            >,
+        > + Send,
     A: FnOnce(C) -> F,
     F: std::future::Future<Output = T>,
 {
     let context = discovery.await.map_err(SelectionStageError::Discovery)?;
-    run_selection_candidate(SelectionSite::PostPress, clock, budget, prior, context, probe, write)
-        .await.map_err(SelectionStageError::Refused)
+    run_selection_candidate(
+        SelectionSite::PostPress,
+        clock,
+        budget,
+        prior,
+        context,
+        probe,
+        write,
+    )
+    .await
+    .map_err(SelectionStageError::Refused)
 }
 
 #[derive(Clone)]
@@ -3391,51 +3420,102 @@ async fn run_live_post_press_selection(
     pid: i32,
     window_id: u32,
     foreground: bool,
-) -> (Option<super::BackgroundMutationLease>, Result<(AxClickOutcome, bool), ToolResult>) {
+) -> (
+    Option<super::BackgroundMutationLease>,
+    Result<(AxClickOutcome, bool), ToolResult>,
+) {
     let discovery_history = history.clone();
     let discovery = async move {
         let result = latency::spawn_action_blocking(move || {
             let held = lease;
             let run = || {
-                use crate::input::ax_actions::{discover_selection, SelectionDiscovery, SelectionElement};
+                use crate::input::ax_actions::{
+                    discover_selection, SelectionDiscovery, SelectionElement,
+                };
                 let start = unsafe { SelectionElement::retain(leaf.as_ptr() as AXUIElementRef) };
                 match discover_selection(start) {
-                    SelectionDiscovery::Ready((role, item)) => SelectionDiscovery::Ready(SelectionCandidate {
-                        target: unsafe { crate::ax::snapshot::RetainedElement::retain(item.as_ptr() as usize) }, role,
-                    }),
+                    SelectionDiscovery::Ready((role, item)) => {
+                        SelectionDiscovery::Ready(SelectionCandidate {
+                            target: unsafe {
+                                crate::ax::snapshot::RetainedElement::retain(item.as_ptr() as usize)
+                            },
+                            role,
+                        })
+                    }
                     SelectionDiscovery::Absent => SelectionDiscovery::Absent,
                     SelectionDiscovery::Unknown(reason) => SelectionDiscovery::Unknown(reason),
                 }
             };
             (run(), held)
-        }).await;
+        })
+        .await;
         match result {
-            Ok((crate::input::ax_actions::SelectionDiscovery::Ready(candidate), lease)) => Ok((lease, candidate)),
-            Ok((crate::input::ax_actions::SelectionDiscovery::Absent, lease)) =>
-                Err((lease, post_press_failure(&discovery_history, "selection target is unknown"))),
-            Ok((crate::input::ax_actions::SelectionDiscovery::Unknown(reason), lease)) =>
-                Err((lease, post_press_failure(&discovery_history, &format!("selection target is unknown: {reason}")))),
-            Err(error) => Err((None, post_press_failure(&discovery_history, &format!("discovery worker failed: {error}")))),
+            Ok((crate::input::ax_actions::SelectionDiscovery::Ready(candidate), lease)) => {
+                Ok((lease, candidate))
+            }
+            Ok((crate::input::ax_actions::SelectionDiscovery::Absent, lease)) => Err((
+                lease,
+                post_press_failure(&discovery_history, "selection target is unknown"),
+            )),
+            Ok((crate::input::ax_actions::SelectionDiscovery::Unknown(reason), lease)) => Err((
+                lease,
+                post_press_failure(
+                    &discovery_history,
+                    &format!("selection target is unknown: {reason}"),
+                ),
+            )),
+            Err(error) => Err((
+                None,
+                post_press_failure(
+                    &discovery_history,
+                    &format!("discovery worker failed: {error}"),
+                ),
+            )),
         }
     };
     let clock = super::actionability::semantic_clock();
     let history_for_write = history.clone();
     let result = run_post_press_selection(
-        &clock, cua_driver_core::actionability::DEFAULT_BUDGET, history.prior, discovery,
-        |(lease, candidate), _| super::actionability::semantic_probe(
-            lease.as_ref(), candidate.target.clone(), pid, window_id,
-            super::actionability::semantic::SemanticIntent::Select,
-        ),
-        |(lease, candidate)| run_live_selection_write(SelectionSite::PostPress, lease, candidate, history_for_write, pid, window_id, foreground),
-    ).await;
+        &clock,
+        cua_driver_core::actionability::DEFAULT_BUDGET,
+        history.prior,
+        discovery,
+        |(lease, candidate), _| {
+            super::actionability::semantic_probe(
+                lease.as_ref(),
+                candidate.target.clone(),
+                pid,
+                window_id,
+                super::actionability::semantic::SemanticIntent::Select,
+            )
+        },
+        |(lease, candidate)| {
+            run_live_selection_write(
+                SelectionSite::PostPress,
+                lease,
+                candidate,
+                history_for_write,
+                pid,
+                window_id,
+                foreground,
+            )
+        },
+    )
+    .await;
     match result {
         Ok(written) => project_live_selection_result(Ok(written), history),
-        Err(SelectionStageError::Refused(report)) => project_live_selection_result(Err(report), history),
+        Err(SelectionStageError::Refused(report)) => {
+            project_live_selection_result(Err(report), history)
+        }
         Err(SelectionStageError::Discovery((lease, failure))) => (lease, Err(failure)),
     }
 }
 
-fn post_press_delivery(outcome: AxClickOutcome, _press_fronted: bool, selection_fronted: bool) -> (AxClickOutcome, bool) {
+fn post_press_delivery(
+    outcome: AxClickOutcome,
+    _press_fronted: bool,
+    selection_fronted: bool,
+) -> (AxClickOutcome, bool) {
     (outcome, selection_fronted)
 }
 
@@ -3460,19 +3540,41 @@ async fn run_live_selection_candidate(
         cua_driver_core::actionability::DEFAULT_BUDGET,
         prior,
         (lease, candidate),
-        |(lease, candidate), _| super::actionability::semantic_probe(
-            lease.as_ref(), candidate.target.clone(), pid, window_id,
-            super::actionability::semantic::SemanticIntent::Select,
-        ),
-        |(lease, candidate)| run_live_selection_write(site, lease, candidate, history_for_write, pid, window_id, foreground),
-    ).await;
+        |(lease, candidate), _| {
+            super::actionability::semantic_probe(
+                lease.as_ref(),
+                candidate.target.clone(),
+                pid,
+                window_id,
+                super::actionability::semantic::SemanticIntent::Select,
+            )
+        },
+        |(lease, candidate)| {
+            run_live_selection_write(
+                site,
+                lease,
+                candidate,
+                history_for_write,
+                pid,
+                window_id,
+                foreground,
+            )
+        },
+    )
+    .await;
     project_live_selection_result(result, history)
 }
 
 fn project_live_selection_result(
-    result: Result<Result<LiveSelectionOutput, tokio::task::JoinError>, cua_driver_core::actionability::ActionabilityReport>,
+    result: Result<
+        Result<LiveSelectionOutput, tokio::task::JoinError>,
+        cua_driver_core::actionability::ActionabilityReport,
+    >,
     history: ClickHistory,
-) -> (Option<super::BackgroundMutationLease>, Result<(AxClickOutcome, bool), ToolResult>) {
+) -> (
+    Option<super::BackgroundMutationLease>,
+    Result<(AxClickOutcome, bool), ToolResult>,
+) {
     match result {
         Err(report) => (None, Err(project_gate_refusal(report, &history))),
         Ok(Err(error)) => (
@@ -3540,7 +3642,7 @@ async fn run_live_selection_write(
     window_id: u32,
     foreground: bool,
 ) -> Result<LiveSelectionOutput, tokio::task::JoinError> {
-            focus_guard::with_focus_suppressed(
+    focus_guard::with_focus_suppressed(
                 if foreground { None } else { Some(pid) },
                 apps::frontmost_pid(),
                 "click.AXSelected",
@@ -3621,11 +3723,19 @@ mod u32_stage_tests {
     #[test]
     fn post_press_selection_uses_selection_delivery_not_press_delivery() {
         use cua_driver_core::action_record::ActualDelivery;
-        let outcome = ("selected".into(), false, Some(ClickEvidence::Selected), false);
+        let outcome = (
+            "selected".into(),
+            false,
+            Some(ClickEvidence::Selected),
+            false,
+        );
         let (outcome, actual_fronted) = post_press_delivery(outcome, true, false);
         let result = finish_ax_click(outcome, actual_fronted, true, "");
         assert_eq!(result.structured_content.as_ref().unwrap()["path"], "ax");
-        assert_eq!(result.action_record.unwrap().actual_delivery, Some(ActualDelivery::Background));
+        assert_eq!(
+            result.action_record.unwrap().actual_delivery,
+            Some(ActualDelivery::Background)
+        );
     }
 
     struct FakeSelectionReader {
@@ -3805,33 +3915,77 @@ mod u32_stage_tests {
     async fn selection_gate_refusal_blocks_both_selection_sites() {
         let writes = [AtomicUsize::new(0), AtomicUsize::new(0)];
         let discoveries = AtomicUsize::new(0);
+        let discovery_queue = std::sync::Mutex::new(std::collections::VecDeque::from([73_u32]));
         let counter = &writes[0];
         let first = run_selection_candidate(
-            SelectionSite::First, &FakeClock, Duration::ZERO, PriorInput::None, 73_u32,
-            |candidate, _| Box::pin(async move {
-                        assert_eq!(*candidate, 73);
-                        ActionabilityReport { verdict: Verdict::Terminal { code: "disabled", reason: "disabled".into() }, checks: vec![], waited_ms: 0, samples: 0, last_facts: None, disposition: None }
-                    }),
+            SelectionSite::First,
+            &FakeClock,
+            Duration::ZERO,
+            PriorInput::None,
+            73_u32,
+            |candidate, _| {
+                Box::pin(async move {
+                    assert_eq!(*candidate, 73);
+                    ActionabilityReport {
+                        verdict: Verdict::Terminal {
+                            code: "disabled",
+                            reason: "disabled".into(),
+                        },
+                        checks: vec![],
+                        waited_ms: 0,
+                        samples: 0,
+                        last_facts: None,
+                        disposition: None,
+                    }
+                })
+            },
             |candidate| async move {
-                        assert_eq!(candidate, 73);
-                        counter.fetch_add(1, Ordering::SeqCst);
-                    },
-        ).await;
+                assert_eq!(candidate, 73);
+                counter.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+        .await;
         let counter = &writes[1];
         let post = run_post_press_selection(
-            &FakeClock, Duration::ZERO, PriorInput::None,
-            async { discoveries.fetch_add(1, Ordering::SeqCst); Ok::<_, ()>(73_u32) },
-            |candidate, _| Box::pin(async move {
-                        assert_eq!(*candidate, 73);
-                        ActionabilityReport { verdict: Verdict::Terminal { code: "disabled", reason: "disabled".into() }, checks: vec![], waited_ms: 0, samples: 0, last_facts: None, disposition: None }
-                    }),
+            &FakeClock,
+            Duration::ZERO,
+            PriorInput::None,
+            async {
+                discoveries.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, ()>(discovery_queue.lock().unwrap().pop_front().unwrap())
+            },
+            |candidate, _| {
+                Box::pin(async move {
+                    assert_eq!(*candidate, 73);
+                    ActionabilityReport {
+                        verdict: Verdict::Terminal {
+                            code: "disabled",
+                            reason: "disabled".into(),
+                        },
+                        checks: vec![],
+                        waited_ms: 0,
+                        samples: 0,
+                        last_facts: None,
+                        disposition: None,
+                    }
+                })
+            },
             |candidate| async move {
-                        assert_eq!(candidate, 73);
-                        counter.fetch_add(1, Ordering::SeqCst);
-                    },
-        ).await;
-        assert_eq!([writes[0].load(Ordering::SeqCst), writes[1].load(Ordering::SeqCst)], [0, 0], "both refusals must prevent AXSelected");
+                assert_eq!(candidate, 73);
+                counter.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+        .await;
+        assert_eq!(
+            [
+                writes[0].load(Ordering::SeqCst),
+                writes[1].load(Ordering::SeqCst)
+            ],
+            [0, 0],
+            "both refusals must prevent AXSelected"
+        );
         assert_eq!(discoveries.load(Ordering::SeqCst), 1);
+        assert!(discovery_queue.lock().unwrap().is_empty());
         assert!(first.is_err());
         assert!(matches!(post, Err(SelectionStageError::Refused(_))));
     }
