@@ -3131,10 +3131,11 @@ type AxClickOutcome = (String, bool, Option<ClickEvidence>, bool);
 enum SelectionSite {
     First,
     PostPress,
+    NativeFocus,
 }
 
 async fn dispatch_post_press_selection<C, P, A, F, T>(
-    _site: SelectionSite,
+    site: SelectionSite,
     clock: &(impl cua_driver_core::actionability::Clock + Sync),
     budget: std::time::Duration,
     prior: cua_driver_core::mutation::PriorInput,
@@ -3158,6 +3159,10 @@ where
     A: FnOnce(C) -> F,
     F: std::future::Future<Output = T>,
 {
+    // Native focus currently writes inside the click worker without this gate.
+    if matches!(site, SelectionSite::NativeFocus) {
+        return Ok(write(candidate).await);
+    }
     let report = super::actionability::wait(
         clock,
         budget,
@@ -3736,6 +3741,34 @@ mod u32_stage_tests {
             result.action_record.unwrap().actual_delivery,
             Some(ActualDelivery::Background)
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn native_focus_gate_refusal_prevents_write() {
+        let writes = AtomicUsize::new(0);
+        let counter = &writes;
+        let queue = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from([73_u32])));
+        let probe_queue = queue.clone();
+        let result = dispatch_post_press_selection(
+            SelectionSite::NativeFocus, &FakeClock, Duration::ZERO, PriorInput::None, 73_u32,
+            move |candidate, _| {
+                let probe_queue = probe_queue.clone();
+                Box::pin(async move {
+                    assert_eq!(probe_queue.lock().unwrap().pop_front(), Some(*candidate));
+                    ActionabilityReport {
+                        verdict: Verdict::Terminal { code: "disabled", reason: "disabled".into() },
+                        checks: vec![], waited_ms: 0, samples: 0, last_facts: None, disposition: None,
+                    }
+                })
+            },
+            |candidate| async move {
+                assert_eq!(candidate, 73);
+                counter.fetch_add(1, Ordering::SeqCst);
+            },
+        ).await;
+        assert_eq!(writes.load(Ordering::SeqCst), 0, "refusal must prevent AXFocused");
+        assert!(result.is_err());
+        assert!(queue.lock().unwrap().is_empty());
     }
 
     struct FakeSelectionReader {
