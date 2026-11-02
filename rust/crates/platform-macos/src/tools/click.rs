@@ -2103,7 +2103,7 @@ impl ClickTool {
                     .await;
                     _mutation_lease = held;
                     match selected {
-                        Ok(outcome) => Ok(Ok((outcome, fronted))),
+                        Ok((outcome, selection_fronted)) => Ok(Ok(post_press_delivery(outcome, fronted, selection_fronted))),
                         Err(refusal) => {
                             let _ = snapshot.detect_sampled_async().await;
                             return refusal;
@@ -3348,7 +3348,7 @@ async fn run_post_press_selection(
     foreground: bool,
 ) -> (
     Option<super::BackgroundMutationLease>,
-    Result<AxClickOutcome, ToolResult>,
+    Result<(AxClickOutcome, bool), ToolResult>,
 ) {
     let discovery = latency::spawn_action_blocking(move || {
         let held = lease;
@@ -3412,7 +3412,11 @@ async fn run_post_press_selection(
         foreground,
     )
     .await;
-    (lease, result.map(|(outcome, _)| outcome))
+    (lease, result)
+}
+
+fn post_press_delivery(outcome: AxClickOutcome, press_fronted: bool, _selection_fronted: bool) -> (AxClickOutcome, bool) {
+    (outcome, press_fronted)
 }
 
 async fn run_selection_candidate(
@@ -3568,6 +3572,16 @@ mod u32_stage_tests {
         fn sleep(&self, _: Duration) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
             Box::pin(std::future::pending())
         }
+    }
+
+    #[test]
+    fn post_press_selection_uses_selection_delivery_not_press_delivery() {
+        use cua_driver_core::action_record::ActualDelivery;
+        let outcome = ("selected".into(), false, Some(ClickEvidence::Selected), false);
+        let (outcome, actual_fronted) = post_press_delivery(outcome, true, false);
+        let result = finish_ax_click(outcome, actual_fronted, true, "");
+        assert_eq!(result.structured_content.as_ref().unwrap()["path"], "ax");
+        assert_eq!(result.action_record.unwrap().actual_delivery, Some(ActualDelivery::Background));
     }
 
     struct FakeSelectionReader {
