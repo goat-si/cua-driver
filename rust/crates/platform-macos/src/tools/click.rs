@@ -4050,7 +4050,7 @@ where
 
 enum NativeFocusDiscoveryError {
     Next(Option<super::BackgroundMutationLease>),
-    Refused(Option<super::BackgroundMutationLease>, ToolResult),
+    Refused(Option<super::BackgroundMutationLease>, Box<ToolResult>),
 }
 
 async fn run_live_native_focus_stage(
@@ -4075,10 +4075,10 @@ async fn run_live_native_focus_stage(
             Err(error) => {
                 return Err(NativeFocusDiscoveryError::Refused(
                     None,
-                    super::pre_dispatch_refusal(
+                    Box::new(super::pre_dispatch_refusal(
                         "action_unavailable",
                         format!("native focus discovery failed: {error}"),
-                    ),
+                    )),
                 ))
             }
         };
@@ -4086,10 +4086,10 @@ async fn run_live_native_focus_stage(
             NativeFocusRoute::Next => Err(NativeFocusDiscoveryError::Next(held)),
             NativeFocusRoute::Refused(reason) => Err(NativeFocusDiscoveryError::Refused(
                 held,
-                super::pre_dispatch_refusal(
+                Box::new(super::pre_dispatch_refusal(
                     "action_unavailable",
                     format!("native focus unavailable: {reason}"),
-                ),
+                )),
             )),
             NativeFocusRoute::Ready(candidate) => {
                 let prior_front = apps::frontmost_pid();
@@ -4134,7 +4134,7 @@ async fn run_live_native_focus_stage(
     ).await;
     let (held, outcome) = match result {
         Err(SelectionStageError::Discovery(NativeFocusDiscoveryError::Next(held))) => return (held, None),
-        Err(SelectionStageError::Discovery(NativeFocusDiscoveryError::Refused(held, refusal))) => return (held, Some(refusal)),
+        Err(SelectionStageError::Discovery(NativeFocusDiscoveryError::Refused(held, refusal))) => return (held, Some(*refusal)),
         Err(SelectionStageError::Refused(report)) => (None, Err(project_focus_gate_refusal(*report, prior))),
         Ok(Err(error)) => (None, Err(click_task_failure(format!("native focus worker failed ({error}); the action may have run. Read fresh state before retrying.")).with_disposition(cua_driver_contract::ErrorDisposition::SUSPECTED_NOOP))),
         Ok(Ok((Err(error), held))) => (held, Err(native_focus_failure(&error))),
