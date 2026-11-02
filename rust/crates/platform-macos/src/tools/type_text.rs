@@ -1624,7 +1624,7 @@ pub(super) fn target_requires_pointer_focus(
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum WebAreaClassification {
+pub(super) enum WebAreaClassification {
     WebContent,
     NonWebContent,
     Incomplete,
@@ -1642,7 +1642,7 @@ fn target_readback_is_untrusted(classification: WebAreaClassification, _is_elect
     classification != WebAreaClassification::NonWebContent
 }
 
-fn classify_target_web_area(
+pub(super) fn classify_target_web_area(
     pid: i32,
     element_ptr_and_idx: Option<(usize, Option<usize>)>,
     window_id: Option<u32>,

@@ -1879,6 +1879,23 @@ impl ClickTool {
                 }
             }
 
+            if effective_action == "press" && resolved_action == "AXPress" && modifiers.is_empty() {
+                let foreground = delivery_mode.is_foreground();
+                let (held, result) = run_live_native_focus_stage(
+                    _mutation_lease.take(),
+                    element_guard.clone(),
+                    (idx, read_back),
+                    (pid, wid),
+                    foreground,
+                    cua_driver_core::mutation::PriorInput::None,
+                )
+                .await;
+                _mutation_lease = held;
+                if let Some(result) = result {
+                    return result;
+                }
+            }
+
             // Finder icon/list items can expose a readable AXSelected state
             // while refusing both AXSelected writes and AXPress. Resolve a
             // verified coordinate frame only for those collection-like
@@ -3131,6 +3148,7 @@ type AxClickOutcome = (String, bool, Option<ClickEvidence>, bool);
 enum SelectionSite {
     First,
     PostPress,
+    NativeFocus,
 }
 
 async fn dispatch_post_press_selection<C, P, A, F, T>(
@@ -3265,6 +3283,101 @@ enum AxClickStep {
 struct SelectionCandidate {
     target: crate::ax::snapshot::RetainedElement,
     role: String,
+}
+
+struct NativeFocusCandidate {
+    target: crate::ax::snapshot::RetainedElement,
+    role: String,
+    title: String,
+    idx: usize,
+    read_back: bool,
+}
+
+enum NativeFocusRoute {
+    Next,
+    Ready(NativeFocusCandidate),
+    Refused(String),
+}
+
+fn focus_capability(
+    evidence: cua_driver_core::actionability::Evidence<bool>,
+) -> Result<(), String> {
+    use cua_driver_core::actionability::Evidence;
+    match evidence {
+        Evidence::Known(true) => Ok(()),
+        Evidence::Known(false) => Err("AXFocused is not settable".into()),
+        Evidence::Absent => Err("AXFocused capability is absent".into()),
+        Evidence::Unknown(reason) => Err(format!("AXFocused capability is unknown: {reason}")),
+    }
+}
+
+fn focus_capability_refusal(
+    evidence: cua_driver_core::actionability::Evidence<bool>,
+) -> Option<NativeFocusRoute> {
+    focus_capability(evidence)
+        .err()
+        .map(NativeFocusRoute::Refused)
+}
+
+fn native_focus_recheck(
+    bound: bool,
+    role_matches: bool,
+    capability: cua_driver_core::actionability::Evidence<bool>,
+    proven_native: bool,
+) -> bool {
+    bound && role_matches && focus_capability(capability).is_ok() && proven_native
+}
+
+fn prepare_native_focus(
+    leaf: &crate::ax::snapshot::RetainedElement,
+    idx: usize,
+    pid: i32,
+    window_id: u32,
+    read_back: bool,
+    foreground: bool,
+) -> NativeFocusRoute {
+    use crate::ax::actionability::{NativeReader, Reader};
+    use cua_driver_core::actionability::Evidence;
+    let ptr = leaf.as_ptr() as AXUIElementRef;
+    let role = match NativeReader.string(ptr, "AXRole") {
+        Evidence::Known(role) if !role.is_empty() && role != "AXUnknown" => role,
+        _ => return NativeFocusRoute::Refused("AXRole is unknown".into()),
+    };
+    if !text_input_click_role(&role) || unsafe { super::set_value::file_name_cell(ptr) } {
+        return NativeFocusRoute::Next;
+    }
+    use super::type_text::WebAreaClassification;
+    match super::type_text::classify_target_web_area(
+        pid,
+        Some((leaf.as_ptr(), Some(idx))),
+        Some(window_id),
+    ) {
+        WebAreaClassification::WebContent
+        | WebAreaClassification::Incomplete
+        | WebAreaClassification::WindowFocusUnavailable => return NativeFocusRoute::Next,
+        WebAreaClassification::NonWebContent => {}
+    }
+    if let Err(error) =
+        crate::input::ax_actions::ensure_ax_action_enabled(leaf.as_ptr(), "AXPress", foreground)
+    {
+        return NativeFocusRoute::Refused(error.to_string());
+    }
+    if let Some(refusal) = focus_capability_refusal(NativeReader.settable(ptr, "AXFocused")) {
+        return refusal;
+    }
+    let title = ["AXTitle", "AXDescription", "AXHelp", "AXIdentifier"]
+        .iter()
+        .find_map(|attr| {
+            unsafe { copy_string_attr(ptr, attr) }.filter(|text| !text.trim().is_empty())
+        })
+        .unwrap_or_default();
+    NativeFocusRoute::Ready(NativeFocusCandidate {
+        target: leaf.clone(),
+        role,
+        title,
+        idx,
+        read_back,
+    })
 }
 
 enum FirstSelectionRoute<T> {
@@ -3698,6 +3811,348 @@ async fn run_live_selection_write(
             ).await
 }
 
+fn perform_native_text_focus(
+    candidate: &NativeFocusCandidate,
+    pid: i32,
+    window_id: u32,
+    foreground: bool,
+    mut prior: cua_driver_core::mutation::PriorInput,
+) -> anyhow::Result<AxClickOutcome> {
+    use crate::ax::actionability::{NativeReader, Reader};
+    use cua_driver_core::{actionability::Evidence, mutation::PriorInput};
+    let element_ptr = candidate.target.as_ptr();
+    let element = element_ptr as AXUIElementRef;
+    let bound = super::actionability::semantic::bind_exact_with(
+        &mut super::actionability::semantic::NativeWindowReader,
+        candidate.target.clone(),
+        pid,
+        window_id,
+    );
+    let role_matches = matches!(NativeReader.string(element, "AXRole"), Evidence::Known(role) if role == candidate.role);
+    let capability = NativeReader.settable(element, "AXFocused");
+    if !native_focus_recheck(
+        matches!(bound, Evidence::Known(_)),
+        role_matches,
+        capability,
+        super::type_text::target_is_proven_native(pid, element_ptr, window_id),
+    ) {
+        return Err(ClickWriteFailure {
+            message:
+                "native focus target changed or its capability is unknown; AXFocused was not sent"
+                    .into(),
+            disposition: if prior == PriorInput::None {
+                cua_driver_contract::ErrorDisposition::NOT_DELIVERED
+            } else {
+                cua_driver_contract::ErrorDisposition::SUSPECTED_NOOP
+            },
+        }
+        .into());
+    }
+    let focus_idle_before = super::physical_input_idle_ms();
+    let focus_input_from = std::time::Instant::now();
+    let focused_before = candidate
+        .read_back
+        .then(|| unsafe { copy_bool_attr(element, "AXFocused") })
+        .flatten();
+    let scope = if !foreground {
+        match crate::input::skylight::enter_exact_window_key_inline_detailed(
+            pid as libc::pid_t,
+            window_id,
+        ) {
+            Ok(scope) => Some(scope),
+            Err(reason) => {
+                let entry = reason.entry;
+                let had_input =
+                    entry.records_posted > 0 || entry.records_uncertain || entry.ax_write;
+                return Err(ClickWriteFailure {
+                    message: format!(
+                        "text input [{}]: {}; AXFocused was not written and AXPress was not sent",
+                        candidate.idx, reason.reason
+                    ),
+                    disposition: if had_input || prior == PriorInput::MayHaveDelivered {
+                        cua_driver_contract::ErrorDisposition::SUSPECTED_NOOP
+                    } else {
+                        cua_driver_contract::ErrorDisposition::NOT_DELIVERED
+                    },
+                }
+                .into());
+            }
+        }
+    } else {
+        None
+    };
+    if let Some(scope) = &scope {
+        let entry = scope.entry();
+        if entry.records_posted > 0 || entry.records_uncertain || entry.ax_write {
+            prior = PriorInput::MayHaveDelivered;
+        }
+    }
+    let focus_step = || -> anyhow::Result<bool> {
+        let err = crate::input::ax_actions::focus_element_raw(element_ptr);
+        let outcome = crate::ax::write_outcome::native_write_outcome(
+            crate::ax::write_outcome::NativeWriteKind::SetAttribute,
+            true,
+            &crate::ax::write_outcome::Settable::Unknown(crate::ax::bindings::kAXErrorFailure),
+            err,
+        );
+        let chain = cua_driver_core::mutation::ChainResult::from_recorded(vec![outcome], prior)
+            .expect("one write");
+        if outcome != cua_driver_core::mutation::WriteOutcome::Delivered {
+            return Err(ClickWriteFailure {
+                message: format!("AXFocused returned {err}"),
+                disposition: chain
+                    .error_disposition(
+                        cua_driver_core::mutation::Postcondition::Indeterminate,
+                        false,
+                    )
+                    .expect("unconfirmed write"),
+            }
+            .into());
+        }
+        let holds = || {
+            (unsafe { copy_bool_attr(element, "AXFocused") } == Some(true))
+                && super::type_text::element_in_requested_window(pid, window_id, element_ptr)
+                && crate::input::ax_actions::is_element_focused(pid, element_ptr)
+                && super::type_text::focused_window_matches_element(pid, window_id, element_ptr)
+        };
+        Ok(watch_for_change(
+            ObservationScope::Watch,
+            std::time::Instant::now(),
+            &crate::ax::scroll_area::SystemClock,
+            || holds().then_some(ClickEvidence::Focused),
+        )
+        .is_some())
+    };
+    let focused = focus_step();
+    let hand_back = scope.map(|scope| {
+        let entry = scope.entry();
+        crate::input::skylight::scope_disclosure(entry, Some(scope.finish()))
+    });
+    let focused = match focused {
+        Ok(value) => value,
+        Err(error) => match hand_back.filter(|text| !text.is_empty()) {
+            Some(text) => {
+                let message = format!("{error} {text}");
+                return Err(error.context(message));
+            }
+            None => return Err(error),
+        },
+    };
+    let idx = candidate.idx;
+    let role = &candidate.role;
+    let title = &candidate.title;
+    if !focused {
+        return Err(ClickWriteFailure {
+            message: format!("text input [{idx}] did not become the application's focused element; AXPress was not sent.{}", hand_back.map(|text| format!(" {text}")).unwrap_or_default()),
+            disposition: cua_driver_contract::ErrorDisposition::DELIVERED,
+        }.into());
+    }
+    let evidence = text_focus_evidence(
+        focused_before,
+        input_quiet(
+            focus_idle_before,
+            super::physical_input_idle_ms(),
+            elapsed_ms(focus_input_from),
+        ),
+    );
+    let summary = if evidence.is_some() {
+        format!(
+            "✅ Focused [{idx}] {role} \"{title}\" with AXFocused=true; focus read-back confirmed."
+        )
+    } else {
+        format!("✅ [{idx}] {role} \"{title}\" holds focus (AXFocused=true), but it was focused before the click or input arrived meanwhile, so nothing confirms the click.")
+    };
+    Ok((
+        format!(
+            "{summary}{}",
+            hand_back.map(|text| format!(" {text}")).unwrap_or_default()
+        ),
+        false,
+        evidence,
+        false,
+    ))
+}
+
+fn project_focus_gate_refusal(
+    report: cua_driver_core::actionability::ActionabilityReport,
+    prior: cua_driver_core::mutation::PriorInput,
+) -> ToolResult {
+    let mut result = report.refusal_result().expect("terminal report");
+    if prior == cua_driver_core::mutation::PriorInput::MayHaveDelivered {
+        let reason = match &report.verdict {
+            cua_driver_core::actionability::Verdict::Terminal { reason, .. } => reason,
+            _ => unreachable!(),
+        };
+        result.content = ToolResult::error(format!(
+            "Prior input may have been delivered; AXFocused was not sent: {reason}"
+        ))
+        .content;
+        if let Some(value) = result.structured_content.as_mut() {
+            value["effect"] = serde_json::json!("unverifiable");
+            if let Some(object) = value.as_object_mut() {
+                object.remove("dispatched");
+            }
+        }
+        result.disposition = Some(cua_driver_contract::ErrorDisposition::SUSPECTED_NOOP);
+    }
+    result
+}
+
+fn native_focus_failure(error: &anyhow::Error) -> ToolResult {
+    let mut result = element_click_failure(error);
+    if result.disposition.is_some_and(|disposition| {
+        disposition == cua_driver_contract::ErrorDisposition::SUSPECTED_NOOP
+            || disposition == cua_driver_contract::ErrorDisposition::DELIVERED
+    }) {
+        result.structured_content = Some(serde_json::json!({"effect": "unverifiable"}));
+    }
+    result
+}
+
+async fn run_native_focus_stage<C, D, E, P, A, F, T>(
+    clock: &(impl cua_driver_core::actionability::Clock + Sync),
+    budget: std::time::Duration,
+    prior: cua_driver_core::mutation::PriorInput,
+    discovery: D,
+    probe: P,
+    write: A,
+) -> Result<T, SelectionStageError<E>>
+where
+    C: Sync,
+    D: std::future::Future<Output = Result<C, E>>,
+    P: for<'a> FnMut(
+            &'a C,
+            std::time::Duration,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = cua_driver_core::actionability::ActionabilityReport,
+                    > + Send
+                    + 'a,
+            >,
+        > + Send,
+    A: FnOnce(C) -> F,
+    F: std::future::Future<Output = T>,
+{
+    let context = discovery.await.map_err(SelectionStageError::Discovery)?;
+    dispatch_post_press_selection(
+        SelectionSite::NativeFocus,
+        clock,
+        budget,
+        prior,
+        context,
+        probe,
+        write,
+    )
+    .await
+    .map_err(|report| SelectionStageError::Refused(Box::new(report)))
+}
+
+enum NativeFocusDiscoveryError {
+    Next(Option<super::BackgroundMutationLease>),
+    Refused(Option<super::BackgroundMutationLease>, Box<ToolResult>),
+}
+
+async fn run_live_native_focus_stage(
+    lease: Option<super::BackgroundMutationLease>,
+    leaf: crate::ax::snapshot::RetainedElement,
+    element: (usize, bool),
+    window: (i32, u32),
+    foreground: bool,
+    prior: cua_driver_core::mutation::PriorInput,
+) -> (Option<super::BackgroundMutationLease>, Option<ToolResult>) {
+    let (idx, read_back) = element;
+    let (pid, window_id) = window;
+    let mut snapshot = None;
+    let discovery = async {
+        let prepared = latency::spawn_action_blocking(move || {
+            let run = || prepare_native_focus(&leaf, idx, pid, window_id, read_back, foreground);
+            (run(), lease)
+        })
+        .await;
+        let (route, held) = match prepared {
+            Ok(value) => value,
+            Err(error) => {
+                return Err(NativeFocusDiscoveryError::Refused(
+                    None,
+                    Box::new(super::pre_dispatch_refusal(
+                        "action_unavailable",
+                        format!("native focus discovery failed: {error}"),
+                    )),
+                ))
+            }
+        };
+        match route {
+            NativeFocusRoute::Next => Err(NativeFocusDiscoveryError::Next(held)),
+            NativeFocusRoute::Refused(reason) => Err(NativeFocusDiscoveryError::Refused(
+                held,
+                Box::new(super::pre_dispatch_refusal(
+                    "action_unavailable",
+                    format!("native focus unavailable: {reason}"),
+                )),
+            )),
+            NativeFocusRoute::Ready(candidate) => {
+                let prior_front = apps::frontmost_pid();
+                snapshot = Some(if foreground {
+                    WindowChangeDetector::snapshot_without_suppression(prior_front)
+                } else {
+                    WindowChangeDetector::snapshot(prior_front)
+                });
+                Ok((held, candidate))
+            }
+        }
+    };
+    let clock = super::actionability::semantic_clock();
+    let result = run_native_focus_stage(
+        &clock, cua_driver_core::actionability::DEFAULT_BUDGET, prior, discovery,
+        |(lease, candidate), _| super::actionability::semantic_probe(
+            lease.as_ref(), candidate.target.clone(), pid, window_id, super::actionability::semantic::SemanticIntent::Focus,
+        ),
+        |(lease, candidate)| async move {
+            focus_guard::with_focus_suppressed(
+                if foreground { None } else { Some(pid) }, apps::frontmost_pid(), "click.AXFocused",
+                || async move { latency::spawn_action_blocking(move || {
+                    let held = lease;
+                    let run = || -> anyhow::Result<(AxClickOutcome, bool)> {
+                        if foreground {
+                            let before = crate::input::skylight::focus_generation();
+                            let mut output = None;
+                            let fronted = crate::input::skylight::with_foreground_assist(pid as libc::pid_t, window_id, || {
+                                let effective_prior = if crate::input::skylight::focus_generation() != before { cua_driver_core::mutation::PriorInput::MayHaveDelivered } else { prior };
+                                output = Some(perform_native_text_focus(&candidate, pid, window_id, true, effective_prior));
+                                Ok(())
+                            })?;
+                            Ok((output.ok_or_else(|| anyhow::anyhow!("native focus did not execute"))??, fronted))
+                        } else {
+                            perform_native_text_focus(&candidate, pid, window_id, false, prior).map(|outcome| (outcome, false))
+                        }
+                    };
+                    (run(), held)
+                }).await },
+            ).await
+        },
+    ).await;
+    let (held, outcome) = match result {
+        Err(SelectionStageError::Discovery(NativeFocusDiscoveryError::Next(held))) => return (held, None),
+        Err(SelectionStageError::Discovery(NativeFocusDiscoveryError::Refused(held, refusal))) => return (held, Some(*refusal)),
+        Err(SelectionStageError::Refused(report)) => (None, Err(project_focus_gate_refusal(*report, prior))),
+        Ok(Err(error)) => (None, Err(click_task_failure(format!("native focus worker failed ({error}); the action may have run. Read fresh state before retrying.")).with_disposition(cua_driver_contract::ErrorDisposition::SUSPECTED_NOOP))),
+        Ok(Ok((Err(error), held))) => (held, Err(native_focus_failure(&error))),
+        Ok(Ok((Ok(outcome), held))) => (held, Ok(outcome)),
+    };
+    let changes = snapshot
+        .expect("ready discovery creates a snapshot")
+        .detect_sampled_async()
+        .await;
+    let result = match outcome {
+        Ok((outcome, fronted)) => {
+            finish_ax_click(outcome, fronted, foreground, &changes.result_suffix())
+        }
+        Err(refusal) => refusal,
+    };
+    (held, Some(result))
+}
+
 #[cfg(test)]
 mod u32_stage_tests {
     use super::*;
@@ -3736,6 +4191,148 @@ mod u32_stage_tests {
             result.action_record.unwrap().actual_delivery,
             Some(ActualDelivery::Background)
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn native_focus_gate_refusal_prevents_write() {
+        let writes = AtomicUsize::new(0);
+        let counter = &writes;
+        let queue = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from([
+            73_u32,
+        ])));
+        let discovery_queue = queue.clone();
+        let result = run_native_focus_stage(
+            &FakeClock,
+            Duration::ZERO,
+            PriorInput::None,
+            async move { Ok::<_, ()>(discovery_queue.lock().unwrap().pop_front().unwrap()) },
+            |candidate, _| {
+                Box::pin(async move {
+                    assert_eq!(*candidate, 73);
+                    ActionabilityReport {
+                        verdict: Verdict::Terminal {
+                            code: "disabled",
+                            reason: "disabled".into(),
+                        },
+                        checks: vec![],
+                        waited_ms: 0,
+                        samples: 0,
+                        last_facts: None,
+                        disposition: None,
+                    }
+                })
+            },
+            |candidate| async move {
+                assert_eq!(candidate, 73);
+                counter.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+        .await;
+        assert_eq!(
+            writes.load(Ordering::SeqCst),
+            0,
+            "refusal must prevent AXFocused"
+        );
+        assert!(matches!(result, Err(SelectionStageError::Refused(_))));
+        assert!(queue.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn native_focus_changed_target_after_gate_never_writes() {
+        use cua_driver_core::actionability::Evidence;
+        let writes = AtomicUsize::new(0);
+        let target = std::sync::Arc::new(AtomicUsize::new(73));
+        let probe_target = target.clone();
+        let write_target = target.clone();
+        let counter = &writes;
+        let result = dispatch_post_press_selection(
+            SelectionSite::NativeFocus,
+            &FakeClock,
+            Duration::ZERO,
+            PriorInput::None,
+            73_u32,
+            move |candidate, _| {
+                let target = probe_target.clone();
+                Box::pin(async move {
+                    assert_eq!(*candidate, 73);
+                    target.store(74, Ordering::SeqCst);
+                    ActionabilityReport {
+                        verdict: Verdict::Pass,
+                        checks: vec![],
+                        waited_ms: 0,
+                        samples: 0,
+                        last_facts: None,
+                        disposition: None,
+                    }
+                })
+            },
+            |candidate| async move {
+                if native_focus_recheck(
+                    candidate as usize == write_target.load(Ordering::SeqCst),
+                    true,
+                    Evidence::Known(true),
+                    true,
+                ) {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    true
+                } else {
+                    false
+                }
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!result);
+        assert_eq!(writes.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn native_focus_unknown_capability_never_falls_through() {
+        use cua_driver_core::actionability::Evidence;
+        let writes = AtomicUsize::new(0);
+        let fallbacks = AtomicUsize::new(0);
+        let capability = Evidence::Unknown("read failed".into());
+        match focus_capability_refusal(capability.clone()) {
+            Some(NativeFocusRoute::Refused(_)) => {}
+            Some(NativeFocusRoute::Next) => {
+                fallbacks.fetch_add(1, Ordering::SeqCst);
+            }
+            Some(NativeFocusRoute::Ready(_)) | None => {
+                writes.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        assert!(!native_focus_recheck(true, true, capability, true));
+        assert_eq!(
+            (
+                writes.load(Ordering::SeqCst),
+                fallbacks.load(Ordering::SeqCst)
+            ),
+            (0, 0)
+        );
+    }
+
+    #[test]
+    fn native_focus_refusal_preserves_prior_input() {
+        let report = ActionabilityReport {
+            verdict: Verdict::Terminal {
+                code: "disabled",
+                reason: "disabled".into(),
+            },
+            checks: vec![],
+            waited_ms: 0,
+            samples: 1,
+            last_facts: None,
+            disposition: None,
+        };
+        let result = project_focus_gate_refusal(report, PriorInput::MayHaveDelivered);
+        assert_eq!(
+            result.disposition,
+            Some(cua_driver_contract::ErrorDisposition::SUSPECTED_NOOP)
+        );
+        let structured = result.structured_content.unwrap();
+        assert_eq!(structured["effect"], "unverifiable");
+        assert_eq!(structured["code"], "element_not_actionable");
+        assert!(structured.get("dispatched").is_none());
     }
 
     struct FakeSelectionReader {
@@ -5084,14 +5681,20 @@ fn perform_ax_click(
             Some((element_ptr, Some(idx))),
             Some(window_id),
         );
-    // A native text input whose app's key window is another of its windows (a
-    // second document) takes AXFocused only while its own window is key: hold
-    // that window as the app's key window for the focus and its checks, then
-    // hand key back. A window that is already key is held without posting
-    // anything. The focus stays the window's first responder for the next
-    // type_text, which takes its own key scope.
-    let text_key_scope = text_input_press && !text_in_web_area && !foreground;
-    if !foreground && !text_key_scope {
+    // Native text focus must have passed through the caller's Focus stage.
+    if text_input_press && !text_in_web_area {
+        return Err(ClickWriteFailure {
+            message: "native text focus changed after route preparation; AXFocused was not sent"
+                .into(),
+            disposition: if prior == cua_driver_core::mutation::PriorInput::None {
+                cua_driver_contract::ErrorDisposition::NOT_DELIVERED
+            } else {
+                cua_driver_contract::ErrorDisposition::SUSPECTED_NOOP
+            },
+        }
+        .into());
+    }
+    if !foreground {
         let before = crate::input::skylight::focus_generation();
         latency::section(latency::Stage::KeyPrime, || {
             prime_key_window_for_background_press(pid, window_id, ax_action)
@@ -5102,10 +5705,6 @@ fn perform_ax_click(
     }
     if text_input_press {
         let in_web_area = text_in_web_area;
-        // Focus counts as the click's effect only when the field was not
-        // focused before and no physical input arrived meanwhile.
-        // The input clock starts before the baseline read, so a person
-        // focusing the field during the read also disqualifies it.
         let focus_idle_before = super::physical_input_idle_ms();
         let focus_input_from = std::time::Instant::now();
         // Only evidence reads it; a click that was not asked to read back
@@ -5114,71 +5713,13 @@ fn perform_ax_click(
             .selection
             .then(|| unsafe { copy_bool_attr(element, "AXFocused") })
             .flatten();
-        let scope = if text_key_scope {
-            match crate::input::skylight::enter_exact_window_key_inline_detailed(
-                pid as libc::pid_t,
-                window_id,
-            ) {
-                Ok(scope) => Some(scope),
-                Err(reason) => {
-                    let entry = reason.entry;
-                    let had_input =
-                        entry.records_posted > 0 || entry.records_uncertain || entry.ax_write;
-                    return Err(ClickWriteFailure {
-                        message: format!("text input [{idx}]: {}; AXFocused was not written and AXPress was not sent", reason.reason),
-                        disposition: if had_input || prior == cua_driver_core::mutation::PriorInput::MayHaveDelivered {
-                            cua_driver_contract::ErrorDisposition::SUSPECTED_NOOP
-                        } else {
-                            cua_driver_contract::ErrorDisposition::NOT_DELIVERED
-                        },
-                    }.into());
-                }
-            }
-        } else {
-            None
-        };
-        if let Some(scope) = &scope {
-            let entry = scope.entry();
-            if entry.records_posted > 0 || entry.records_uncertain || entry.ax_write {
-                prior = cua_driver_core::mutation::PriorInput::MayHaveDelivered;
-            }
-        }
-        // The focus step and its checks; the scope's hand-back is finished
-        // and disclosed on every way out of it.
         let focus_step = || -> anyhow::Result<bool> {
-            if in_web_area {
-                super::type_text::click_element_center_for_focus_checked(
-                    pid,
-                    window_id,
-                    element_ptr,
-                    foreground,
-                )?;
-            } else {
-                let err = crate::input::ax_actions::focus_element_raw(element_ptr);
-                let outcome = crate::ax::write_outcome::native_write_outcome(
-                    crate::ax::write_outcome::NativeWriteKind::SetAttribute,
-                    true,
-                    &crate::ax::write_outcome::Settable::Unknown(
-                        crate::ax::bindings::kAXErrorFailure,
-                    ),
-                    err,
-                );
-                let chain =
-                    cua_driver_core::mutation::ChainResult::from_recorded(vec![outcome], prior)
-                        .expect("one write");
-                if outcome != cua_driver_core::mutation::WriteOutcome::Delivered {
-                    return Err(ClickWriteFailure {
-                        message: format!("AXFocused returned {err}"),
-                        disposition: chain
-                            .error_disposition(
-                                cua_driver_core::mutation::Postcondition::Indeterminate,
-                                false,
-                            )
-                            .expect("unconfirmed write"),
-                    }
-                    .into());
-                }
-            }
+            super::type_text::click_element_center_for_focus_checked(
+                pid,
+                window_id,
+                element_ptr,
+                foreground,
+            )?;
             // Focus can land shortly after delivery (a web field's DOM
             // focus): poll it from delivery and stop on the sample that
             // shows it.
@@ -5197,10 +5738,7 @@ fn perform_ax_click(
             .is_some())
         };
         let focused = focus_step();
-        let hand_back = scope.map(|scope| {
-            let entry = scope.entry();
-            crate::input::skylight::scope_disclosure(entry, Some(scope.finish()))
-        });
+        let hand_back: Option<String> = None;
         let focused = match focused {
             Ok(focused) => focused,
             // The original error stays downcastable (refusal codes); the
