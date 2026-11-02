@@ -3176,7 +3176,7 @@ where
 
 enum SelectionStageError<E> {
     Discovery(E),
-    Refused(cua_driver_core::actionability::ActionabilityReport),
+    Refused(Box<cua_driver_core::actionability::ActionabilityReport>),
 }
 
 async fn run_selection_candidate<C, P, A, F, T>(
@@ -3243,7 +3243,7 @@ where
         write,
     )
     .await
-    .map_err(SelectionStageError::Refused)
+    .map_err(|report| SelectionStageError::Refused(Box::new(report)))
 }
 
 #[derive(Clone)]
@@ -3505,7 +3505,7 @@ async fn run_live_post_press_selection(
     match result {
         Ok(written) => project_live_selection_result(Ok(written), history),
         Err(SelectionStageError::Refused(report)) => {
-            project_live_selection_result(Err(report), history)
+            project_live_selection_result(Err(*report), history)
         }
         Err(SelectionStageError::Discovery((lease, failure))) => (lease, Err(failure)),
     }
