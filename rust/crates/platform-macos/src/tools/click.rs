@@ -3415,8 +3415,8 @@ async fn run_post_press_selection(
     (lease, result)
 }
 
-fn post_press_delivery(outcome: AxClickOutcome, press_fronted: bool, _selection_fronted: bool) -> (AxClickOutcome, bool) {
-    (outcome, press_fronted)
+fn post_press_delivery(outcome: AxClickOutcome, _press_fronted: bool, selection_fronted: bool) -> (AxClickOutcome, bool) {
+    (outcome, selection_fronted)
 }
 
 async fn run_selection_candidate(
