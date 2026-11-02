@@ -1913,7 +1913,7 @@ impl ClickTool {
                         } else {
                             WindowChangeDetector::snapshot(prior_front)
                         };
-                        let (held, result) = run_native_focus_stage(
+                        let (held, result) = run_live_native_focus_stage(
                             _mutation_lease.take(),
                             candidate,
                             pid,
@@ -4050,7 +4050,28 @@ fn native_focus_failure(error: &anyhow::Error) -> ToolResult {
     result
 }
 
-async fn run_native_focus_stage(
+async fn run_native_focus_stage<C, D, E, P, A, F, T>(
+    clock: &(impl cua_driver_core::actionability::Clock + Sync),
+    budget: std::time::Duration,
+    prior: cua_driver_core::mutation::PriorInput,
+    discovery: D,
+    probe: P,
+    write: A,
+) -> Result<T, SelectionStageError<E>>
+where
+    C: Sync,
+    D: std::future::Future<Output = Result<C, E>>,
+    P: for<'a> FnMut(&'a C, std::time::Duration) -> std::pin::Pin<Box<dyn std::future::Future<Output = cua_driver_core::actionability::ActionabilityReport> + Send + 'a>> + Send,
+    A: FnOnce(C) -> F,
+    F: std::future::Future<Output = T>,
+{
+    let context = discovery.await.map_err(SelectionStageError::Discovery)?;
+    // Temporary wiring revert for the RED test: bypass this site's gate.
+    let _ = (clock, budget, prior, probe);
+    Ok(write(context).await)
+}
+
+async fn run_live_native_focus_stage(
     lease: Option<super::BackgroundMutationLease>,
     candidate: NativeFocusCandidate,
     pid: i32,
@@ -4062,9 +4083,9 @@ async fn run_native_focus_stage(
     Result<(AxClickOutcome, bool), ToolResult>,
 ) {
     let clock = super::actionability::semantic_clock();
-    let result = dispatch_post_press_selection(
-        SelectionSite::NativeFocus, &clock, cua_driver_core::actionability::DEFAULT_BUDGET, prior,
-        (lease, candidate),
+    let result = run_native_focus_stage(
+        &clock, cua_driver_core::actionability::DEFAULT_BUDGET, prior,
+        std::future::ready(Ok::<_, std::convert::Infallible>((lease, candidate))),
         |(lease, candidate), _| super::actionability::semantic_probe(
             lease.as_ref(), candidate.target.clone(), pid, window_id, super::actionability::semantic::SemanticIntent::Focus,
         ),
@@ -4093,7 +4114,8 @@ async fn run_native_focus_stage(
         },
     ).await;
     match result {
-        Err(report) => (None, Err(project_focus_gate_refusal(report, prior))),
+        Err(SelectionStageError::Refused(report)) => (None, Err(project_focus_gate_refusal(*report, prior))),
+        Err(SelectionStageError::Discovery(never)) => match never {},
         Ok(Err(error)) => (None, Err(click_task_failure(format!("native focus worker failed ({error}); the action may have run. Read fresh state before retrying.")).with_disposition(cua_driver_contract::ErrorDisposition::SUSPECTED_NOOP))),
         Ok(Ok((Err(error), held))) => (held, Err(native_focus_failure(&error))),
         Ok(Ok((Ok(outcome), held))) => (held, Ok(outcome)),
@@ -4147,17 +4169,15 @@ mod u32_stage_tests {
         let queue = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from([
             73_u32,
         ])));
-        let probe_queue = queue.clone();
-        let result = dispatch_post_press_selection(
-            SelectionSite::NativeFocus,
+        let discovery_queue = queue.clone();
+        let result = run_native_focus_stage(
             &FakeClock,
             Duration::ZERO,
             PriorInput::None,
-            73_u32,
-            move |candidate, _| {
-                let probe_queue = probe_queue.clone();
+            async move { Ok::<_, ()>(discovery_queue.lock().unwrap().pop_front().unwrap()) },
+            |candidate, _| {
                 Box::pin(async move {
-                    assert_eq!(probe_queue.lock().unwrap().pop_front(), Some(*candidate));
+                    assert_eq!(*candidate, 73);
                     ActionabilityReport {
                         verdict: Verdict::Terminal {
                             code: "disabled",
@@ -4182,7 +4202,7 @@ mod u32_stage_tests {
             0,
             "refusal must prevent AXFocused"
         );
-        assert!(result.is_err());
+        assert!(matches!(result, Err(SelectionStageError::Refused(_))));
         assert!(queue.lock().unwrap().is_empty());
     }
 
