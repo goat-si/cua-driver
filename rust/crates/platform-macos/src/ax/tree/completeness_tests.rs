@@ -247,6 +247,242 @@ fn menu_ownership_unavailable_reports_attribute_failure_and_scope_mismatch() {
 }
 
 #[test]
+fn verify_read_with_no_omission_is_complete() {
+    use super::environment_evidence_tests::Scenario;
+    let (walk, _, _) = with_exhaustive_assertion(true, || {
+        with_exhaustive_nodes(true, || {
+            super::orchestration_preservation_tests::run_scenario(
+                Scenario::Launching,
+                Some((2, "AXWindow")),
+            )
+        })
+    });
+    assert_eq!(walk.legacy.window_scope, Some(WindowScope::Matched));
+    let mut output = json!({});
+    walk.legacy.walk.apply(&mut output);
+    assert_eq!(output["observation_complete"], true, "{output}");
+    assert_eq!(output["observation_incomplete_reasons"], json!([]));
+}
+
+fn clean_verify_with_limits(depth: usize, nodes: usize, empty_children: bool) -> TreeWalkResult {
+    use super::environment_evidence_tests::Scenario;
+    with_exhaustive_assertion(true, || {
+        with_exhaustive_nodes(true, || {
+            super::orchestration_preservation_tests::run_scenario_with_limits(
+                Scenario::Launching,
+                Some((2, "AXWindow")),
+                depth,
+                nodes,
+                empty_children,
+                None,
+            )
+            .0
+            .legacy
+        })
+    })
+}
+
+#[test]
+fn unused_node_cap_does_not_make_verify_incomplete() {
+    let tree = clean_verify_with_limits(10, 2, false);
+    assert_eq!(tree.walk.nodes_visited, 1);
+    let mut output = json!({});
+    tree.walk.apply(&mut output);
+    assert_eq!(output["observation_complete"], true);
+    assert_eq!(output["observation_incomplete_reasons"], json!([]));
+}
+
+#[test]
+fn empty_depth_cap_leaf_is_complete() {
+    let tree = clean_verify_with_limits(0, 100, true);
+    let mut output = json!({});
+    tree.walk.apply(&mut output);
+    assert_eq!(output["observation_complete"], true, "{output}");
+    assert!(!tree.nodes_skipped);
+}
+
+#[test]
+fn absent_children_are_complete() {
+    let tree = clean_verify_with_limits(10, 100, false);
+    let mut output = json!({});
+    tree.walk.apply(&mut output);
+    assert_eq!(output["observation_complete"], true, "{output}");
+    assert_eq!(tree.nodes.len(), 1);
+}
+
+#[test]
+fn ordinary_read_is_not_asserted() {
+    use super::environment_evidence_tests::Scenario;
+    let (walk, _, _) = super::orchestration_preservation_tests::run_scenario(
+        Scenario::Launching,
+        Some((2, "AXWindow")),
+    );
+    assert_eq!(
+        reasons(&walk.legacy),
+        json!([{"kind":"unknown", "detail":"not_asserted"}])
+    );
+}
+
+fn unasserted_verify_options(display_only: bool, full_output: bool, query: Option<&str>) {
+    use super::environment_evidence_tests::Scenario;
+    let assertion = verify_assertion_requested(true, display_only, full_output, query);
+    let (walk, _, _) = with_exhaustive_assertion(assertion, || {
+        with_exhaustive_nodes(true, || {
+            super::orchestration_preservation_tests::run_scenario(
+                Scenario::Launching,
+                Some((2, "AXWindow")),
+            )
+        })
+    });
+    assert_eq!(
+        reasons(&walk.legacy),
+        json!([{"kind":"unknown", "detail":"not_asserted"}])
+    );
+}
+
+#[test]
+fn full_output_read_is_not_asserted() {
+    unasserted_verify_options(false, true, None);
+}
+
+#[test]
+fn display_only_read_is_not_asserted() {
+    unasserted_verify_options(true, false, None);
+}
+
+#[test]
+fn closed_menubar_menu_is_scope_exclusion_not_incomplete() {
+    let tree = super::walker_seam_tests::closed_menu_fixture();
+    let mut output = json!({});
+    tree.walk
+        .apply_with_owner_mapping(&mut output, &std::collections::HashMap::from([(1, 0)]));
+    // The frozen name predates core #253: unverified excluded content is incomplete.
+    assert_eq!(
+        output["observation_scope_exclusions"],
+        json!([{
+            "kind":"closed_menus_not_expanded", "element_indices":[0]
+        }])
+    );
+    assert_eq!(output["observation_complete"], false);
+    assert!(has_reason(
+        &tree,
+        "unknown",
+        "excluded_content_unclassified"
+    ));
+    assert!(!has_reason(&tree, "policy_omission", "collapsed_menu"));
+    assert!(!tree.nodes_skipped);
+}
+
+#[test]
+fn unreadable_menu_selection_stays_incomplete() {
+    for failure in [
+        super::super::tree_source::ReadFailure::WrongType,
+        super::super::tree_source::ReadFailure::Ax(kAXErrorCannotComplete),
+    ] {
+        let tree = super::walker_seam_tests::collapsed_menu_fixture(Read::Unknown(failure));
+        assert!(tree.nodes_skipped);
+        assert!(has_reason(
+            &tree,
+            "provider_failure",
+            "attribute_read_failed"
+        ));
+        assert!(has_reason(&tree, "policy_omission", "collapsed_menu"));
+        let mut output = json!({});
+        tree.walk.apply(&mut output);
+        assert!(output.get("observation_scope_exclusions").is_none());
+    }
+}
+
+#[test]
+fn absent_menu_selection_stays_incomplete() {
+    let tree = super::walker_seam_tests::collapsed_menu_fixture(Read::Absent);
+    assert!(tree.nodes_skipped);
+    assert!(has_reason(&tree, "policy_omission", "collapsed_menu"));
+    let mut output = json!({});
+    tree.walk.apply(&mut output);
+    assert!(output.get("observation_scope_exclusions").is_none());
+}
+
+fn assert_menu_walked(tree: &TreeWalkResult) {
+    assert_eq!(tree.walk.nodes_visited, 2);
+    assert_eq!(tree.nodes[1].role, "AXMenuItem");
+    assert_eq!(tree.nodes[1].title.as_deref(), Some("Open"));
+    let mut output = json!({});
+    tree.walk.apply(&mut output);
+    assert!(output.get("observation_scope_exclusions").is_none());
+}
+
+#[test]
+fn open_menubar_menu_is_walked_and_counted() {
+    let tree = super::walker_seam_tests::expanded_scope_fixture("AXMenuBarItem", true, None, false);
+    assert_menu_walked(&tree);
+    assert!(!tree.nodes_skipped);
+}
+
+#[test]
+fn query_request_walks_closed_menus() {
+    let query = Some("Open");
+    let collapse = collapse_menus_for_request(query, false, false);
+    assert!(!collapse);
+    let tree =
+        super::walker_seam_tests::expanded_scope_fixture("AXMenuBarItem", collapse, query, false);
+    assert_menu_walked(&tree);
+    assert!(tree.tree_markdown.contains("Open"));
+}
+
+#[test]
+fn full_output_request_walks_closed_menus() {
+    let collapse = collapse_menus_for_request(None, true, false);
+    assert!(!collapse);
+    let tree =
+        super::walker_seam_tests::expanded_scope_fixture("AXMenuBarItem", collapse, None, false);
+    assert_menu_walked(&tree);
+}
+
+#[test]
+fn expanded_menu_request_counts_unread_items() {
+    let tree = super::walker_seam_tests::expanded_scope_fixture("AXMenuBarItem", false, None, true);
+    assert_menu_walked(&tree);
+    assert!(tree.nodes_skipped);
+    assert!(has_reason(
+        &tree,
+        "provider_failure",
+        "child_enumeration_failed"
+    ));
+}
+
+#[test]
+fn expanded_combobox_list_is_walked() {
+    let tree = super::walker_seam_tests::expanded_scope_fixture("AXComboBox", true, None, false);
+    assert_menu_walked(&tree);
+    assert!(!tree.nodes_skipped);
+}
+
+#[test]
+fn window_recovery_failure_never_asserts_complete() {
+    use super::environment_evidence_tests::Scenario;
+    for (scenario, root) in [
+        (Scenario::NoMatch, None),
+        (Scenario::ProviderFailure, Some((2, "AXWindow"))),
+        (Scenario::CachedFailure, Some((2, "AXWindow"))),
+    ] {
+        let (walk, _, _) = with_exhaustive_assertion(true, || {
+            with_exhaustive_nodes(true, || {
+                super::orchestration_preservation_tests::run_scenario(scenario, root)
+            })
+        });
+        let mut output = json!({});
+        walk.legacy.walk.apply(&mut output);
+        assert_eq!(output["observation_complete"], false, "{output}");
+        assert!(output["observation_incomplete_reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|reason| reason != &json!({"kind":"unknown", "detail":"not_asserted"})));
+    }
+}
+
+#[test]
 fn missing_application_root_reports_enumeration_error() {
     let (walk, _) = super::environment_setup_tests::run_application_failure();
     assert!(has_reason(

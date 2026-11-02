@@ -582,9 +582,17 @@ impl Tool for GetWindowStateTool {
 
         // A model-facing read lists the menu bar's top-level titles only; a
         // query or full_output walks every menu as before.
-        let collapse_menus = query.as_deref().is_none_or(|q| q.trim().is_empty())
-            && !view.full_output
-            && !observation_only;
+        let collapse_menus = crate::ax::tree::collapse_menus_for_request(
+            query.as_deref(),
+            view.full_output,
+            observation_only,
+        );
+        let assert_exhaustive = crate::ax::tree::verify_assertion_requested(
+            verify_read,
+            display_only,
+            view.full_output,
+            query.as_deref(),
+        );
         let window_dense_rows = !view.full_output && !observation_only;
         // Start the screenshot grab before the tree walk so the two overlap:
         // ScreenCaptureKit and the accessibility walk use independent system
@@ -629,14 +637,16 @@ impl Tool for GetWindowStateTool {
                 }
                 let mut tree = crate::ax::tree::with_menus_collapsed(collapse_menus, || {
                     crate::ax::dense_rows::with_dense_rows_windowed(window_dense_rows, || {
-                        crate::ax::tree::with_exhaustive_nodes(verify_read, || {
-                            crate::ax::tree::walk_tree_budgeted(
-                                pid,
-                                Some(window_id),
-                                q.as_deref(),
-                                max_depth,
-                                budget,
-                            )
+                        crate::ax::tree::with_exhaustive_assertion(assert_exhaustive, || {
+                            crate::ax::tree::with_exhaustive_nodes(verify_read, || {
+                                crate::ax::tree::walk_tree_budgeted(
+                                    pid,
+                                    Some(window_id),
+                                    q.as_deref(),
+                                    max_depth,
+                                    budget,
+                                )
+                            })
                         })
                     })
                 });
@@ -1584,8 +1594,39 @@ fn tree_output_fields(
         structured["filtered_element_count"] = serde_json::json!(filtered_element_count);
     }
     if let Some(tree) = tree {
-        tree.walk.apply(&mut structured);
+        let returned_indices: std::collections::HashSet<u64> = structured["elements"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|element| element.get("element_index").and_then(Value::as_u64))
+            .collect();
+        let mut owners = std::collections::HashMap::new();
+        let mut ambiguous = std::collections::HashSet::new();
+        for node in &tree.nodes {
+            let Some(index) = node.element_index.map(|index| index as u64) else {
+                continue;
+            };
+            if node.element_ptr == 0 || !returned_indices.contains(&index) {
+                continue;
+            }
+            let owner = node.element_ptr as u64;
+            if owners
+                .insert(owner, index)
+                .is_some_and(|previous| previous != index)
+            {
+                ambiguous.insert(owner);
+            }
+        }
+        for owner in ambiguous {
+            owners.remove(&owner);
+        }
+        tree.walk.apply_with_owner_mapping(&mut structured, &owners);
         apply_offscreen_rows(&mut structured, &tree.offscreen_rows);
+    } else {
+        structured["observation_complete"] = serde_json::json!(false);
+        structured["observation_incomplete_reasons"] = serde_json::json!([
+            {"kind": "unknown", "detail": "not_asserted"}
+        ]);
     }
     if let Some(sid) = snapshot_id {
         structured["snapshot_id"] =
@@ -3133,6 +3174,483 @@ mod row_label_tests {
 
 #[cfg(test)]
 mod evidence_refactor_output_tests;
+
+#[cfg(test)]
+mod completeness_output_tests {
+    use super::*;
+    use crate::ax::tree::verify_assertion_requested;
+    use serde_json::json;
+
+    #[test]
+    fn verified_query_projection_never_asserts_complete() {
+        for query in [Some("Beta"), Some("")] {
+            assert!(!verify_assertion_requested(true, false, false, query));
+        }
+        assert!(verify_assertion_requested(true, false, false, None));
+        assert!(!verify_assertion_requested(false, false, false, None));
+        assert!(!verify_assertion_requested(true, true, false, None));
+        assert!(!verify_assertion_requested(true, false, true, None));
+        let tree = crate::ax::tree::verify_output_fixture(Some("Window"), false);
+        let elements = build_observation_elements_array(&tree.nodes);
+        let projected = cua_driver_core::element_query::project_elements_for_query(
+            elements,
+            Some("Window"),
+            &tree.tree_markdown,
+        );
+        assert!(!projected.is_empty());
+        let mut payload = tree_output_fields(
+            91001,
+            42,
+            tree.nodes.len(),
+            projected.len(),
+            elements_complete(Some(&tree), true, true),
+            tree.tree_markdown.clone(),
+            projected,
+            true,
+            Some(&tree),
+            None,
+            42,
+            None,
+        );
+        let context = cua_driver_core::window_state_view::ViewContext {
+            pid: 42,
+            window_id: 91001,
+            key: cua_driver_core::window_state_view::ViewKey {
+                query: Some("Window".into()),
+                max_elements: 100,
+                max_depth: None,
+            },
+            focus_probe: None,
+        };
+        let options = cua_driver_core::window_state_view::ViewOptions::from_args(
+            &json!({"tree_format":"both"}),
+        )
+        .unwrap();
+        let mut content = response_content(91001, 42, Some(&tree), None, false);
+        cua_driver_core::window_state_view::apply(&options, &context, &mut content, &mut payload);
+        assert_eq!(payload["observation_complete"], false);
+        assert_eq!(
+            payload["observation_incomplete_reasons"],
+            json!([{"kind":"unknown", "detail":"not_asserted"}])
+        );
+        assert!(!payload["elements"].as_array().unwrap().is_empty());
+        assert!(payload["tree_markdown"]
+            .as_str()
+            .unwrap()
+            .contains("Window"));
+    }
+
+    #[test]
+    fn verify_output_uses_final_walk_outcome() {
+        for failure in [false, true] {
+            let tree = crate::ax::tree::verify_output_fixture(None, failure);
+            let elements = build_observation_elements_array(&tree.nodes);
+            let payload = tree_output_fields(
+                91002,
+                42,
+                tree.nodes.len(),
+                elements.len(),
+                elements_complete(Some(&tree), true, true),
+                tree.tree_markdown.clone(),
+                elements,
+                false,
+                Some(&tree),
+                None,
+                42,
+                None,
+            );
+            assert_eq!(payload["observation_complete"], !failure);
+            if failure {
+                assert!(payload["observation_incomplete_reasons"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!({"kind":"provider_failure", "detail":"untrusted_provider"})));
+            } else {
+                assert_eq!(payload["observation_incomplete_reasons"], json!([]));
+            }
+        }
+    }
+
+    fn since_pair(window: u64, first_meta: Value, next_meta: Value) -> Value {
+        use cua_driver_core::window_state_view::{self, ViewContext, ViewKey, ViewOptions};
+        let context = ViewContext {
+            pid: 42,
+            window_id: window,
+            key: ViewKey {
+                query: None,
+                max_elements: 100,
+                max_depth: None,
+            },
+            focus_probe: None,
+        };
+        let make = |snapshot, metadata: Value| {
+            let mut payload = tree_output_fields(
+                window as u32,
+                42,
+                1,
+                1,
+                false,
+                "- [0] AXButton \"Open\"\n".into(),
+                vec![json!({"element_index":0, "role":"AXButton", "label":"Open"})],
+                false,
+                None,
+                Some(snapshot),
+                42,
+                None,
+            );
+            for (key, value) in metadata.as_object().unwrap() {
+                payload[key] = value.clone();
+            }
+            payload
+        };
+        let base = (window as u32) << 4;
+        let mut first = make(base, first_meta);
+        let mut first_content = vec![Content::text("first")];
+        window_state_view::apply(
+            &ViewOptions::from_args(&json!({"tree_format":"both"})).unwrap(),
+            &context,
+            &mut first_content,
+            &mut first,
+        );
+        let mut next = make(base + 1, next_meta);
+        let mut next_content = vec![Content::text("next")];
+        window_state_view::apply(&ViewOptions::from_args(&json!({
+            "tree_format":"both", "since":cua_driver_core::element_token::format_snapshot_id(base)
+        })).unwrap(), &context, &mut next_content, &mut next);
+        next
+    }
+
+    #[test]
+    fn completeness_only_change_is_a_since_diff() {
+        let output = since_pair(
+            91011,
+            json!({"observation_complete":false, "observation_incomplete_reasons":[]}),
+            json!({"observation_complete":true, "observation_incomplete_reasons":[]}),
+        );
+        assert_eq!(output["since_status"], "diff");
+        assert!(output["tree_diff"]
+            .as_str()
+            .unwrap()
+            .contains("observation_complete"));
+    }
+
+    #[test]
+    fn reason_only_change_is_a_since_diff() {
+        let output = since_pair(
+            91012,
+            json!({"observation_complete":false, "observation_incomplete_reasons":[{"kind":"budget", "detail":"node_budget"}]}),
+            json!({"observation_complete":false, "observation_incomplete_reasons":[{"kind":"budget", "detail":"time_budget"}]}),
+        );
+        assert_eq!(output["since_status"], "diff");
+        assert!(output["tree_diff"]
+            .as_str()
+            .unwrap()
+            .contains("time_budget"));
+    }
+
+    #[test]
+    fn scope_exclusion_only_change_is_a_since_diff() {
+        let output = since_pair(
+            91013,
+            json!({}),
+            json!({"observation_scope_exclusions":[{"kind":"closed_menus_not_expanded", "element_indices":[0]}]}),
+        );
+        assert_eq!(output["since_status"], "diff");
+        assert!(output["tree_diff"]
+            .as_str()
+            .unwrap()
+            .contains("observation_scope_exclusions"));
+    }
+
+    #[test]
+    fn unchanged_completeness_is_no_change() {
+        let metadata = json!({"observation_complete":false, "observation_incomplete_reasons":[{"kind":"unknown", "detail":"not_asserted"}]});
+        let output = since_pair(91014, metadata.clone(), metadata);
+        assert_eq!(output["since_status"], "no_change");
+    }
+
+    #[test]
+    fn tokens_indices_and_legacy_fields_are_unchanged() {
+        let (tree, _) = crate::ax::tree::evidence_output_fixture(true, true);
+        let elements = build_elements_array_with_token(&tree.nodes, Some(7));
+        let elements = cua_driver_core::element_query::project_elements_for_query(
+            elements,
+            Some("Beta"),
+            &tree.tree_markdown,
+        );
+        let payload = tree_output_fields(
+            99,
+            42,
+            4,
+            elements.len(),
+            false,
+            tree.tree_markdown.clone(),
+            elements,
+            true,
+            Some(&tree),
+            Some(7),
+            42,
+            None,
+        );
+        assert_eq!(payload["snapshot_id"], "s00000007");
+        assert_eq!(payload["element_count"], 4);
+        assert_eq!(payload["filtered_element_count"], 2);
+        assert_eq!(payload["elements"][0]["element_token"], "s00000007:0");
+        assert_eq!(payload["elements"][1]["element_token"], "s00000007:3");
+        assert_eq!(payload["elements"][1]["element_index"], 3);
+        assert_eq!(payload["tree_markdown"], tree.tree_markdown);
+        assert!(payload.get("_note").is_some());
+    }
+
+    #[test]
+    fn query_full_output_display_only_keep_typed_reasons() {
+        use cua_driver_core::window_state_view::{self, ViewContext, ViewKey, ViewOptions};
+        let tree = crate::ax::tree::evidence_deadline_fixture();
+        for args in [
+            json!({"query":"Window", "tree_format":"both"}),
+            json!({"full_output":true}),
+            json!({"display_only":true, "include_accessibility_tree":false}),
+        ] {
+            let mut payload = tree_output_fields(
+                99,
+                42,
+                0,
+                0,
+                false,
+                tree.tree_markdown.clone(),
+                vec![],
+                args.get("query").is_some(),
+                Some(&tree),
+                None,
+                42,
+                None,
+            );
+            if args["display_only"] == true {
+                window_state_view::mark_display_only(&mut payload);
+            }
+            let context = ViewContext {
+                pid: 42,
+                window_id: 99,
+                key: ViewKey {
+                    query: None,
+                    max_elements: 100,
+                    max_depth: None,
+                },
+                focus_probe: None,
+            };
+            let mut content = vec![Content::text("partial")];
+            window_state_view::apply(
+                &ViewOptions::from_args(&args).unwrap(),
+                &context,
+                &mut content,
+                &mut payload,
+            );
+            assert_eq!(payload["observation_complete"], false);
+            assert!(
+                payload["observation_incomplete_reasons"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!({"kind":"budget", "detail":"time_budget"})),
+                "args={args}: {payload}"
+            );
+        }
+    }
+
+    #[test]
+    fn failed_setup_success_has_substantive_reason_not_only_not_asserted() {
+        let tree = crate::ax::tree::failed_setup_output_fixture();
+        let payload = tree_output_fields(
+            99,
+            42,
+            0,
+            0,
+            false,
+            tree.tree_markdown.clone(),
+            vec![],
+            false,
+            Some(&tree),
+            None,
+            42,
+            None,
+        );
+        assert_eq!(payload["observation_complete"], false);
+        assert!(payload["observation_incomplete_reasons"]
+            .as_array()
+            .unwrap()
+            .contains(
+                &json!({"kind":"provider_failure", "detail":"enumeration_error_unclassified"})
+            ));
+    }
+
+    #[test]
+    fn scope_exclusion_owner_maps_after_deferred_renumbering() {
+        let (mut tree, _) = crate::ax::tree::evidence_output_fixture(true, true);
+        let owner = tree
+            .nodes
+            .iter()
+            .find(|node| node.element_ptr == 4)
+            .unwrap();
+        assert_eq!(owner.element_index, Some(3));
+        let mut budget = cua_driver_core::walk_budget::WalkBudget::nodes_only(100);
+        budget.record_scope_exclusion(
+            cua_driver_contract::ScopeExclusionKind::ClosedMenusNotExpanded,
+            Some(4),
+        );
+        tree.walk = budget.outcome();
+        let elements = build_elements_array_with_token(&tree.nodes, Some(7));
+        let elements = cua_driver_core::element_query::project_elements_for_query(
+            elements,
+            Some("Beta"),
+            &tree.tree_markdown,
+        );
+        assert!(elements.iter().any(|entry| entry["element_index"] == 3));
+        let payload = tree_output_fields(
+            99,
+            42,
+            4,
+            elements.len(),
+            false,
+            tree.tree_markdown.clone(),
+            elements,
+            true,
+            Some(&tree),
+            Some(7),
+            42,
+            None,
+        );
+        assert_eq!(
+            payload["observation_scope_exclusions"],
+            json!([{
+                "kind":"closed_menus_not_expanded", "element_indices":[3]
+            }])
+        );
+    }
+
+    fn exclusion_output(owners: &[u64], returned: &[u64]) -> Value {
+        let nodes = vec![
+            crate::ax::tree::AXNode::for_test(Some(1), 10),
+            crate::ax::tree::AXNode::for_test(Some(3), 20),
+        ];
+        let mut tree = crate::ax::tree::TreeWalkResult::for_test(String::new(), nodes);
+        let mut budget = cua_driver_core::walk_budget::WalkBudget::nodes_only(100);
+        for &owner in owners {
+            budget.record_scope_exclusion(
+                cua_driver_contract::ScopeExclusionKind::ClosedMenusNotExpanded,
+                Some(owner),
+            );
+        }
+        tree.walk = budget.outcome();
+        let elements = returned
+            .iter()
+            .map(|index| json!({"element_index": index}))
+            .collect::<Vec<_>>();
+        tree_output_fields(
+            99,
+            42,
+            2,
+            elements.len(),
+            false,
+            String::new(),
+            elements,
+            false,
+            Some(&tree),
+            None,
+            42,
+            None,
+        )
+    }
+
+    #[test]
+    fn dropped_or_unmapped_owner_preserves_exclusion_with_unknown_ownership() {
+        for owners in [vec![10, 20], vec![10, 99]] {
+            let payload = exclusion_output(&owners, &[1]);
+            assert_eq!(
+                payload["observation_scope_exclusions"],
+                json!([{
+                    "kind":"closed_menus_not_expanded"
+                }])
+            );
+            assert_eq!(payload["observation_complete"], false);
+        }
+    }
+
+    #[test]
+    fn multiple_exclusions_deduplicate_final_owner_indices() {
+        let payload = exclusion_output(&[20, 10, 20], &[1, 3]);
+        assert_eq!(
+            payload["observation_scope_exclusions"],
+            json!([{
+                "kind":"closed_menus_not_expanded", "element_indices":[1, 3]
+            }])
+        );
+    }
+
+    #[test]
+    fn owner_mapping_uses_final_projected_elements_only() {
+        let payload = exclusion_output(&[20], &[1]);
+        assert_eq!(
+            payload["observation_scope_exclusions"],
+            json!([{
+                "kind":"closed_menus_not_expanded"
+            }])
+        );
+        let returned = exclusion_output(&[20], &[3]);
+        assert_eq!(
+            returned["observation_scope_exclusions"],
+            json!([{
+                "kind":"closed_menus_not_expanded", "element_indices":[3]
+            }])
+        );
+    }
+
+    #[test]
+    fn no_walk_success_modes_report_explicit_false() {
+        for args in [
+            json!({"include_accessibility_tree": false}),
+            json!({"include_accessibility_tree": false, "full_output": true}),
+            json!({"include_accessibility_tree": false, "display_only": true}),
+            json!({"include_accessibility_tree": false, "display_only": true, "full_output": true}),
+        ] {
+            assert!(!wants_tree(&args));
+            let mut payload = tree_output_fields(
+                99,
+                42,
+                0,
+                0,
+                false,
+                String::new(),
+                vec![],
+                false,
+                None,
+                None,
+                42,
+                None,
+            );
+            if cua_driver_core::window_state_view::display_only(&args).unwrap() {
+                cua_driver_core::window_state_view::mark_display_only(&mut payload);
+            }
+            let options =
+                cua_driver_core::window_state_view::ViewOptions::from_args(&args).unwrap();
+            let context = cua_driver_core::window_state_view::ViewContext {
+                pid: 42,
+                window_id: 99,
+                key: cua_driver_core::window_state_view::ViewKey {
+                    query: None,
+                    max_elements: 100,
+                    max_depth: None,
+                },
+                focus_probe: None,
+            };
+            cua_driver_core::window_state_view::apply(&options, &context, &mut [], &mut payload);
+            assert_eq!(payload["observation_complete"], false, "args={args}");
+            assert_eq!(
+                payload["observation_incomplete_reasons"],
+                json!([{"kind":"unknown", "detail":"not_asserted"}]),
+                "args={args}"
+            );
+        }
+    }
+}
 
 #[cfg(test)]
 mod canonical_output_tests {

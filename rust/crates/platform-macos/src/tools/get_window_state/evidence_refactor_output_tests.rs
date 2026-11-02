@@ -195,7 +195,11 @@ fn display_and_screenshot_only_outputs_are_unchanged_by_evidence_refactor() {
     assert_eq!(payload["screenshot_height"], 200);
     assert_eq!(payload["screenshot_mime_type"], "image/png");
     assert!(payload.get("snapshot_id").is_none());
-    assert!(payload.get("observation_complete").is_none());
+    assert_eq!(payload["observation_complete"], false);
+    assert_eq!(
+        payload["observation_incomplete_reasons"],
+        json!([{"kind":"unknown", "detail":"not_asserted"}])
+    );
     assert!(!serde_json::to_string(&payload)
         .unwrap()
         .contains("evidence"));
