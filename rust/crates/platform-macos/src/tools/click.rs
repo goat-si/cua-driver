@@ -29,12 +29,12 @@ use std::sync::Arc;
 use crate::apps;
 use crate::ax::bindings::{
     copy_action_names, copy_bool_attr, copy_children, copy_element_attr, copy_string_attr,
-    element_at_screen_position, element_screen_rect, kAXErrorSuccess, AXUIElementPerformAction,
+    element_at_screen_position, element_screen_rect, kAXErrorFailure, AXUIElementPerformAction,
     AXUIElementRef,
 };
 use crate::focus_guard;
 use crate::window_change_detector::WindowChangeDetector;
-use core_foundation::base::{CFRelease, CFTypeRef, TCFType};
+use core_foundation::base::{CFEqual, CFRelease, CFTypeRef, TCFType};
 
 use super::pixel_route::PixelClickRoute;
 use super::ToolState;
@@ -462,6 +462,7 @@ impl Drop for WindowTitleProbe {
 /// cannot complete means the app did not answer in time, so a short read-back
 /// proves nothing. Neither qualifies; an unresolved error after dispatch is
 /// reported as unverifiable by `unresolved_perform_error`.
+#[cfg(test)]
 fn press_error_may_have_acted(err: crate::ax::bindings::AXError) -> bool {
     use crate::ax::bindings::{
         kAXErrorActionUnsupported, kAXErrorAttributeUnsupported, kAXErrorFailure,
@@ -641,6 +642,14 @@ impl SelectionSnapshot {
             .iter()
             .map(|(item, _)| unsafe { copy_bool_attr(item.0, "AXSelected") })
             .collect()
+    }
+
+    fn transitioned_target(&self, target: AXUIElementRef) -> bool {
+        self.items.iter().any(|(item, before)| {
+            (unsafe { CFEqual(item.0 as CFTypeRef, target as CFTypeRef) != 0 })
+                && !*before
+                && unsafe { copy_bool_attr(item.0, "AXSelected") } == Some(true)
+        })
     }
 
     fn transitioned(&self) -> bool {
@@ -1905,6 +1914,7 @@ impl ClickTool {
                             let run = || -> anyhow::Result<(AxClickOutcome, bool)> {
                                 if foreground {
                                     let mut outcome = None;
+                                    let focus_generation = crate::input::skylight::focus_generation();
                                     let has_modifiers = !selection_modifiers.is_empty();
                                     let action = || {
                                         outcome = Some(perform_ax_click(
@@ -1917,6 +1927,11 @@ impl ClickTool {
                                             &selection_modifiers,
                                             foreground,
                                             read_back,
+                                            if crate::input::skylight::focus_generation() != focus_generation {
+                                                cua_driver_core::mutation::PriorInput::MayHaveDelivered
+                                            } else {
+                                                cua_driver_core::mutation::PriorInput::None
+                                            },
                                         )?);
                                         Ok(())
                                     };
@@ -1949,6 +1964,7 @@ impl ClickTool {
                                         &selection_modifiers,
                                         false,
                                         read_back,
+                                        cua_driver_core::mutation::PriorInput::None,
                                     )
                                     .map(|outcome| (outcome, false))
                                 }
@@ -2356,10 +2372,34 @@ impl ClickTool {
                         return Err(moved.into());
                     }
                     let delivered = if focus_only {
-                        if crate::input::ax_actions::focus_element(element as usize).is_ok() {
+                        let err = crate::input::ax_actions::focus_element_raw(element as usize);
+                        let outcome = crate::ax::write_outcome::native_write_outcome(
+                            crate::ax::write_outcome::NativeWriteKind::SetAttribute,
+                            true,
+                            &crate::ax::write_outcome::Settable::Unknown(
+                                crate::ax::bindings::kAXErrorFailure,
+                            ),
+                            err,
+                        );
+                        let chain = cua_driver_core::mutation::ChainResult::from_recorded(
+                            vec![outcome],
+                            cua_driver_core::mutation::PriorInput::None,
+                        )
+                        .expect("one write");
+                        if outcome == cua_driver_core::mutation::WriteOutcome::Delivered {
                             PxAxPress::Delivered(None, hit)
                         } else {
-                            PxAxPress::FallThrough
+                            CFRelease(element as _);
+                            return Err(ClickWriteFailure {
+                                message: format!("AXFocused returned {err}"),
+                                disposition: chain
+                                    .error_disposition(
+                                        cua_driver_core::mutation::Postcondition::Indeterminate,
+                                        false,
+                                    )
+                                    .expect("unconfirmed write"),
+                            }
+                            .into());
                         }
                     } else {
                         match ax_press_with_ancestors(element, &dispatch_guard, pid, reads) {
@@ -2370,6 +2410,15 @@ impl ClickTool {
                             Ok(AxPressOutcome::Indeterminate) => {
                                 CFRelease(element as _);
                                 return Ok(PxAxPress::Indeterminate(hit));
+                            }
+                            Ok(AxPressOutcome::NotDelivered(error)) => {
+                                CFRelease(element as _);
+                                return Err(ClickWriteFailure {
+                                    message: format!("AX action returned {error}"),
+                                    disposition:
+                                        cua_driver_contract::ErrorDisposition::NOT_DELIVERED,
+                                }
+                                .into());
                             }
                             Err(moved) => {
                                 CFRelease(element as _);
@@ -2407,6 +2456,21 @@ impl ClickTool {
                         }));
                     }
                     Ok(Err(error)) if !focus_only => {
+                        if let Some(failure) = error.downcast_ref::<ClickWriteFailure>() {
+                            if failure.disposition
+                                == cua_driver_contract::ErrorDisposition::NOT_DELIVERED
+                            {
+                                return super::pre_dispatch_refusal(
+                                    "action_unavailable",
+                                    format!("Background PX action failed: {error}"),
+                                )
+                                .with_disposition(failure.disposition);
+                            }
+                            return ToolResult::error(format!(
+                                "Background PX action failed: {error}"
+                            ))
+                            .with_disposition(failure.disposition);
+                        }
                         // The AX task may have failed after an action: do
                         // not fall through to a second (pixel) click.
                         return ToolResult::text(format!(
@@ -2429,10 +2493,26 @@ impl ClickTool {
                         );
                     }
                     Ok(Err(error)) if focus_only => {
-                        return ToolResult::error(format!("Background PX focus failed: {error}"))
-                            .with_structured(serde_json::json!({
-                                "code": "background_unavailable"
-                            }));
+                        if let Some(failure) = error.downcast_ref::<ClickWriteFailure>() {
+                            if failure.disposition
+                                == cua_driver_contract::ErrorDisposition::NOT_DELIVERED
+                            {
+                                return super::pre_dispatch_refusal(
+                                    "background_unavailable",
+                                    format!("Background PX focus failed: {error}"),
+                                )
+                                .with_disposition(failure.disposition);
+                            }
+                        }
+                        let mut result =
+                            ToolResult::error(format!("Background PX focus failed: {error}"))
+                                .with_structured(serde_json::json!({
+                                    "code": "background_unavailable"
+                                }));
+                        if let Some(failure) = error.downcast_ref::<ClickWriteFailure>() {
+                            result = result.with_disposition(failure.disposition);
+                        }
+                        return result;
                     }
                     Ok(Ok(PxAxPress::Indeterminate(hit))) => {
                         // (path and record below)
@@ -3036,16 +3116,347 @@ fn selection_attempt_outcome(
     attempt: crate::input::ax_actions::SelectAttempt,
     element: (usize, &str, &str),
     after_error: Option<crate::ax::bindings::AXError>,
+    prior: cua_driver_core::mutation::PriorInput,
     tied: impl FnOnce() -> bool,
-) -> Option<AxClickOutcome> {
+) -> anyhow::Result<Option<AxClickOutcome>> {
     use crate::input::ax_actions::SelectAttempt;
+    use cua_driver_core::mutation::{ChainResult, Postcondition, WriteOutcome};
     match attempt {
-        SelectAttempt::NotAttempted => None,
-        SelectAttempt::WriteSentUnconfirmed(role) => {
-            Some(unconfirmed_selection_write(&role, element))
+        SelectAttempt::NotAttempted => Ok(None),
+        SelectAttempt::WriteSentUnconfirmed(role, error, outcome) => {
+            let chain = ChainResult::from_recorded(vec![outcome], prior).expect("one write");
+            if matches!(outcome, WriteOutcome::StopNotDelivered(_)) {
+                return Err(ClickWriteFailure {
+                    message: format!("AXSelected on {role} returned {error}"),
+                    disposition: chain
+                        .error_disposition(Postcondition::Indeterminate, false)
+                        .expect("unconfirmed write"),
+                }
+                .into());
+            }
+            Ok(Some(unconfirmed_selection_write(&role, element)))
         }
-        SelectAttempt::Confirmed(role) => {
-            Some(selection_write_outcome(tied(), &role, element, after_error))
+        SelectAttempt::Confirmed(role, _, outcome) => {
+            let _chain = ChainResult::from_recorded(vec![outcome], prior).expect("one write");
+            Ok(Some(selection_write_outcome(
+                tied(),
+                &role,
+                element,
+                after_error,
+            )))
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ClickWriteFailure {
+    message: String,
+    disposition: cua_driver_contract::ErrorDisposition,
+}
+impl std::fmt::Display for ClickWriteFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+impl std::error::Error for ClickWriteFailure {}
+
+fn post_press_should_select(err: crate::ax::bindings::AXError) -> bool {
+    matches!(
+        crate::ax::write_outcome::native_write_outcome(
+            crate::ax::write_outcome::NativeWriteKind::Perform,
+            true,
+            &crate::ax::write_outcome::Settable::Unknown(crate::ax::bindings::kAXErrorFailure),
+            err,
+        ),
+        cua_driver_core::mutation::WriteOutcome::FallThrough(_)
+    )
+}
+
+fn direct_perform_evidence(
+    reason: cua_driver_core::mutation::Reason,
+    observe: impl FnOnce() -> Option<ClickEvidence>,
+) -> (
+    cua_driver_core::mutation::WriteOutcome,
+    Option<ClickEvidence>,
+) {
+    classify_perform_evidence(
+        cua_driver_core::mutation::WriteOutcome::StopUncertain(reason),
+        observe,
+    )
+}
+
+fn ancestor_perform_evidence(
+    outcome: cua_driver_core::mutation::WriteOutcome,
+    observe: impl FnOnce() -> Option<ClickEvidence>,
+) -> (
+    cua_driver_core::mutation::WriteOutcome,
+    Option<ClickEvidence>,
+) {
+    classify_perform_evidence(outcome, observe)
+}
+
+/// Resolve only uninformative Perform errors from fresh target-tied evidence.
+fn classify_perform_evidence(
+    outcome: cua_driver_core::mutation::WriteOutcome,
+    observe: impl FnOnce() -> Option<ClickEvidence>,
+) -> (
+    cua_driver_core::mutation::WriteOutcome,
+    Option<ClickEvidence>,
+) {
+    use cua_driver_core::mutation::{Reason, WriteOutcome};
+    match outcome {
+        WriteOutcome::Delivered => (outcome, observe()),
+        WriteOutcome::StopUncertain(reason @ (Reason::AttributeUnsupported | Reason::NoValue)) => {
+            let evidence = observe().filter(|evidence| {
+                matches!(
+                    evidence,
+                    ClickEvidence::Selected
+                        | ClickEvidence::TitleNamesTarget
+                        | ClickEvidence::ToggleChanged
+                )
+            });
+            (
+                reason.classify_perform_with_observed_effect(evidence.is_some()),
+                evidence,
+            )
+        }
+        _ => (outcome, None),
+    }
+}
+
+#[cfg(test)]
+mod u32_fresh_perform_tests {
+    use super::{
+        ancestor_action_kind, ancestor_perform_evidence, classify_perform_evidence,
+        direct_perform_evidence, ClickEvidence,
+    };
+    use cua_driver_core::mutation::{Reason, WriteOutcome};
+
+    macro_rules! fresh_case {
+        ($name:ident, $path:ident, $reason:ident, $evidence:ident) => {
+            #[test]
+            fn $name() {
+                let reason = Reason::$reason;
+                let evidence = ClickEvidence::$evidence;
+                let (outcome, observed) = $path(reason, evidence);
+                assert_eq!(outcome, WriteOutcome::Delivered);
+                assert_eq!(observed, Some(evidence));
+            }
+        };
+    }
+    fn direct(reason: Reason, evidence: ClickEvidence) -> (WriteOutcome, Option<ClickEvidence>) {
+        direct_perform_evidence(reason, || Some(evidence))
+    }
+    fn ancestor(reason: Reason, evidence: ClickEvidence) -> (WriteOutcome, Option<ClickEvidence>) {
+        let chain = vec![
+            (Some("AXCell".into()), vec!["AXOpen".into()], false),
+            (Some("AXOutline".into()), vec![], true),
+        ];
+        assert_eq!(ancestor_action_kind(&chain, true), Some((0, "AXOpen")));
+        ancestor_perform_evidence(WriteOutcome::StopUncertain(reason), || Some(evidence))
+    }
+    fresh_case!(
+        direct_unsupported_selected,
+        direct,
+        AttributeUnsupported,
+        Selected
+    );
+    fresh_case!(
+        direct_unsupported_title,
+        direct,
+        AttributeUnsupported,
+        TitleNamesTarget
+    );
+    fresh_case!(direct_no_value_selected, direct, NoValue, Selected);
+    fresh_case!(direct_no_value_title, direct, NoValue, TitleNamesTarget);
+    fresh_case!(
+        ancestor_unsupported_selected,
+        ancestor,
+        AttributeUnsupported,
+        Selected
+    );
+    fresh_case!(
+        ancestor_unsupported_title,
+        ancestor,
+        AttributeUnsupported,
+        TitleNamesTarget
+    );
+    fresh_case!(ancestor_no_value_selected, ancestor, NoValue, Selected);
+    fresh_case!(ancestor_no_value_title, ancestor, NoValue, TitleNamesTarget);
+
+    #[test]
+    fn sheet_close_and_missing_effect_remain_uncertain() {
+        for reason in [Reason::AttributeUnsupported, Reason::NoValue] {
+            for evidence in [None, Some(ClickEvidence::SheetClosed)] {
+                let expected = (WriteOutcome::StopUncertain(reason), None);
+                assert_eq!(direct_perform_evidence(reason, || evidence), expected);
+                assert_eq!(
+                    ancestor_perform_evidence(WriteOutcome::StopUncertain(reason), || evidence),
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn shared_leaf_classifier_preserves_other_outcomes_and_success_evidence() {
+        for outcome in [
+            WriteOutcome::StopUncertain(Reason::Failure),
+            WriteOutcome::StopNotDelivered(Reason::PermissionDenied),
+            WriteOutcome::FallThrough(Reason::Unsupported),
+        ] {
+            let (classified, evidence) =
+                classify_perform_evidence(outcome, || panic!("must not observe this outcome"));
+            assert_eq!((classified, evidence), (outcome, None));
+        }
+        assert_eq!(
+            classify_perform_evidence(WriteOutcome::Delivered, || Some(ClickEvidence::SheetClosed)),
+            (WriteOutcome::Delivered, Some(ClickEvidence::SheetClosed))
+        );
+        assert_eq!(
+            classify_perform_evidence(WriteOutcome::StopUncertain(Reason::NoValue), || Some(
+                ClickEvidence::Selected
+            )),
+            (WriteOutcome::Delivered, Some(ClickEvidence::Selected))
+        );
+    }
+}
+
+#[cfg(test)]
+mod u32_outcome_tests {
+    use super::{ax_click_structured, post_press_should_select, selection_attempt_outcome};
+    use crate::ax::bindings::{kAXErrorAttributeUnsupported, kAXErrorIllegalArgument, AXError};
+    use crate::input::ax_actions::{select_with, SelectionOps};
+    use cua_driver_core::mutation::PriorInput;
+
+    struct FakeSelection {
+        selected: bool,
+        writes: usize,
+        error: AXError,
+    }
+
+    impl SelectionOps for FakeSelection {
+        type Element = usize;
+        fn role(&mut self, _: &usize) -> Option<String> {
+            Some("AXCell".into())
+        }
+        fn parent(&mut self, _: &usize) -> Option<usize> {
+            None
+        }
+        fn selected(&mut self, _: &usize) -> Option<bool> {
+            Some(self.selected)
+        }
+        fn select(&mut self, _: &usize) -> Result<(), AXError> {
+            self.writes += 1;
+            self.selected = true;
+            Err(self.error)
+        }
+        fn center(&mut self, _: &usize) -> Option<(f64, f64)> {
+            None
+        }
+    }
+
+    #[test]
+    fn perform_attribute_unsupported_requires_fresh_tied_effect() {
+        use cua_driver_core::mutation::{Reason, WriteOutcome};
+        assert_eq!(
+            Reason::AttributeUnsupported.classify_perform_with_observed_effect(false),
+            WriteOutcome::StopUncertain(Reason::AttributeUnsupported)
+        );
+        assert_eq!(
+            Reason::AttributeUnsupported.classify_perform_with_observed_effect(true),
+            WriteOutcome::Delivered
+        );
+        let mut ops = FakeSelection {
+            selected: false,
+            writes: 0,
+            error: kAXErrorIllegalArgument,
+        };
+        let mut pixels = 0;
+        if post_press_should_select(kAXErrorAttributeUnsupported) {
+            let attempt = select_with(&mut ops, 0);
+            if selection_attempt_outcome(
+                attempt,
+                (1, "AXCell", "label"),
+                None,
+                PriorInput::None,
+                || false,
+            )
+            .unwrap()
+            .is_none()
+            {
+                pixels += 1;
+            }
+        }
+        assert_eq!(
+            ops.writes + pixels,
+            0,
+            "no second AXSelected or pixel write without a fresh tied effect"
+        );
+    }
+
+    #[test]
+    fn selection_illegal_argument_never_falls_back_or_claims_safe_retry() {
+        let mut ops = FakeSelection {
+            selected: false,
+            writes: 0,
+            error: kAXErrorIllegalArgument,
+        };
+        let attempt = select_with(&mut ops, 0);
+        assert!(matches!(
+            &attempt,
+            crate::input::ax_actions::SelectAttempt::WriteSentUnconfirmed(
+                _,
+                error,
+                cua_driver_core::mutation::WriteOutcome::StopUncertain(_)
+            ) if *error == kAXErrorIllegalArgument
+        ));
+        let outcome = selection_attempt_outcome(
+            attempt,
+            (1, "AXCell", "label"),
+            None,
+            PriorInput::None,
+            || panic!("must not confirm a failed setter"),
+        )
+        .unwrap();
+        assert_eq!(ops.writes, 1);
+        assert!(ops.selected);
+        let (_, suspected_noop, evidence, via_pixel) = outcome.expect("must stop after setter");
+        assert_eq!(
+            ax_click_structured(via_pixel, false, evidence, suspected_noop),
+            serde_json::json!({"path":"ax", "verified":false, "effect":"unverifiable"})
+        );
+        for (prior, expected) in [
+            (
+                PriorInput::None,
+                cua_driver_contract::ErrorDisposition::NOT_DELIVERED,
+            ),
+            (
+                PriorInput::MayHaveDelivered,
+                cua_driver_contract::ErrorDisposition::SUSPECTED_NOOP,
+            ),
+        ] {
+            let attempt = crate::input::ax_actions::SelectAttempt::WriteSentUnconfirmed(
+                "AXCell".into(),
+                crate::ax::bindings::kAXErrorAPIDisabled,
+                cua_driver_core::mutation::WriteOutcome::StopNotDelivered(
+                    cua_driver_core::mutation::Reason::PermissionDenied,
+                ),
+            );
+            let failure =
+                selection_attempt_outcome(attempt, (1, "AXCell", "label"), None, prior, || false)
+                    .expect_err("disabled setter must stop");
+            let result = super::element_click_failure(&failure);
+            assert_eq!(result.disposition, Some(expected));
+            if prior == PriorInput::MayHaveDelivered {
+                assert_ne!(
+                    result
+                        .structured_content
+                        .as_ref()
+                        .and_then(|v| v.get("dispatched")),
+                    Some(&serde_json::json!(false))
+                );
+            }
         }
     }
 }
@@ -3055,6 +3466,7 @@ mod selection_write_outcome_tests {
     use super::{ax_click_structured, selection_attempt_outcome, unconfirmed_selection_write};
     use crate::ax::bindings::{kAXErrorIllegalArgument, AXError};
     use crate::input::ax_actions::{select_with, SelectionOps};
+    use cua_driver_core::mutation::PriorInput;
 
     #[test]
     fn a_sent_unconfirmed_write_has_existing_unverifiable_fields() {
@@ -3107,9 +3519,14 @@ mod selection_write_outcome_tests {
             };
             let attempt = select_with(&mut ops, 0);
             let mut pixels = 0;
-            let outcome = selection_attempt_outcome(attempt, (1, "AXCell", "label"), error, || {
-                panic!("no readback after error")
-            });
+            let outcome = selection_attempt_outcome(
+                attempt,
+                (1, "AXCell", "label"),
+                error,
+                PriorInput::None,
+                || panic!("no readback after error"),
+            )
+            .unwrap();
             if outcome.is_none() {
                 pixels += 1;
             }
@@ -3182,6 +3599,17 @@ fn unconfirmed_selection_click(
 /// and came back with an error does not arrive here: it is an unverifiable
 /// click (`unresolved_perform_error`) unless a read-back confirms it.
 fn element_click_failure(error: &anyhow::Error) -> ToolResult {
+    if let Some(failure) = error.downcast_ref::<ClickWriteFailure>() {
+        if failure.disposition == cua_driver_contract::ErrorDisposition::NOT_DELIVERED {
+            return super::pre_dispatch_refusal(
+                "action_unavailable",
+                format!("AX action refused: {error}"),
+            )
+            .with_disposition(failure.disposition);
+        }
+        return ToolResult::error(format!("AX action failed: {error}"))
+            .with_disposition(failure.disposition);
+    }
     match crate::input::ax_actions::element_action_refusal_code(error) {
         Some(code) => super::pre_dispatch_refusal(code, format!("AX action refused: {error}")),
         None => ToolResult::error(format!("AX action failed: {error}")),
@@ -3468,6 +3896,7 @@ fn perform_ax_click(
     modifiers: &[String],
     foreground: bool,
     read_back: bool,
+    mut prior: cua_driver_core::mutation::PriorInput,
 ) -> anyhow::Result<AxClickOutcome> {
     let (element_ptr, idx) = element;
     let (pid, window_id) = window;
@@ -3505,21 +3934,21 @@ fn perform_ax_click(
             let snapshot = reads
                 .selection
                 .then(|| unsafe { SelectionSnapshot::capture(element) });
-            if let Some(outcome) = selection_attempt_outcome(
-                crate::input::ax_actions::select_nearest_container_attempt(element_ptr),
-                (idx, &role, &title),
-                None,
-                || {
-                    snapshot
-                        .as_ref()
-                        .is_some_and(SelectionSnapshot::transitioned)
-                        && input_quiet(
-                            idle_before,
-                            super::physical_input_idle_ms(),
-                            elapsed_ms(started),
-                        )
-                },
-            ) {
+            let (attempt, target) =
+                crate::input::ax_actions::select_nearest_container_attempt_with_target(element_ptr);
+            if let Some(outcome) =
+                selection_attempt_outcome(attempt, (idx, &role, &title), None, prior, || {
+                    snapshot.as_ref().is_some_and(|snapshot| {
+                        target
+                            .as_ref()
+                            .is_some_and(|target| snapshot.transitioned_target(target.as_ptr()))
+                    }) && input_quiet(
+                        idle_before,
+                        super::physical_input_idle_ms(),
+                        elapsed_ms(started),
+                    )
+                })?
+            {
                 return Ok(outcome);
             }
         }
@@ -3642,9 +4071,13 @@ fn perform_ax_click(
     // type_text, which takes its own key scope.
     let text_key_scope = text_input_press && !text_in_web_area && !foreground;
     if !foreground && !text_key_scope {
+        let before = crate::input::skylight::focus_generation();
         latency::section(latency::Stage::KeyPrime, || {
             prime_key_window_for_background_press(pid, window_id, ax_action)
         });
+        if crate::input::skylight::focus_generation() != before {
+            prior = cua_driver_core::mutation::PriorInput::MayHaveDelivered;
+        }
     }
     if text_input_press {
         let in_web_area = text_in_web_area;
@@ -3661,18 +4094,34 @@ fn perform_ax_click(
             .then(|| unsafe { copy_bool_attr(element, "AXFocused") })
             .flatten();
         let scope = if text_key_scope {
-            match crate::input::skylight::enter_exact_window_key_inline(
+            match crate::input::skylight::enter_exact_window_key_inline_detailed(
                 pid as libc::pid_t,
                 window_id,
             ) {
                 Ok(scope) => Some(scope),
-                Err(reason) => anyhow::bail!(
-                    "text input [{idx}]: {reason}; AXFocused was not written and AXPress was not sent"
-                ),
+                Err(reason) => {
+                    let entry = reason.entry;
+                    let had_input =
+                        entry.records_posted > 0 || entry.records_uncertain || entry.ax_write;
+                    return Err(ClickWriteFailure {
+                        message: format!("text input [{idx}]: {}; AXFocused was not written and AXPress was not sent", reason.reason),
+                        disposition: if had_input || prior == cua_driver_core::mutation::PriorInput::MayHaveDelivered {
+                            cua_driver_contract::ErrorDisposition::SUSPECTED_NOOP
+                        } else {
+                            cua_driver_contract::ErrorDisposition::NOT_DELIVERED
+                        },
+                    }.into());
+                }
             }
         } else {
             None
         };
+        if let Some(scope) = &scope {
+            let entry = scope.entry();
+            if entry.records_posted > 0 || entry.records_uncertain || entry.ax_write {
+                prior = cua_driver_core::mutation::PriorInput::MayHaveDelivered;
+            }
+        }
         // The focus step and its checks; the scope's hand-back is finished
         // and disclosed on every way out of it.
         let focus_step = || -> anyhow::Result<bool> {
@@ -3684,7 +4133,30 @@ fn perform_ax_click(
                     foreground,
                 )?;
             } else {
-                crate::input::ax_actions::focus_element(element_ptr)?;
+                let err = crate::input::ax_actions::focus_element_raw(element_ptr);
+                let outcome = crate::ax::write_outcome::native_write_outcome(
+                    crate::ax::write_outcome::NativeWriteKind::SetAttribute,
+                    true,
+                    &crate::ax::write_outcome::Settable::Unknown(
+                        crate::ax::bindings::kAXErrorFailure,
+                    ),
+                    err,
+                );
+                let chain =
+                    cua_driver_core::mutation::ChainResult::from_recorded(vec![outcome], prior)
+                        .expect("one write");
+                if outcome != cua_driver_core::mutation::WriteOutcome::Delivered {
+                    return Err(ClickWriteFailure {
+                        message: format!("AXFocused returned {err}"),
+                        disposition: chain
+                            .error_disposition(
+                                cua_driver_core::mutation::Postcondition::Indeterminate,
+                                false,
+                            )
+                            .expect("unconfirmed write"),
+                    }
+                    .into());
+                }
             }
             // Focus can land shortly after delivery (a web field's DOM
             // focus): poll it from delivery and stop on the sample that
@@ -3731,10 +4203,10 @@ fn perform_ax_click(
                     true,
                 ));
             }
-            anyhow::bail!(
-                "text input [{idx}] did not become the application's focused element; AXPress was not sent.{}",
-                hand_back.map(|text| format!(" {text}")).unwrap_or_default()
-            )
+            return Err(ClickWriteFailure {
+                message: format!("text input [{idx}] did not become the application's focused element; AXPress was not sent.{}", hand_back.map(|text| format!(" {text}")).unwrap_or_default()),
+                disposition: cua_driver_contract::ErrorDisposition::DELIVERED,
+            }.into());
         }
         let evidence = text_focus_evidence(
             focused_before,
@@ -3789,17 +4261,31 @@ fn perform_ax_click(
         crate::ax::bindings::perform_action(element, ax_action)
     });
     probe.press_returned();
+    let outcome = crate::ax::write_outcome::native_write_outcome(
+        crate::ax::write_outcome::NativeWriteKind::Perform,
+        true,
+        &crate::ax::write_outcome::Settable::Unknown(crate::ax::bindings::kAXErrorFailure),
+        err,
+    );
     if err != crate::ax::bindings::kAXErrorSuccess {
         // Checked before the row-selection fallback, which writes AXSelected
         // on an ancestor: a press that landed (a toggle, a navigation) needs
         // no other write. Same evidence and input rules as a success.
-        if press_error_may_have_acted(err) {
+        if let cua_driver_core::mutation::WriteOutcome::StopUncertain(
+            reason @ (cua_driver_core::mutation::Reason::AttributeUnsupported
+            | cua_driver_core::mutation::Reason::NoValue),
+        ) = outcome
+        {
             // A press the app reported as failed never claims the sheet's
             // closing: only a delivered AXPress may.
-            if let Some(evidence) = probe
-                .observe()
-                .filter(|evidence| *evidence != ClickEvidence::SheetClosed)
-            {
+            let (classified, evidence) = direct_perform_evidence(reason, || probe.observe());
+            if classified == cua_driver_core::mutation::WriteOutcome::Delivered {
+                let evidence = evidence.expect("fresh tied effect");
+                let _chain = cua_driver_core::mutation::ChainResult::from_recorded(
+                    vec![cua_driver_core::mutation::WriteOutcome::Delivered],
+                    prior,
+                )
+                .expect("one write");
                 return Ok((
                     format!(
                         "✅ Performed {ax_action} on [{idx}] {role} \"{title}\"; {}, although \
@@ -3812,31 +4298,68 @@ fn perform_ax_click(
                 ));
             }
         }
-        // Some collection rows claim a click-like action but Finder returns
-        // kAXErrorCannotComplete. Use the same verified selection fallback
-        // before surfacing the dispatch error.
-        if let Some((snapshot, idle_before, started)) = fallback_selection {
-            if let Some(outcome) = selection_attempt_outcome(
-                crate::input::ax_actions::select_nearest_container_attempt(element_ptr),
-                (idx, &role, &title),
-                Some(err),
-                || {
-                    snapshot
-                        .as_ref()
-                        .is_some_and(SelectionSnapshot::transitioned)
-                        && input_quiet(
+        let chain = cua_driver_core::mutation::ChainResult::from_recorded(vec![outcome], prior)
+            .expect("one write");
+        if matches!(
+            outcome,
+            cua_driver_core::mutation::WriteOutcome::StopNotDelivered(_)
+        ) {
+            return Err(ClickWriteFailure {
+                message: format!("AXUIElementPerformAction({ax_action}) returned {err}"),
+                disposition: chain
+                    .error_disposition(
+                        cua_driver_core::mutation::Postcondition::Indeterminate,
+                        false,
+                    )
+                    .expect("unconfirmed write"),
+            }
+            .into());
+        }
+        // Only a proven fall-through permits the selection fallback.
+        if post_press_should_select(err) {
+            if let Some((snapshot, idle_before, started)) = fallback_selection {
+                let (attempt, target) =
+                    crate::input::ax_actions::select_nearest_container_attempt_with_target(
+                        element_ptr,
+                    );
+                if let Some(outcome) = selection_attempt_outcome(
+                    attempt,
+                    (idx, &role, &title),
+                    Some(err),
+                    prior,
+                    || {
+                        snapshot.as_ref().is_some_and(|snapshot| {
+                            target
+                                .as_ref()
+                                .is_some_and(|target| snapshot.transitioned_target(target.as_ptr()))
+                        }) && input_quiet(
                             idle_before,
                             super::physical_input_idle_ms(),
                             elapsed_ms(started),
                         )
-                },
-            ) {
-                return Ok(outcome);
+                    },
+                )? {
+                    return Ok(outcome);
+                }
             }
+        }
+        if matches!(
+            outcome,
+            cua_driver_core::mutation::WriteOutcome::FallThrough(_)
+        ) {
+            return Err(ClickWriteFailure {
+                message: format!("AXUIElementPerformAction({ax_action}) returned {err}; no fallback was available"),
+                disposition: chain.error_disposition(cua_driver_core::mutation::Postcondition::Indeterminate, false).expect("unconfirmed write"),
+            }.into());
+        }
+        if perform_error_proves_nothing_was_sent(err) {
+            return Ok((format!("⚠️ Sent {ax_action} to [{idx}] {role} \"{title}\", but the app returned AX error {err}; it may have acted. Read the window before repeating it."), false, None, false));
         }
         return unresolved_perform_error(ax_action, err, (idx, &role, &title));
     }
 
+    let _chain = cua_driver_core::mutation::ChainResult::from_recorded(vec![outcome], prior)
+        .expect("one write");
     let mut summary = format!("✅ Performed {ax_action} on [{idx}] {role} \"{title}\".");
     drop(fallback_selection);
     let evidence = probe.observe();
@@ -4027,6 +4550,7 @@ enum AxPressOutcome {
     Unavailable,
     /// An AX action may have been delivered: stop, do not fall through.
     Indeterminate,
+    NotDelivered(crate::ax::bindings::AXError),
 }
 
 /// Which ancestor action a click should use, if any. Selection first:
@@ -4102,12 +4626,32 @@ unsafe fn ax_press_with_ancestors(
         super::window_points::check_guard(dispatch_guard)?;
         let action = CFString::new("AXPress");
         let err = AXUIElementPerformAction(element, action.as_concrete_TypeRef());
-        if err == kAXErrorSuccess {
-            return Ok(AxPressOutcome::Delivered(probe.observe()));
-        }
-        if !perform_error_proves_nothing_was_sent(err) {
-            // The press may have acted: only evidence read after it says so.
-            return Ok(ancestor_press_outcome(probe.observe()));
+        let outcome = crate::ax::write_outcome::native_write_outcome(
+            crate::ax::write_outcome::NativeWriteKind::Perform,
+            true,
+            &crate::ax::write_outcome::Settable::Unknown(kAXErrorFailure),
+            err,
+        );
+        let (outcome, evidence) = classify_perform_evidence(outcome, || probe.observe());
+        let _chain = cua_driver_core::mutation::ChainResult::from_recorded(
+            vec![outcome],
+            cua_driver_core::mutation::PriorInput::None,
+        )
+        .expect("one write");
+        match outcome {
+            cua_driver_core::mutation::WriteOutcome::Delivered => {
+                return Ok(AxPressOutcome::Delivered(evidence))
+            }
+            cua_driver_core::mutation::WriteOutcome::FallThrough(_) => {}
+            cua_driver_core::mutation::WriteOutcome::StopNotDelivered(_) => {
+                return Ok(AxPressOutcome::NotDelivered(err))
+            }
+            cua_driver_core::mutation::WriteOutcome::StopUncertain(_) => {
+                return Ok(AxPressOutcome::Indeterminate)
+            }
+            cua_driver_core::mutation::WriteOutcome::RetryAfterUncertain(_) => {
+                unreachable!("native classifier does not retry")
+            }
         }
     }
     // The hit's OWN outline role counts in the boundary decision (it is
@@ -4168,21 +4712,34 @@ unsafe fn ax_press_with_ancestors(
     // Finder opens a sidebar location and still returns an AX error
     // (kAXErrorAttributeUnsupported): an error that does not prove the
     // action never reached the app is observed like a success.
-    let may_have_acted = err == kAXErrorSuccess || !perform_error_proves_nothing_was_sent(err);
-    let evidence = may_have_acted.then(|| probe.observe()).flatten();
+    let outcome = crate::ax::write_outcome::native_write_outcome(
+        crate::ax::write_outcome::NativeWriteKind::Perform,
+        true,
+        &crate::ax::write_outcome::Settable::Unknown(kAXErrorFailure),
+        err,
+    );
+    let (outcome, evidence) = ancestor_perform_evidence(outcome, || probe.observe());
+    let _chain = cua_driver_core::mutation::ChainResult::from_recorded(
+        vec![outcome],
+        cua_driver_core::mutation::PriorInput::None,
+    )
+    .expect("one write");
     for (_, _, el, _) in chain {
         CFRelease(el as _);
     }
-    if err == kAXErrorSuccess {
+    if outcome == cua_driver_core::mutation::WriteOutcome::Delivered {
         if action_name == "AXPress" {
             return Ok(ancestor_press_outcome(evidence));
         }
         return Ok(AxPressOutcome::Delivered(evidence));
     }
-    if !perform_error_proves_nothing_was_sent(err) {
-        return Ok(ancestor_press_outcome(evidence));
+    match outcome {
+        cua_driver_core::mutation::WriteOutcome::FallThrough(_) => Ok(AxPressOutcome::Unavailable),
+        cua_driver_core::mutation::WriteOutcome::StopNotDelivered(_) => {
+            Ok(AxPressOutcome::NotDelivered(err))
+        }
+        _ => Ok(AxPressOutcome::Indeterminate),
     }
-    Ok(AxPressOutcome::Unavailable)
 }
 
 #[cfg(test)]
