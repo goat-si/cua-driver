@@ -1854,7 +1854,7 @@ impl ClickTool {
                         } else {
                             WindowChangeDetector::snapshot(prior_front)
                         };
-                        let (held, result) = run_selection_candidate(
+                        let (held, result) = run_live_selection_candidate(
                             SelectionSite::First,
                             _mutation_lease.take(),
                             candidate,
@@ -2092,7 +2092,7 @@ impl ClickTool {
             let result = match result {
                 Ok(Ok((AxClickStep::Done(outcome), fronted))) => Ok(Ok((outcome, fronted))),
                 Ok(Ok((AxClickStep::NeedSelection(history), fronted))) => {
-                    let (held, selected) = run_post_press_selection(
+                    let (held, selected) = run_live_post_press_selection(
                         _mutation_lease.take(),
                         selection_leaf,
                         history,
@@ -3172,6 +3172,51 @@ where
     }
 }
 
+enum SelectionStageError<E> {
+    Discovery(E),
+    Refused(cua_driver_core::actionability::ActionabilityReport),
+}
+
+async fn run_selection_candidate<C, P, A, F, T>(
+    site: SelectionSite,
+    clock: &(impl cua_driver_core::actionability::Clock + Sync),
+    budget: std::time::Duration,
+    prior: cua_driver_core::mutation::PriorInput,
+    context: C,
+    probe: P,
+    write: A,
+) -> Result<T, cua_driver_core::actionability::ActionabilityReport>
+where
+    C: Sync,
+    P: for<'a> FnMut(&'a C, std::time::Duration) -> std::pin::Pin<Box<dyn std::future::Future<Output = cua_driver_core::actionability::ActionabilityReport> + Send + 'a>> + Send,
+    A: FnOnce(C) -> F,
+    F: std::future::Future<Output = T>,
+{
+    // Temporary wiring revert for the RED test: bypass the gate at this site.
+    let _ = (site, clock, budget, prior, probe);
+    Ok(write(context).await)
+}
+
+async fn run_post_press_selection<C, D, E, P, A, F, T>(
+    clock: &(impl cua_driver_core::actionability::Clock + Sync),
+    budget: std::time::Duration,
+    prior: cua_driver_core::mutation::PriorInput,
+    discovery: D,
+    probe: P,
+    write: A,
+) -> Result<T, SelectionStageError<E>>
+where
+    C: Sync,
+    D: std::future::Future<Output = Result<C, E>>,
+    P: for<'a> FnMut(&'a C, std::time::Duration) -> std::pin::Pin<Box<dyn std::future::Future<Output = cua_driver_core::actionability::ActionabilityReport> + Send + 'a>> + Send,
+    A: FnOnce(C) -> F,
+    F: std::future::Future<Output = T>,
+{
+    let context = discovery.await.map_err(SelectionStageError::Discovery)?;
+    run_selection_candidate(SelectionSite::PostPress, clock, budget, prior, context, probe, write)
+        .await.map_err(SelectionStageError::Refused)
+}
+
 #[derive(Clone)]
 struct ClickHistory {
     prior: cua_driver_core::mutation::PriorInput,
@@ -3339,87 +3384,62 @@ fn recheck_selection_then_write<T>(
     recheck().then(write)
 }
 
-async fn run_post_press_selection(
+async fn run_live_post_press_selection(
     lease: Option<super::BackgroundMutationLease>,
     leaf: crate::ax::snapshot::RetainedElement,
     history: ClickHistory,
     pid: i32,
     window_id: u32,
     foreground: bool,
-) -> (
-    Option<super::BackgroundMutationLease>,
-    Result<(AxClickOutcome, bool), ToolResult>,
-) {
-    let discovery = latency::spawn_action_blocking(move || {
-        let held = lease;
-        let run = || {
-            use crate::input::ax_actions::{
-                discover_selection, SelectionDiscovery, SelectionElement,
-            };
-            let start = unsafe { SelectionElement::retain(leaf.as_ptr() as AXUIElementRef) };
-            match discover_selection(start) {
-                SelectionDiscovery::Ready((role, item)) => {
-                    SelectionDiscovery::Ready(SelectionCandidate {
-                        target: unsafe {
-                            crate::ax::snapshot::RetainedElement::retain(item.as_ptr() as usize)
-                        },
-                        role,
-                    })
+) -> (Option<super::BackgroundMutationLease>, Result<(AxClickOutcome, bool), ToolResult>) {
+    let discovery_history = history.clone();
+    let discovery = async move {
+        let result = latency::spawn_action_blocking(move || {
+            let held = lease;
+            let run = || {
+                use crate::input::ax_actions::{discover_selection, SelectionDiscovery, SelectionElement};
+                let start = unsafe { SelectionElement::retain(leaf.as_ptr() as AXUIElementRef) };
+                match discover_selection(start) {
+                    SelectionDiscovery::Ready((role, item)) => SelectionDiscovery::Ready(SelectionCandidate {
+                        target: unsafe { crate::ax::snapshot::RetainedElement::retain(item.as_ptr() as usize) }, role,
+                    }),
+                    SelectionDiscovery::Absent => SelectionDiscovery::Absent,
+                    SelectionDiscovery::Unknown(reason) => SelectionDiscovery::Unknown(reason),
                 }
-                SelectionDiscovery::Absent => SelectionDiscovery::Absent,
-                SelectionDiscovery::Unknown(reason) => SelectionDiscovery::Unknown(reason),
-            }
-        };
-        (run(), held)
-    })
-    .await;
-    let (candidate, lease) = match discovery {
-        Ok((crate::input::ax_actions::SelectionDiscovery::Ready(candidate), lease)) => {
-            (candidate, lease)
-        }
-        Ok((crate::input::ax_actions::SelectionDiscovery::Absent, lease)) => {
-            return (
-                lease,
-                Err(post_press_failure(&history, "selection target is unknown")),
-            )
-        }
-        Ok((crate::input::ax_actions::SelectionDiscovery::Unknown(reason), lease)) => {
-            return (
-                lease,
-                Err(post_press_failure(
-                    &history,
-                    &format!("selection target is unknown: {reason}"),
-                )),
-            )
-        }
-        Err(error) => {
-            return (
-                None,
-                Err(post_press_failure(
-                    &history,
-                    &format!("discovery worker failed: {error}"),
-                )),
-            )
+            };
+            (run(), held)
+        }).await;
+        match result {
+            Ok((crate::input::ax_actions::SelectionDiscovery::Ready(candidate), lease)) => Ok((lease, candidate)),
+            Ok((crate::input::ax_actions::SelectionDiscovery::Absent, lease)) =>
+                Err((lease, post_press_failure(&discovery_history, "selection target is unknown"))),
+            Ok((crate::input::ax_actions::SelectionDiscovery::Unknown(reason), lease)) =>
+                Err((lease, post_press_failure(&discovery_history, &format!("selection target is unknown: {reason}")))),
+            Err(error) => Err((None, post_press_failure(&discovery_history, &format!("discovery worker failed: {error}")))),
         }
     };
-    let (lease, result) = run_selection_candidate(
-        SelectionSite::PostPress,
-        lease,
-        candidate,
-        history,
-        pid,
-        window_id,
-        foreground,
-    )
-    .await;
-    (lease, result)
+    let clock = super::actionability::semantic_clock();
+    let history_for_write = history.clone();
+    let result = run_post_press_selection(
+        &clock, cua_driver_core::actionability::DEFAULT_BUDGET, history.prior, discovery,
+        |(lease, candidate), _| super::actionability::semantic_probe(
+            lease.as_ref(), candidate.target.clone(), pid, window_id,
+            super::actionability::semantic::SemanticIntent::Select,
+        ),
+        |(lease, candidate)| run_live_selection_write(SelectionSite::PostPress, lease, candidate, history_for_write, pid, window_id, foreground),
+    ).await;
+    match result {
+        Ok(written) => project_live_selection_result(Ok(written), history),
+        Err(SelectionStageError::Refused(report)) => project_live_selection_result(Err(report), history),
+        Err(SelectionStageError::Discovery((lease, failure))) => (lease, Err(failure)),
+    }
 }
 
 fn post_press_delivery(outcome: AxClickOutcome, _press_fronted: bool, selection_fronted: bool) -> (AxClickOutcome, bool) {
     (outcome, selection_fronted)
 }
 
-async fn run_selection_candidate(
+async fn run_live_selection_candidate(
     site: SelectionSite,
     lease: Option<super::BackgroundMutationLease>,
     candidate: SelectionCandidate,
@@ -3434,7 +3454,7 @@ async fn run_selection_candidate(
     let clock = super::actionability::semantic_clock();
     let prior = history.prior;
     let history_for_write = history.clone();
-    let result = dispatch_post_press_selection(
+    let result = run_selection_candidate(
         site,
         &clock,
         cua_driver_core::actionability::DEFAULT_BUDGET,
@@ -3444,7 +3464,82 @@ async fn run_selection_candidate(
             lease.as_ref(), candidate.target.clone(), pid, window_id,
             super::actionability::semantic::SemanticIntent::Select,
         ),
-        |(lease, candidate)| async move {
+        |(lease, candidate)| run_live_selection_write(site, lease, candidate, history_for_write, pid, window_id, foreground),
+    ).await;
+    project_live_selection_result(result, history)
+}
+
+fn project_live_selection_result(
+    result: Result<Result<LiveSelectionOutput, tokio::task::JoinError>, cua_driver_core::actionability::ActionabilityReport>,
+    history: ClickHistory,
+) -> (Option<super::BackgroundMutationLease>, Result<(AxClickOutcome, bool), ToolResult>) {
+    match result {
+        Err(report) => (None, Err(project_gate_refusal(report, &history))),
+        Ok(Err(error)) => (
+            None,
+            Err(post_press_failure(
+                &history,
+                &format!("selection worker failed; selection may have run: {error}"),
+            )
+            .with_structured(serde_json::json!({"effect": "unverifiable"}))
+            .with_disposition(cua_driver_contract::ErrorDisposition::SUSPECTED_NOOP)),
+        ),
+        Ok(Ok((output, lease, effective_prior, fronted))) => {
+            let mut history = history;
+            history.prior = effective_prior;
+            if let Some(press) = history.press.as_mut() {
+                *press = cua_driver_core::mutation::ChainResult::from_recorded(
+                    press.outcomes().to_vec(),
+                    effective_prior,
+                )
+                .expect("recorded press");
+            }
+            match (output, fronted) {
+                (Some(None), _) => (
+                    lease,
+                    Err(post_press_failure(
+                        &history,
+                        "selection target changed or became unavailable",
+                    )),
+                ),
+                (Some(Some(Err(error))), _) => (lease, Err(element_click_failure(&error))),
+                (Some(Some(Ok(None))), _) => (
+                    lease,
+                    Err(post_press_failure(&history, "selection was not attempted")),
+                ),
+                (Some(Some(Ok(Some(outcome)))), Ok(fronted)) => (lease, Ok((outcome, fronted))),
+                (_, Err(error)) => (
+                    lease,
+                    Err(post_press_failure(
+                        &history,
+                        &format!("foreground assist failed: {error}"),
+                    )),
+                ),
+                (None, Ok(_)) => (
+                    lease,
+                    Err(post_press_failure(&history, "selection worker did not run")),
+                ),
+            }
+        }
+    }
+}
+
+type LiveSelectionOutput = (
+    Option<Option<anyhow::Result<Option<AxClickOutcome>>>>,
+    Option<super::BackgroundMutationLease>,
+    cua_driver_core::mutation::PriorInput,
+    anyhow::Result<bool>,
+);
+
+async fn run_live_selection_write(
+    site: SelectionSite,
+    lease: Option<super::BackgroundMutationLease>,
+    candidate: SelectionCandidate,
+    history_for_write: ClickHistory,
+    pid: i32,
+    window_id: u32,
+    foreground: bool,
+) -> Result<LiveSelectionOutput, tokio::task::JoinError> {
             focus_guard::with_focus_suppressed(
                 if foreground { None } else { Some(pid) },
                 apps::frontmost_pid(),
@@ -3499,57 +3594,6 @@ async fn run_selection_candidate(
                 (output, held, effective_prior, fronted)
                 }).await },
             ).await
-        },
-    ).await;
-    match result {
-        Err(report) => (None, Err(project_gate_refusal(report, &history))),
-        Ok(Err(error)) => (
-            None,
-            Err(post_press_failure(
-                &history,
-                &format!("selection worker failed; selection may have run: {error}"),
-            )
-            .with_structured(serde_json::json!({"effect": "unverifiable"}))
-            .with_disposition(cua_driver_contract::ErrorDisposition::SUSPECTED_NOOP)),
-        ),
-        Ok(Ok((output, lease, effective_prior, fronted))) => {
-            let mut history = history;
-            history.prior = effective_prior;
-            if let Some(press) = history.press.as_mut() {
-                *press = cua_driver_core::mutation::ChainResult::from_recorded(
-                    press.outcomes().to_vec(),
-                    effective_prior,
-                )
-                .expect("recorded press");
-            }
-            match (output, fronted) {
-                (Some(None), _) => (
-                    lease,
-                    Err(post_press_failure(
-                        &history,
-                        "selection target changed or became unavailable",
-                    )),
-                ),
-                (Some(Some(Err(error))), _) => (lease, Err(element_click_failure(&error))),
-                (Some(Some(Ok(None))), _) => (
-                    lease,
-                    Err(post_press_failure(&history, "selection was not attempted")),
-                ),
-                (Some(Some(Ok(Some(outcome)))), Ok(fronted)) => (lease, Ok((outcome, fronted))),
-                (_, Err(error)) => (
-                    lease,
-                    Err(post_press_failure(
-                        &history,
-                        &format!("foreground assist failed: {error}"),
-                    )),
-                ),
-                (None, Ok(_)) => (
-                    lease,
-                    Err(post_press_failure(&history, "selection worker did not run")),
-                ),
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -3760,57 +3804,36 @@ mod u32_stage_tests {
     #[tokio::test(flavor = "current_thread")]
     async fn selection_gate_refusal_blocks_both_selection_sites() {
         let writes = [AtomicUsize::new(0), AtomicUsize::new(0)];
-        let mut refused = [false; 2];
-        let queue = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from([
-            73_u32, 73_u32,
-        ])));
-        for (index, site) in [SelectionSite::First, SelectionSite::PostPress]
-            .into_iter()
-            .enumerate()
-        {
-            let counter = &writes[index];
-            let probe_queue = queue.clone();
-            let result = dispatch_post_press_selection(
-                site,
-                &FakeClock,
-                Duration::ZERO,
-                PriorInput::None,
-                73_u32,
-                move |candidate, _| {
-                    let probe_queue = probe_queue.clone();
-                    Box::pin(async move {
-                        assert_eq!(probe_queue.lock().unwrap().pop_front(), Some(*candidate));
-                        ActionabilityReport {
-                            verdict: Verdict::Terminal {
-                                code: "disabled",
-                                reason: "disabled".into(),
-                            },
-                            checks: vec![],
-                            waited_ms: 0,
-                            samples: 0,
-                            last_facts: None,
-                            disposition: None,
-                        }
-                    })
-                },
-                |candidate| async move {
-                    assert_eq!(candidate, 73);
-                    counter.fetch_add(1, Ordering::SeqCst);
-                },
-            )
-            .await;
-            refused[index] = result.is_err();
-        }
-        assert_eq!(
-            [
-                writes[0].load(Ordering::SeqCst),
-                writes[1].load(Ordering::SeqCst)
-            ],
-            [0, 0],
-            "both refusals must prevent AXSelected"
-        );
-        assert_eq!(refused, [true, true]);
-        assert!(queue.lock().unwrap().is_empty());
+        let discoveries = AtomicUsize::new(0);
+        let counter = &writes[0];
+        let first = run_selection_candidate(
+            SelectionSite::First, &FakeClock, Duration::ZERO, PriorInput::None, 73_u32,
+            |candidate, _| Box::pin(async move {
+                        assert_eq!(*candidate, 73);
+                        ActionabilityReport { verdict: Verdict::Terminal { code: "disabled", reason: "disabled".into() }, checks: vec![], waited_ms: 0, samples: 0, last_facts: None, disposition: None }
+                    }),
+            |candidate| async move {
+                        assert_eq!(candidate, 73);
+                        counter.fetch_add(1, Ordering::SeqCst);
+                    },
+        ).await;
+        let counter = &writes[1];
+        let post = run_post_press_selection(
+            &FakeClock, Duration::ZERO, PriorInput::None,
+            async { discoveries.fetch_add(1, Ordering::SeqCst); Ok::<_, ()>(73_u32) },
+            |candidate, _| Box::pin(async move {
+                        assert_eq!(*candidate, 73);
+                        ActionabilityReport { verdict: Verdict::Terminal { code: "disabled", reason: "disabled".into() }, checks: vec![], waited_ms: 0, samples: 0, last_facts: None, disposition: None }
+                    }),
+            |candidate| async move {
+                        assert_eq!(candidate, 73);
+                        counter.fetch_add(1, Ordering::SeqCst);
+                    },
+        ).await;
+        assert_eq!([writes[0].load(Ordering::SeqCst), writes[1].load(Ordering::SeqCst)], [0, 0], "both refusals must prevent AXSelected");
+        assert_eq!(discoveries.load(Ordering::SeqCst), 1);
+        assert!(first.is_err());
+        assert!(matches!(post, Err(SelectionStageError::Refused(_))));
     }
 
     #[test]
