@@ -1880,60 +1880,19 @@ impl ClickTool {
             }
 
             if effective_action == "press" && resolved_action == "AXPress" && modifiers.is_empty() {
-                let held = _mutation_lease.take();
-                let leaf = element_guard.clone();
                 let foreground = delivery_mode.is_foreground();
-                let prepared = latency::spawn_action_blocking(move || {
-                    let run = || prepare_native_focus(&leaf, idx, pid, wid, read_back, foreground);
-                    (run(), held)
-                })
+                let (held, result) = run_live_native_focus_stage(
+                    _mutation_lease.take(),
+                    element_guard.clone(),
+                    (idx, read_back),
+                    (pid, wid),
+                    foreground,
+                    cua_driver_core::mutation::PriorInput::None,
+                )
                 .await;
-                let (route, held) = match prepared {
-                    Ok(value) => value,
-                    Err(error) => {
-                        return super::pre_dispatch_refusal(
-                            "action_unavailable",
-                            format!("native focus discovery failed: {error}"),
-                        )
-                    }
-                };
                 _mutation_lease = held;
-                match route {
-                    NativeFocusRoute::Next => {}
-                    NativeFocusRoute::Refused(reason) => {
-                        return super::pre_dispatch_refusal(
-                            "action_unavailable",
-                            format!("native focus unavailable: {reason}"),
-                        )
-                    }
-                    NativeFocusRoute::Ready(candidate) => {
-                        let prior_front = apps::frontmost_pid();
-                        let snapshot = if foreground {
-                            WindowChangeDetector::snapshot_without_suppression(prior_front)
-                        } else {
-                            WindowChangeDetector::snapshot(prior_front)
-                        };
-                        let (held, result) = run_live_native_focus_stage(
-                            _mutation_lease.take(),
-                            candidate,
-                            pid,
-                            wid,
-                            foreground,
-                            cua_driver_core::mutation::PriorInput::None,
-                        )
-                        .await;
-                        _mutation_lease = held;
-                        let changes = snapshot.detect_sampled_async().await;
-                        return match result {
-                            Ok((outcome, fronted)) => finish_ax_click(
-                                outcome,
-                                fronted,
-                                foreground,
-                                &changes.result_suffix(),
-                            ),
-                            Err(refusal) => refusal,
-                        };
-                    }
+                if let Some(result) = result {
+                    return result;
                 }
             }
 
@@ -4061,31 +4020,91 @@ async fn run_native_focus_stage<C, D, E, P, A, F, T>(
 where
     C: Sync,
     D: std::future::Future<Output = Result<C, E>>,
-    P: for<'a> FnMut(&'a C, std::time::Duration) -> std::pin::Pin<Box<dyn std::future::Future<Output = cua_driver_core::actionability::ActionabilityReport> + Send + 'a>> + Send,
+    P: for<'a> FnMut(
+            &'a C,
+            std::time::Duration,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = cua_driver_core::actionability::ActionabilityReport,
+                    > + Send
+                    + 'a,
+            >,
+        > + Send,
     A: FnOnce(C) -> F,
     F: std::future::Future<Output = T>,
 {
     let context = discovery.await.map_err(SelectionStageError::Discovery)?;
-    // Temporary wiring revert for the RED test: bypass this site's gate.
-    let _ = (clock, budget, prior, probe);
-    Ok(write(context).await)
+    dispatch_post_press_selection(
+        SelectionSite::NativeFocus,
+        clock,
+        budget,
+        prior,
+        context,
+        probe,
+        write,
+    )
+    .await
+    .map_err(|report| SelectionStageError::Refused(Box::new(report)))
+}
+
+enum NativeFocusDiscoveryError {
+    Next(Option<super::BackgroundMutationLease>),
+    Refused(Option<super::BackgroundMutationLease>, ToolResult),
 }
 
 async fn run_live_native_focus_stage(
     lease: Option<super::BackgroundMutationLease>,
-    candidate: NativeFocusCandidate,
-    pid: i32,
-    window_id: u32,
+    leaf: crate::ax::snapshot::RetainedElement,
+    element: (usize, bool),
+    window: (i32, u32),
     foreground: bool,
     prior: cua_driver_core::mutation::PriorInput,
-) -> (
-    Option<super::BackgroundMutationLease>,
-    Result<(AxClickOutcome, bool), ToolResult>,
-) {
+) -> (Option<super::BackgroundMutationLease>, Option<ToolResult>) {
+    let (idx, read_back) = element;
+    let (pid, window_id) = window;
+    let mut snapshot = None;
+    let discovery = async {
+        let prepared = latency::spawn_action_blocking(move || {
+            let run = || prepare_native_focus(&leaf, idx, pid, window_id, read_back, foreground);
+            (run(), lease)
+        })
+        .await;
+        let (route, held) = match prepared {
+            Ok(value) => value,
+            Err(error) => {
+                return Err(NativeFocusDiscoveryError::Refused(
+                    None,
+                    super::pre_dispatch_refusal(
+                        "action_unavailable",
+                        format!("native focus discovery failed: {error}"),
+                    ),
+                ))
+            }
+        };
+        match route {
+            NativeFocusRoute::Next => Err(NativeFocusDiscoveryError::Next(held)),
+            NativeFocusRoute::Refused(reason) => Err(NativeFocusDiscoveryError::Refused(
+                held,
+                super::pre_dispatch_refusal(
+                    "action_unavailable",
+                    format!("native focus unavailable: {reason}"),
+                ),
+            )),
+            NativeFocusRoute::Ready(candidate) => {
+                let prior_front = apps::frontmost_pid();
+                snapshot = Some(if foreground {
+                    WindowChangeDetector::snapshot_without_suppression(prior_front)
+                } else {
+                    WindowChangeDetector::snapshot(prior_front)
+                });
+                Ok((held, candidate))
+            }
+        }
+    };
     let clock = super::actionability::semantic_clock();
     let result = run_native_focus_stage(
-        &clock, cua_driver_core::actionability::DEFAULT_BUDGET, prior,
-        std::future::ready(Ok::<_, std::convert::Infallible>((lease, candidate))),
+        &clock, cua_driver_core::actionability::DEFAULT_BUDGET, prior, discovery,
         |(lease, candidate), _| super::actionability::semantic_probe(
             lease.as_ref(), candidate.target.clone(), pid, window_id, super::actionability::semantic::SemanticIntent::Focus,
         ),
@@ -4113,13 +4132,25 @@ async fn run_live_native_focus_stage(
             ).await
         },
     ).await;
-    match result {
+    let (held, outcome) = match result {
+        Err(SelectionStageError::Discovery(NativeFocusDiscoveryError::Next(held))) => return (held, None),
+        Err(SelectionStageError::Discovery(NativeFocusDiscoveryError::Refused(held, refusal))) => return (held, Some(refusal)),
         Err(SelectionStageError::Refused(report)) => (None, Err(project_focus_gate_refusal(*report, prior))),
-        Err(SelectionStageError::Discovery(never)) => match never {},
         Ok(Err(error)) => (None, Err(click_task_failure(format!("native focus worker failed ({error}); the action may have run. Read fresh state before retrying.")).with_disposition(cua_driver_contract::ErrorDisposition::SUSPECTED_NOOP))),
         Ok(Ok((Err(error), held))) => (held, Err(native_focus_failure(&error))),
         Ok(Ok((Ok(outcome), held))) => (held, Ok(outcome)),
-    }
+    };
+    let changes = snapshot
+        .expect("ready discovery creates a snapshot")
+        .detect_sampled_async()
+        .await;
+    let result = match outcome {
+        Ok((outcome, fronted)) => {
+            finish_ax_click(outcome, fronted, foreground, &changes.result_suffix())
+        }
+        Err(refusal) => refusal,
+    };
+    (held, Some(result))
 }
 
 #[cfg(test)]
