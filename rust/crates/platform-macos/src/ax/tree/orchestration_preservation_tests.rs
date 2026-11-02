@@ -203,9 +203,20 @@ pub(super) fn run_scenario(
     scenario: super::environment_evidence_tests::Scenario,
     root: Option<(usize, &str)>,
 ) -> (CompletedWalk, Vec<String>, Vec<String>) {
+    run_scenario_with_limits(scenario, root, 10, 100, false, None)
+}
+
+pub(super) fn run_scenario_with_limits(
+    scenario: super::environment_evidence_tests::Scenario,
+    root: Option<(usize, &str)>,
+    max_depth: usize,
+    max_nodes: usize,
+    empty_children: bool,
+    query: Option<&str>,
+) -> (CompletedWalk, Vec<String>, Vec<String>) {
     use super::super::content_attrs::AttrStatus;
     use super::environment_evidence_tests::Environment;
-    use super::walker_seam_tests::{step, Fake, Reply};
+    use super::walker_seam_tests::{control_batch, step, Fake, Reply};
     use super::walker_test_support::{Batch, Slot};
     let mut steps = vec![];
     if let Some((id, role)) = root {
@@ -216,10 +227,25 @@ pub(super) fn run_scenario(
             step(&format!("text {id} AXRole"), Reply::Text(Read::Known(role.into()))),
             step(&format!("batch {id} AXTitle,AXPlaceholderValue,AXDescription,AXIdentifier,AXHelp,AXSubrole,AXRoleDescription"), Reply::Batch(Ok(Batch(attrs)))),
             step(&format!("value {id}"), Reply::Value(Ok(None))),
-            step(&format!("actions {id}"), Reply::Actions(Read::Known(vec![]))),
-            step(&format!("batch {id} AXPosition,AXSize"), Reply::Batch(Ok(Batch(vec![Slot::Point(None), Slot::Size(None)])))),
-            step(&format!("children {id}"), Reply::Children(Read::Absent)),
+            step(&format!("actions {id}"), Reply::Actions(Read::Known(if query.is_some() { vec!["AXPress".into()] } else { vec![] }))),
         ]);
+        if query.is_some() {
+            steps.push(step(&format!("batch {id} AXEnabled,AXPosition,AXSize,AXValueDescription,AXMinValue,AXMaxValue,AXSelected"), Reply::Batch(Ok(control_batch()))));
+            steps.push(step(&format!("snapshot {id}"), Reply::Unit));
+        } else {
+            steps.push(step(
+                &format!("batch {id} AXPosition,AXSize"),
+                Reply::Batch(Ok(Batch(vec![Slot::Point(None), Slot::Size(None)]))),
+            ));
+        }
+        steps.push(step(
+            &format!("children {id}"),
+            Reply::Children(if empty_children {
+                Read::Known(vec![])
+            } else {
+                Read::Absent
+            }),
+        ));
     }
     let source = Fake::new(
         &[
@@ -241,16 +267,20 @@ pub(super) fn run_scenario(
         WalkRequest {
             pid: 42,
             window_id: Some(99),
-            query: None,
-            max_depth: 10,
+            query,
+            max_depth,
             include_web_content: true,
         },
-        WalkBudget::new(200, 100),
+        WalkBudget::new(200, max_nodes),
     );
     assert!(environment.credits.borrow().values().all(Vec::is_empty));
     environment.environment.assert_released();
     source.assert_consumed();
-    source.assert_lifetimes(&[]);
+    if query.is_some() {
+        source.assert_lifetimes(&[(2, 1)]);
+    } else {
+        source.assert_lifetimes(&[]);
+    }
     let trace = environment.environment.trace.borrow().clone();
     let source_trace = source.trace();
     (result, trace, source_trace)

@@ -1533,6 +1533,21 @@ fn finalize_with_deadline_sample(
         let reasons = fold_with_owned_items(&mut lines, &mut nodes);
         merge_fold_reasons(&mut budget, reasons);
     }
+    // Only the internal verify request can opt in. Require positive window
+    // scope and a clean, reconciled budget after the terminal deadline sample.
+    let mut completeness = serde_json::json!({});
+    budget.outcome().apply(&mut completeness);
+    if EXHAUSTIVE_ASSERTION.with(std::cell::Cell::get)
+        && exhaustive_nodes()
+        && query.is_none()
+        && !MENUS_COLLAPSED.with(std::cell::Cell::get)
+        && window_scope.as_ref().is_some_and(WindowScope::is_matched)
+        && !final_deadline_sample
+        && completeness["observation_incomplete_reasons"]
+            == serde_json::json!([{"kind":"unknown", "detail":"not_asserted"}])
+    {
+        budget.assert_exhaustive();
+    }
     let walk = budget.outcome();
     let nodes_skipped = ledger.finish();
     (
@@ -2941,6 +2956,7 @@ fn walk_element<S: AxTreeSource>(
     // it: its items are reachable through invoke_menu or a query, and walking
     // them cost most of a read (94% of a Chrome window read in a VM check)
     // and ate the node budget before the window content.
+    let mut proved_closed = false;
     let collapse_here = if role == "AXMenuBarItem" && MENUS_COLLAPSED.with(std::cell::Cell::get) {
         match super::evidence::observe_read(
             Some(element_key),
@@ -2950,7 +2966,14 @@ fn walk_element<S: AxTreeSource>(
         .into_walk_legacy()
         {
             Read::Known(true) => false,
-            Read::Known(false) => true,
+            Read::Known(false) => {
+                proved_closed = true;
+                budget.record_scope_exclusion(
+                    cua_driver_contract::ScopeExclusionKind::ClosedMenusNotExpanded,
+                    Some(source.key(element) as u64),
+                );
+                true
+            }
             Read::Absent | Read::Unknown(_) => {
                 budget.record_skip(IncompleteReason {
                     kind: IncompleteReasonKind::PolicyOmission,
@@ -2970,7 +2993,9 @@ fn walk_element<S: AxTreeSource>(
     lines.push((depth, line));
     nodes.push(node);
     if collapse_here {
-        note_skipped();
+        if !proved_closed {
+            note_skipped();
+        }
         return;
     }
 
@@ -3780,6 +3805,36 @@ thread_local! {
     static MENUS_COLLAPSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static WALK_SKIPPED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static EXHAUSTIVE_NODES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static EXHAUSTIVE_ASSERTION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(crate) fn verify_assertion_requested(
+    verify_read: bool,
+    display_only: bool,
+    full_output: bool,
+    query: Option<&str>,
+) -> bool {
+    verify_read && !display_only && !full_output && query.is_none()
+}
+
+pub(crate) fn collapse_menus_for_request(
+    query: Option<&str>,
+    full_output: bool,
+    observation_only: bool,
+) -> bool {
+    query.is_none_or(|q| q.trim().is_empty()) && !full_output && !observation_only
+}
+
+/// Enable completeness assertion only for a trusted internal verify read.
+pub fn with_exhaustive_assertion<T>(enabled: bool, walk: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            EXHAUSTIVE_ASSERTION.with(|flag| flag.set(self.0));
+        }
+    }
+    let _restore = Restore(EXHAUSTIVE_ASSERTION.with(|flag| flag.replace(enabled)));
+    walk()
 }
 
 /// Run `walk` keeping every visited node in `nodes` (or not) on this thread:
@@ -5237,6 +5292,38 @@ pub(crate) fn evidence_output_fixture(search: bool, shared: bool) -> (TreeWalkRe
 #[cfg(test)]
 pub(crate) fn evidence_deadline_fixture() -> TreeWalkResult {
     environment_setup_tests::run_menu_deadline_case().0.legacy
+}
+
+#[cfg(test)]
+pub(crate) fn failed_setup_output_fixture() -> TreeWalkResult {
+    environment_setup_tests::run_application_failure().0.legacy
+}
+
+#[cfg(test)]
+pub(crate) fn verify_output_fixture(query: Option<&str>, provider_failure: bool) -> TreeWalkResult {
+    use environment_evidence_tests::Scenario;
+    let scenario = if provider_failure {
+        Scenario::ProviderFailure
+    } else {
+        Scenario::Launching
+    };
+    with_exhaustive_assertion(
+        verify_assertion_requested(true, false, false, query),
+        || {
+            with_exhaustive_nodes(true, || {
+                orchestration_preservation_tests::run_scenario_with_limits(
+                    scenario,
+                    Some((2, "AXWindow")),
+                    10,
+                    100,
+                    false,
+                    query,
+                )
+                .0
+                .legacy
+            })
+        },
+    )
 }
 #[cfg(test)]
 mod walker_test_support;
